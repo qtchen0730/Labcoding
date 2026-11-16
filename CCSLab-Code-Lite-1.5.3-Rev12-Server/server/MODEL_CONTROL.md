@@ -29,7 +29,7 @@
 
 3. 评估备选组合。运维在同一模型文件、llama.cpp 构建、KV 类型、GPU 与负载条件下测量每个组合。核准文件用 `model-control.example.json` 起步，至少记录当前组合和一个备选。每个 `profiles` 条目包含整数 `total_context`、`slots`、`slot_context` 和 `peak_model_mib`。最后两项分别为实测每槽上限和进程完整负载显存峰值预算，预算要覆盖误差。换模型或构建后重新核准。配置写入前后检查 `n_ctx_train`、实际槽位、显存容量、安全余量和 llama-server 进程显存。
 4. 将 `model-control.json`、`model-context.env` 保存在 `/etc/ccslab`，目录和文件由 root 所有，普通账号不可写，网关可读取。由运维把同一个上游 Token 文件置于 `/etc/ccslab/llama-api-key`，所有者为 root、受权组可读，建议模式 0640。网关使用 `CCSLAB_LLAMA_API_KEY_FILE=/etc/ccslab/llama-api-key`，并配置 `CCSLAB_MODEL_CONTROL_SPEC=/etc/ccslab/model-control.json`。
-5. 安装固定的受控组件。以下代码块假设独立网关 Unix 账户名为 `ccslab`，从源码根目录执行。辅助程序与 Python 模块的整个目录链均必须由 root 所有且其他用户不可写。
+5. 安装固定的受控组件。以下代码块假设独立网关 Unix 账户名为 `ccslab`，从服务端源码目录 `CCSLab-Code-Lite-1.5.3-Rev12-Server/`（包含 `server/`）执行。辅助程序与 Python 模块的整个目录链均必须由 root 所有且其他用户不可写。
 
    ```sh
    sudo install -d -o root -g root -m 0755 /usr/local/lib/ccslab-model-control
@@ -51,4 +51,4 @@
 
 SQLite `model_configuration_audit` 保存操作者、时间、原参数、新参数、应用结果与故障原因。辅助程序另外记录不含密钥的系统日志。应用前保存 `/etc/ccslab/model-context.previous` 和事务标记。新的 PID、健康状态、配置、模型 ID、运行槽位及显存检查均通过后才提交。失败时恢复原配置并重启同一 unit，再次核对。若恢复失败或辅助程序异常中断，`model-change.pending` 将保留，网关会拒绝新的模型请求与配置写入。运维需要检查日志和实际进程，按保存的配置手工恢复已批准的模型服务，核验健康和原槽位后再清除标记。
 
-可在源码根目录运行 `python -m unittest server.test_model_control -v`。测试覆盖运行遥测映射、精确参数与显存校验、确认令牌绑定及过期、活跃槽位拒绝、审计，以及隔离夹具中的成功变更、失败恢复和恢复失败。隔离测试使用临时文件与可控健康响应。
+可在服务端源码目录 `CCSLab-Code-Lite-1.5.3-Rev12-Server/` 运行 `python -m unittest server.test_model_control -v`。测试覆盖运行遥测映射、精确参数与显存校验、确认令牌绑定及过期、活跃槽位拒绝、审计，以及隔离夹具中的成功变更、失败恢复和恢复失败。隔离测试使用临时文件与可控健康响应。

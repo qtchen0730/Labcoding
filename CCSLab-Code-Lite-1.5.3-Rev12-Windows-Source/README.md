@@ -10,7 +10,7 @@
 
 配套 Gateway 支持管理员在“用户审批 → 设置额度”选择不限额或输入 k Token；保存时重新发放所填额度（1k=1000 Token），输入和输出按上游实际 usage 扣减。普通用户左下角显示余额百分比，0% 时禁用任务并提示充值；补充额度后自动恢复，保留草稿。统计缺失会保留预留额并显示待核对，不伪造用量。
 
-管理员降为普通用户不再弹授权码；升为管理员仍需验证。额度及降级需要配套服务端更新；详见 `../CCSLab-Code-Lite-1.5.3-Rev3-Server/REV9.md`。
+管理员降为普通用户不再弹授权码；升为管理员仍需验证。额度及降级需要配套服务端更新；详见 [配套 Gateway 更新](../CCSLab-Code-Lite-1.5.3-Rev12-Server/REV9.md)。
 
 最近项目“删除”只移除当前账号列表记录，保留磁盘项目文件及历史会话。历史会话“删除”经确认后删除该会话的 OpenCode 数据、客户端记录与草稿；运行任务时禁止删除。
 
@@ -33,13 +33,13 @@
 
 ```powershell
 python -m venv .work\venv
-.\.work\venv\Scripts\python.exe -B -m pip install -r CCSLab-Code-Lite-1.5.3-Rev7-Windows-Source\requirements-build.txt
-.\.work\venv\Scripts\python.exe -B CCSLab-Code-Lite-1.5.3-Rev7-Windows-Source\packaging\Fetch-OpenCode.py
-.\.work\venv\Scripts\python.exe -B CCSLab-Code-Lite-1.5.3-Rev7-Windows-Source\app\app.py
-.\CCSLab-Code-Lite-1.5.3-Rev7-Windows-Source\packaging\Build-Windows.ps1 -Python (Resolve-Path .work\venv\Scripts\python.exe).Path
+.\.work\venv\Scripts\python.exe -B -m pip install -r CCSLab-Code-Lite-1.5.3-Rev12-Windows-Source\requirements-build.txt
+.\.work\venv\Scripts\python.exe -B CCSLab-Code-Lite-1.5.3-Rev12-Windows-Source\packaging\Fetch-OpenCode.py
+.\.work\venv\Scripts\python.exe -B CCSLab-Code-Lite-1.5.3-Rev12-Windows-Source\app\app.py
+.\CCSLab-Code-Lite-1.5.3-Rev12-Windows-Source\packaging\Build-Windows.ps1 -Python (Resolve-Path .work\venv\Scripts\python.exe).Path
 ```
 
-源码目录名沿用 Rev7，当前软件发布版本为 Rev12。OpenCode 固定为 1.17.16；源码运行从 `.work/vendor/` 读取，打包后仍使用软件安装目录内的 `vendor/`。
+源码目录名统一为 `CCSLab-Code-Lite-1.5.3-Rev12-Windows-Source/`，当前软件发布版本为 Rev12。OpenCode 固定为 1.17.16；源码运行从 `.work/vendor/` 读取，打包后仍使用软件安装目录内的 `vendor/`。
 
 ## 验证
 

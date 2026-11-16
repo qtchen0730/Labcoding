@@ -1,9 +1,9 @@
 # CCSLab Code Lite
 
-当前 Windows 客户端为 **1.5.3 Rev12 候选版**，继承当前 Rev11 的功能。默认薄荷绿，顶部太阳切换 8 种主题；项目结果默认执行记录；可选择加密保存登录；设置旁显示齿轮。管理员设置 Token 额度，普通用户显示余额百分比。源码目录名沿用 Rev7。
+当前 Windows 客户端为 **1.5.3 Rev12 候选版**，继承当前 Rev11 的功能。默认薄荷绿，顶部太阳切换 8 种主题；项目结果默认执行记录；可选择加密保存登录；设置旁显示齿轮。管理员设置 Token 额度，普通用户显示余额百分比。客户端与服务端源码目录统一使用 Rev12 命名。
 
-- [Windows 客户端源码与开发说明](CCSLab-Code-Lite-1.5.3-Rev7-Windows-Source/)：界面、OpenCode 桥接、工具和验证。
-- [Gateway 服务端源码](CCSLab-Code-Lite-1.5.3-Rev3-Server/server/)：账号、模型转发、迁移、配置示例及测试。目录名沿用 Rev3，实际为配套 Rev12 源码。
+- [Windows 客户端源码与开发说明](CCSLab-Code-Lite-1.5.3-Rev12-Windows-Source/)：界面、OpenCode 桥接、工具和验证。
+- [Gateway 服务端源码](CCSLab-Code-Lite-1.5.3-Rev12-Server/server/)：账号、模型转发、迁移、配置示例及测试。
 
 ## 主题
 
@@ -15,7 +15,7 @@
 
 设置按钮内的齿轮紧随文字右侧。程序、窗口及安装器采用薄荷绿底的 C 字图标；矢量源为客户端 `app/assets/logo.svg`，构建自动生成 7 种尺寸的 ICO，生成文件在 `.work/assets/Rev12/`。
 
-额度及免授权码降级需要 [配套 Gateway 更新](CCSLab-Code-Lite-1.5.3-Rev3-Server/REV9.md)。旧 Gateway 上额度显示“不可用”，不虚构余额。本轮只交付服务端源码，不改生产部署。
+额度及免授权码降级需要 [配套 Gateway 更新](CCSLab-Code-Lite-1.5.3-Rev12-Server/REV9.md)。旧 Gateway 上额度显示“不可用”，不虚构余额。本轮只交付服务端源码，不改生产部署。
 
 ## 仓库与本地产物
 
@@ -29,18 +29,18 @@
 
 ```powershell
 python -m venv .work\venv
-.\.work\venv\Scripts\python.exe -B -m pip install -r CCSLab-Code-Lite-1.5.3-Rev7-Windows-Source\requirements-build.txt
-.\.work\venv\Scripts\python.exe -B CCSLab-Code-Lite-1.5.3-Rev7-Windows-Source\packaging\Fetch-OpenCode.py
-.\.work\venv\Scripts\python.exe -B CCSLab-Code-Lite-1.5.3-Rev7-Windows-Source\app\app.py
-.\CCSLab-Code-Lite-1.5.3-Rev7-Windows-Source\packaging\Build-Windows.ps1 -Python (Resolve-Path .work\venv\Scripts\python.exe).Path
+.\.work\venv\Scripts\python.exe -B -m pip install -r CCSLab-Code-Lite-1.5.3-Rev12-Windows-Source\requirements-build.txt
+.\.work\venv\Scripts\python.exe -B CCSLab-Code-Lite-1.5.3-Rev12-Windows-Source\packaging\Fetch-OpenCode.py
+.\.work\venv\Scripts\python.exe -B CCSLab-Code-Lite-1.5.3-Rev12-Windows-Source\app\app.py
+.\CCSLab-Code-Lite-1.5.3-Rev12-Windows-Source\packaging\Build-Windows.ps1 -Python (Resolve-Path .work\venv\Scripts\python.exe).Path
 ```
 
 软件正常用户配置和会话仍在原用户数据目录，不随开发产物清理。客户端测试命令见客户端 README，使用 `-B` 并自动在 `.work/tests/` 建立临时数据。
 
-Gateway 使用原生入口 `python -m server`，依赖见 `server/requirements.txt`。本轮没有修改生产 Gateway、数据库、Cloudflare 或模型参数，没有推送代码。原仓库 .git 只读，版本提交和可导入 bundle 在独立 Rev12 仓库保留。
+从仓库根目录进入 `CCSLab-Code-Lite-1.5.3-Rev12-Server/` 后，Gateway 使用原生入口 `python -m server`，依赖见该目录下的 `server/requirements.txt`。本轮没有修改生产 Gateway、数据库、Cloudflare 或模型参数，没有推送代码。原仓库 .git 只读，版本提交和可导入 bundle 在独立 Rev12 仓库保留。
 
 ## Rev12 验收边界
 
 安装器增加短暂占用重试、持久事务及中断恢复。额度区分预留、待核对和耗尽，流式中间 usage 不作为最终账单。完整 Gateway HTTP 与真实 llama.cpp 联调当前为 **BLOCKED**，本地回归通过不代表生产验收通过。
 
-部署前阅读 [Rev12 Ubuntu 部署与回滚手册](CCSLab-Code-Lite-1.5.3-Rev3-Server/DEPLOY-REV12.md)，验收门槛解除后由管理员授权执行，不自动部署。
+部署前阅读 [Rev12 Ubuntu 部署与回滚手册](CCSLab-Code-Lite-1.5.3-Rev12-Server/DEPLOY-REV12.md)，验收门槛解除后由管理员授权执行，不自动部署。

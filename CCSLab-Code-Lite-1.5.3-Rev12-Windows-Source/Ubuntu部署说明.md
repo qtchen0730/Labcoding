@@ -1,5 +1,7 @@
 # CCSLab Gateway 1.5.3 Rev3 Ubuntu 升级与回滚
 
+本文保留 Rev3 升级的历史背景，源码路径已统一为 Rev12。Rev12 的部署门槛、迁移与回滚以 [Rev12 Ubuntu 操作手册](../CCSLab-Code-Lite-1.5.3-Rev12-Server/DEPLOY-REV12.md) 为准。
+
 以下操作由生产管理员在授权维护窗口执行。修订版仍使用 `https://ccslab-code.qtchen.cn` 和现有 `http://127.0.0.1:8444` 回源。升级对象是一个 Gateway 进程。Rev3 将本人改密的最低长度调整为 6 个字符，现有 SQLite 结构与 Rev2 兼容。账号 SQLite、管理员授权验证、模型 API Key、Open WebUI 3006、原 Gateway 8443 和模型服务继续使用现有配置。
 
 ## 1. 确认配置与一致性备份
@@ -38,11 +40,11 @@ PY
 
 ## 2. 更新 8444 网关
 
-1. 上传并解压 `CCSLab-Code-Lite-1.5.3-Rev3-Server.zip` 到 `/home/server/ccslab-gateway`，产生独立的 `CCSLab-Code-Lite-1.5.3-Rev3` 目录，旧目录供回滚。
+1. 上传并解压 `CCSLab-Code-Lite-1.5.3-Rev12-Server.zip` 到 `/home/server/ccslab-gateway`，确认源码位于独立的 `CCSLab-Code-Lite-1.5.3-Rev12-Server/` 目录，其下包含 `server/`，旧目录供回滚。
 2. 维护窗口内停止旧的 8444 Gateway。若由 systemd 管理，修改该 Gateway unit 的 `WorkingDirectory`，继续使用同一虚拟环境、服务账号和 `EnvironmentFile`。如改了 unit 文件，执行 `sudo systemctl daemon-reload` 后启动对应的 **Gateway** unit。终端前台运行时，先加载原环境变量，再从新目录运行。下面的示例沿用已有 Python 环境。
 
    ```bash
-   cd /home/server/ccslab-gateway/CCSLab-Code-Lite-1.5.3-Rev3
+   cd /home/server/ccslab-gateway/CCSLab-Code-Lite-1.5.3-Rev12-Server
    /home/server/ccslab-gateway/CCSLab-Code-Lite-1.5.0/.venv/bin/python -m server serve \
      --bind 127.0.0.1 --port 8444
    ```

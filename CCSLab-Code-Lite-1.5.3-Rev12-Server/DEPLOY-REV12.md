@@ -12,9 +12,10 @@
 
 ## 2. 独立目录与依赖
 
-将 Rev12-Server 包解压到独立版本目录，不覆盖旧版本。以普通专用服务账号建立 Python 3.12 venv。以下变量均须由管理员先填入审核后的绝对路径；示例不替代现场核查。
+将 `CCSLab-Code-Lite-1.5.3-Rev12-Server/` 解压或复制到独立版本目录，不覆盖旧版本。`CCS_NEW_SOURCE` 指向该目录，其下必须包含 `server/`；以下依赖安装、测试和迁移命令均从该目录执行。以普通专用服务账号建立 Python 3.12 venv。以下变量均须由管理员先填入审核后的绝对路径；示例不替代现场核查。
 
 ```sh
+cd "$CCS_NEW_SOURCE"
 python3.12 -m venv "$CCS_NEW_VENV"
 "$CCS_NEW_VENV/bin/python" -m pip install --cache-dir "$CCS_CACHE" -r server/requirements.txt
 "$CCS_NEW_VENV/bin/python" -m pip check

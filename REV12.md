@@ -1,6 +1,6 @@
 # CCSLab Code Lite 1.5.3 Rev12 候选版本
 
-以当前工作区实际 Rev11 增量开发。原仓库 main / `738affbde7a316a5edee73ea786761672aaf22a7` 含未提交修改；精确保护当前 98 个源码文件后建立 Git 检查点 `aef8c9819b8bf4491375828c95b01b42b8a8a17b`，在独立 `rev12` 分支开发。没有回退历史实现、覆盖原 Rev11 或丢弃原工作区差异。目录名沿用 Windows Rev7、Server Rev3；安装器和交付标为 Rev12。
+以当前工作区实际 Rev11 增量开发。原仓库 main / `738affbde7a316a5edee73ea786761672aaf22a7` 含未提交修改；精确保护当前 98 个源码文件后建立 Git 检查点 `aef8c9819b8bf4491375828c95b01b42b8a8a17b`，在独立 `rev12` 分支开发。没有回退历史实现、覆盖原 Rev11 或丢弃原工作区差异。当前源码目录统一为 `CCSLab-Code-Lite-1.5.3-Rev12-Windows-Source/` 和 `CCSLab-Code-Lite-1.5.3-Rev12-Server/`；安装器和交付标为 Rev12。
 
 已安装 `D:/opencode/CCSLab Code Lite.exe` 与 Rev11 冻结程序 SHA256 相同：`c5fdd49b77bd9226616a894ee670dfa910aaac153e1db7e64805a269dd0c7bb6`。Gateway 无法通过源码目录名判定生产运行版本；本次仅核实本地实际配套源码，生产进程与部署 commit 未获远程证据。
 
@@ -36,4 +36,4 @@ Rev11 原生压缩已启用 `auto=true, prune=false`，预留输出 4096，保�
 
 登录默认普通会话，管理员升级检查授权码；降级验证有效身份并轮换令牌，旧会话失效。Token 额度由 SQLite `BEGIN IMMEDIATE` 原子预留、实际 usage 幂等结算、批次隔离和审计实现；缓存不重复计费。源码调用链已检查，真实认证与完整 HTTP 因依赖阻塞尚未通过，不能声称不存在绕过路径。
 
-迁移、部署和回滚见 [Rev12 Ubuntu 操作手册](CCSLab-Code-Lite-1.5.3-Rev3-Server/DEPLOY-REV12.md)。真实模型补验清单见 [联调验收说明](CCSLab-Code-Lite-1.5.3-Rev3-Server/REAL-MODEL-ACCEPTANCE.md)。
+迁移、部署和回滚见 [Rev12 Ubuntu 操作手册](CCSLab-Code-Lite-1.5.3-Rev12-Server/DEPLOY-REV12.md)。真实模型补验清单见 [联调验收说明](CCSLab-Code-Lite-1.5.3-Rev12-Server/REAL-MODEL-ACCEPTANCE.md)。
