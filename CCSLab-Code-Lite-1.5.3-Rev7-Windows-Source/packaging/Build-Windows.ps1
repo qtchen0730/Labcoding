@@ -1,8 +1,8 @@
 param(
-    [string]$Output = (Join-Path (Split-Path (Split-Path $PSScriptRoot)) '.work\releases\CCSLab-Code-Lite-1.5.3-Rev11-Setup-x64.exe'),
+    [string]$Output = (Join-Path (Split-Path (Split-Path $PSScriptRoot)) '.work\releases\CCSLab-Code-Lite-1.5.3-Rev12-Setup-x64.exe'),
     [string]$Python = 'python',
     [string]$PyInstallerPath = '',
-    [string]$BuildRoot = (Join-Path (Split-Path (Split-Path $PSScriptRoot)) '.work\build\Rev11')
+    [string]$BuildRoot = (Join-Path (Split-Path (Split-Path $PSScriptRoot)) '.work\build\Rev12')
 )
 
 $ErrorActionPreference = 'Stop'
@@ -39,7 +39,7 @@ if ((Get-FileHash -LiteralPath $OpenCode -Algorithm SHA256).Hash -ne $OpenCodeHa
 }
 
 $Dist = Join-Path $BuildRoot 'dist'
-$Assets = (New-Item -ItemType Directory -Force -Path (Join-Path $LocalWork 'assets\Rev10')).FullName
+$Assets = (New-Item -ItemType Directory -Force -Path (Join-Path $LocalWork 'assets\Rev12')).FullName
 $Icon = Join-Path $Assets 'app.ico'
 $IconPng = Join-Path $Assets 'app.png'
 $IconBuilder = Join-Path $BuildRoot 'Build-Icon.exe'

@@ -217,6 +217,7 @@ class UserFeatures(unittest.TestCase):
     def test_quota_errors_are_distinct_from_context_failure(self):
         for code, status in (("token_quota_exhausted",402),("token_quota_insufficient",402),
                              ("token_quota_unconfirmed",409),("token_quota_changed",409),
+                             ("token_quota_reserved",409),
                              ("用户额度已经用完，请充值。",402),("有请求用量待核对，请联系管理员。",409),
                              ("额度设置已更新，请重试本次任务。",409)):
             message, actual_status, kind = _model_failure({"data":{"statusCode":status,"message":code}})

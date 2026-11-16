@@ -1,4 +1,4 @@
-﻿# CCSLab Code Lite 1.5.3 Rev11
+# CCSLab Code Lite 1.5.3 Rev12 候选版
 
 薄荷绿恢复原来的浅色配色，默认仍为薄荷绿，保留已保存的主题选择。顶部太阳切换 8 种主题，齿轮在“设置”文字右侧的按钮内部，项目结果默认执行记录。
 
@@ -39,7 +39,7 @@ python -m venv .work\venv
 .\CCSLab-Code-Lite-1.5.3-Rev7-Windows-Source\packaging\Build-Windows.ps1 -Python (Resolve-Path .work\venv\Scripts\python.exe).Path
 ```
 
-源码目录名沿用 Rev7，当前软件发布版本为 Rev11。OpenCode 固定为 1.17.16；源码运行从 `.work/vendor/` 读取，打包后仍使用软件安装目录内的 `vendor/`。
+源码目录名沿用 Rev7，当前软件发布版本为 Rev12。OpenCode 固定为 1.17.16；源码运行从 `.work/vendor/` 读取，打包后仍使用软件安装目录内的 `vendor/`。
 
 ## 验证
 
@@ -50,3 +50,11 @@ python -B -m unittest -v verify_saved_login verify_user_features verify_themes v
 ```
 
 验证临时文件自动落在 `.work/tests/`。使用 `-B` 避免在源码旁生成字节码；构建脚本会将 Python 字节码重定向到 `.work/pycache/`。协议 fixture 的 Token 数为脚本值，不代表实际模型分词结果。
+
+## Rev12 安装及验收
+
+安装器保持当前用户权限运行，在程序目录外加独占锁和持久事务。短暂访问拒绝/共享冲突最多重试约 12.7 秒；失败回滚旧程序，中断后的下次安装先恢复事务。含额外用户文件的程序目录仍拒绝升级。恢复失败保留事务和旧副本，关闭占用进程后重试，不删除唯一有效副本。正常用户配置、DPAPI 和会话目录保持原样。
+
+`python -B -m unittest -v verify_installer` 使用小型合成载荷验证原生事务；`packaging/Test-Installer.ps1 -Installer <Rev12安装包>` 验证完整载荷首次安装、覆盖升级及启动。环境变量 `CCSLAB_INSTALL_TEST_POINT` 仅在明确传入 `--smoke-install` 时生效，用于自动化故障注入。
+
+本轮客户端回归通过，完整 Gateway HTTP 及真实模型联调仍为 BLOCKED；不能据此认定生产验收完成。详见仓库 `REV12.md`。

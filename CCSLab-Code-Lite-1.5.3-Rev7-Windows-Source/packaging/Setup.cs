@@ -4,13 +4,16 @@ using System.Drawing;
 using System.IO;
 using System.IO.Compression;
 using System.Reflection;
+using System.Security.Cryptography;
+using System.Text;
+using System.Threading;
 using System.Windows.Forms;
 using Microsoft.Win32;
 
 [assembly: AssemblyTitle("CCSLab Code Lite")]
 [assembly: AssemblyProduct("CCSLab Code Lite")]
-[assembly: AssemblyVersion("1.5.3.11")]
-[assembly: AssemblyFileVersion("1.5.3.11")]
+[assembly: AssemblyVersion("1.5.3.12")]
+[assembly: AssemblyFileVersion("1.5.3.12")]
 
 static class Setup
 {
@@ -18,7 +21,7 @@ static class Setup
     const string AppName = "CCSLab Code Lite.exe";
     const string Marker = ".ccslab-code-lite-install";
     const string RegistryPath = @"Software\Microsoft\Windows\CurrentVersion\Uninstall\CCSLabCodeLite";
-    const string Version = "1.5.3 Rev11";
+    const string Version = "1.5.3 Rev12";
     static readonly string DefaultInstallDir = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Programs", Product);
     static readonly string ShortcutPath = Path.Combine(
@@ -52,7 +55,7 @@ static class Setup
             {
                 var testDirectory = NormalizeDestination(args[1]);
                 RequireAppClosed(testDirectory);
-                Install(testDirectory);
+                Install(testDirectory, true);
                 return 0;
             }
             using (var wizard = new SetupForm())
@@ -138,6 +141,23 @@ static class Setup
         })) { }
     }
 
+    static void RetryFileOperation(Action operation)
+    {
+        int[] delays = { 100, 200, 400, 800, 1600, 3200, 3200, 3200 };
+        for (int attempt = 0; ; attempt++)
+        {
+            try { operation(); return; }
+            catch (Exception error)
+            {
+                int code = error.HResult & 0xffff;
+                if (!(error is IOException || error is UnauthorizedAccessException) ||
+                    (code != 5 && code != 32 && code != 33) || attempt == delays.Length)
+                    throw;
+                Thread.Sleep(delays[attempt]);
+            }
+        }
+    }
+
 #if UNINSTALLER
     static void FinishUninstall(int firstProcess, string directory)
     {
@@ -162,10 +182,114 @@ static class Setup
         MessageBox.Show("已卸载 CCSLab Code Lite。", Product, MessageBoxButtons.OK, MessageBoxIcon.Information);
     }
 #else
-    static void Install(string destination)
+    static string TransactionPath(string destination)
+    {
+        using (var hash = SHA256.Create())
+        {
+            var name = BitConverter.ToString(hash.ComputeHash(Encoding.UTF8.GetBytes(
+                destination.ToUpperInvariant()))).Replace("-", "");
+            return Path.Combine(Path.GetDirectoryName(destination), ".ccslab-install-" + name);
+        }
+    }
+
+    static void RequireRegularFile(string path)
+    {
+        if (File.Exists(path) && (File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0)
+            throw new IOException("安装事务文件不能是链接。请检查：" + path);
+    }
+
+    static void WriteTransaction(string journal, string destination, string stage, string phase)
+    {
+        RequireRegularFile(journal);
+        var temporary = journal + ".tmp";
+        RequireRegularFile(temporary);
+        using (var stream = new FileStream(temporary, FileMode.Create, FileAccess.Write, FileShare.None))
+        {
+            var bytes = Encoding.UTF8.GetBytes(String.Join("\n", new[] { destination, stage, phase }));
+            stream.Write(bytes, 0, bytes.Length);
+            stream.Flush(true);
+        }
+        if (File.Exists(journal)) File.Replace(temporary, journal, null);
+        else File.Move(temporary, journal);
+    }
+
+    static void CleanPayload(string folder)
+    {
+        if (!Directory.Exists(folder)) return;
+        if ((File.GetAttributes(folder) & FileAttributes.ReparsePoint) != 0)
+            throw new IOException("安装恢复路径不能是链接：" + folder);
+        if (Directory.GetFileSystemEntries(folder).Length == 0)
+            RetryFileOperation(delegate { Directory.Delete(folder); });
+        else
+        {
+            ValidateInstallation(folder);
+            RequireOnlyInstalledFiles(folder);
+            RemoveInstalledFiles(folder, folder);
+        }
+    }
+
+    static void RecoverTransaction(string journal, string destination)
+    {
+        if (!File.Exists(journal)) return;
+        RequireRegularFile(journal);
+        var lines = File.ReadAllLines(journal);
+        if (lines.Length != 3 || !SamePath(lines[0], destination) ||
+            (lines[2] != "prepared" && lines[2] != "committed"))
+            throw new IOException("安装事务记录无效，已保留现场：" + journal);
+        var stage = Path.GetFullPath(lines[1]);
+        var name = Path.GetFileName(stage);
+        Guid identity;
+        if (!SamePath(Path.GetDirectoryName(stage), Path.GetDirectoryName(destination)) ||
+            !name.StartsWith(".ccslab-setup-", StringComparison.Ordinal) ||
+            !Guid.TryParseExact(name.Substring(14), "N", out identity))
+            throw new IOException("安装事务恢复路径无效，已保留现场：" + journal);
+        var previous = stage + ".old";
+        if (lines[2] == "prepared" && Directory.Exists(previous))
+        {
+            ValidateInstallation(previous);
+            RequireOnlyInstalledFiles(previous);
+            CleanPayload(destination);
+            RetryFileOperation(delegate { Directory.Move(previous, destination); });
+        }
+        if (lines[2] == "committed")
+        {
+            ValidateInstallation(destination);
+            RequireOnlyInstalledFiles(destination);
+            foreach (var file in File.ReadAllLines(Path.Combine(destination, Marker)))
+                if (!File.Exists(ResolvePayloadPath(destination, file)))
+                    throw new IOException("新版本文件不完整，已保留恢复副本：" + previous);
+            CleanPayload(previous);
+        }
+        CleanPayload(stage);
+        File.Delete(journal);
+    }
+
+    static void TestPoint(bool smoke, string destination, string point)
+    {
+        if (!smoke) return;
+        var instruction = Environment.GetEnvironmentVariable("CCSLAB_INSTALL_TEST_POINT");
+        if (instruction == "throw:" + point)
+            throw new IOException("Smoke-only injected failure: " + point);
+        if (instruction == "pause:" + point)
+        {
+            File.WriteAllText(destination + ".test-point", point);
+            Thread.Sleep(120000);
+            throw new IOException("Smoke-only pause expired.");
+        }
+    }
+
+    static void Install(string destination, bool smoke = false)
     {
         var root = Path.GetDirectoryName(destination);
         Directory.CreateDirectory(root);
+        var transaction = TransactionPath(destination);
+        RequireRegularFile(transaction + ".lock");
+        // The lock lives outside the program folder, so it cannot lock our own rename.
+        using (var installLock = new FileStream(transaction + ".lock", FileMode.OpenOrCreate,
+            FileAccess.ReadWrite, FileShare.None))
+        {
+        var journal = transaction + ".transaction";
+        RecoverTransaction(journal, destination);
         var stage = Path.Combine(root, ".ccslab-setup-" + Guid.NewGuid().ToString("N"));
         var previous = stage + ".old";
         bool hasInstallation = File.Exists(Path.Combine(destination, Marker));
@@ -177,6 +301,7 @@ static class Setup
         else if (Directory.Exists(destination) && Directory.GetFileSystemEntries(destination).Length > 0)
             throw new IOException("目标文件夹已有其他文件。请选择空文件夹，或输入新的子文件夹路径。");
         Directory.CreateDirectory(stage);
+        WriteTransaction(journal, destination, stage, "prepared");
         try
         {
             using (var package = Assembly.GetExecutingAssembly().GetManifestResourceStream("ccslab-payload"))
@@ -185,6 +310,16 @@ static class Setup
                 var manifest = Path.Combine(stage, Marker);
                 using (var files = new StreamWriter(manifest))
                 {
+                    var names = new System.Collections.Generic.HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    foreach (var entry in archive.Entries)
+                    {
+                        var result = ResolvePayloadPath(stage, entry.FullName);
+                        if (SamePath(result, manifest) || !names.Add(result))
+                            throw new InvalidDataException("安装载荷包含重复文件或保留名称。");
+                        files.WriteLine(entry.FullName);
+                    }
+                    files.Flush();
+                    ((FileStream)files.BaseStream).Flush(true);
                     foreach (var entry in archive.Entries)
                     {
                         var result = ResolvePayloadPath(stage, entry.FullName);
@@ -192,7 +327,6 @@ static class Setup
                         using (var input = entry.Open())
                         using (var output = new FileStream(result, FileMode.CreateNew))
                             input.CopyTo(output);
-                        files.WriteLine(entry.FullName);
                     }
                 }
             }
@@ -200,24 +334,28 @@ static class Setup
             if (upgrading)
             {
                 if (hasInstallation)
-                    Directory.Move(destination, previous);
+                    RetryFileOperation(delegate { Directory.Move(destination, previous); });
                 else
                     Directory.Delete(destination, false);
             }
-            try { Directory.Move(stage, destination); }
-            catch
-            {
-                if (hasInstallation)
-                    Directory.Move(previous, destination);
-                throw;
-            }
-            if (hasInstallation)
-                RemoveInstalledFiles(previous, previous);
+            TestPoint(smoke, destination, "after-backup");
+            RetryFileOperation(delegate { Directory.Move(stage, destination); });
+            TestPoint(smoke, destination, "after-swap");
+            WriteTransaction(journal, destination, stage, "committed");
+            TestPoint(smoke, destination, "after-commit");
         }
-        finally
+        catch (Exception installError)
         {
-            if (Directory.Exists(stage))
-                Directory.Delete(stage, true);
+            try { RecoverTransaction(journal, destination); }
+            catch (Exception recoveryError)
+            {
+                throw new IOException("安装失败，自动恢复未完成。已保留事务和副本，请关闭占用进程后重试：" +
+                    journal, new AggregateException(installError, recoveryError));
+            }
+            throw;
+        }
+        // A cleanup failure retains the committed journal; the next invocation resumes it.
+        RecoverTransaction(journal, destination);
         }
     }
 
@@ -418,7 +556,7 @@ static class Setup
         foreach (var line in File.ReadAllLines(marker))
         {
             var file = ResolvePayloadPath(folder, line);
-            File.Delete(file);
+            RetryFileOperation(delegate { File.Delete(file); });
             for (var directory = Path.GetDirectoryName(file); directory.Length > folder.Length;
                 directory = Path.GetDirectoryName(directory))
                 directories.Add(directory);
@@ -427,9 +565,9 @@ static class Setup
         ordered.Sort((left, right) => right.Length.CompareTo(left.Length));
         foreach (var directory in ordered)
             if (Directory.Exists(directory) && Directory.GetFileSystemEntries(directory).Length == 0)
-                Directory.Delete(directory);
-        File.Delete(marker);
+                RetryFileOperation(delegate { Directory.Delete(directory); });
+        RetryFileOperation(delegate { File.Delete(marker); });
         if (Directory.GetFileSystemEntries(folder).Length == 0)
-            Directory.Delete(folder);
+            RetryFileOperation(delegate { Directory.Delete(folder); });
     }
 }

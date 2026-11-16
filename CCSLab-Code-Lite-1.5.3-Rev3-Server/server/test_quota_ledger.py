@@ -108,7 +108,7 @@ class QuotaLedgerTests(unittest.TestCase):
 
     def test_actual_usage_counts_input_and_output_once_including_cache(self):
         observer = UsageObserver()
-        data = {"usage":{"prompt_tokens":350,"completion_tokens":25,"total_tokens":375,
+        data = {"choices":[], "usage":{"prompt_tokens":350,"completion_tokens":25,"total_tokens":375,
                          "prompt_tokens_details":{"cached_tokens":300}}}
         observer.frame(["data: "+json.dumps(data)])
         observer.frame(["data: "+json.dumps(data)])
@@ -123,6 +123,44 @@ class QuotaLedgerTests(unittest.TestCase):
             self.assertIsNone(usage(invalid))
         observer.body(json.dumps({"usage":{"prompt_tokens":351,"completion_tokens":25}}))
         self.assertIsNone(observer.result)
+
+    def test_partial_stream_usage_disconnect_holds_full_reservation(self):
+        self.grant(200)
+        identity = self.quota.reserve("user-fixture", "partial", 200)
+        observer = UsageObserver()
+        observer.frame(['data: '+json.dumps({"choices":[{"delta":{"content":"partial"},
+                         "finish_reason":None}], "usage":{"prompt_tokens":100,"completion_tokens":1}})])
+        self.assertIsNone(observer.result)
+        self.quota.finish(identity, observer.result, sent=True)
+        self.assertEqual(self.state()["held_tokens"], 200)
+        self.assertEqual(self.state()["used_tokens"], 0)
+        with self.assertRaises(AccountError) as raised:
+            self.quota.reserve("user-fixture", "retry", 1)
+        self.assertEqual((raised.exception.status_code, raised.exception.code),
+                         (409, "token_quota_unconfirmed"))
+
+    def test_fully_reserved_is_not_exhaustion_and_release_restores_credit(self):
+        self.grant(200)
+        identity = self.quota.reserve("user-fixture", "in-flight", 200)
+        with self.assertRaises(AccountError) as raised:
+            self.quota.reserve("user-fixture", "concurrent", 1)
+        self.assertEqual((raised.exception.status_code, raised.exception.code),
+                         (409, "token_quota_reserved"))
+        self.quota.finish(identity, None, sent=False)
+        self.assertEqual(self.state()["remaining_tokens"], 200)
+
+    def test_only_valid_terminal_stream_usage_can_settle(self):
+        for choices in ([], [{"finish_reason":"stop"}], [{"finish_reason":"tool_calls"}]):
+            observer = UsageObserver()
+            observer.frame(['data: '+json.dumps({"choices":choices,
+                            "usage":{"prompt_tokens":100,"completion_tokens":25}})])
+            self.assertEqual(observer.result, (100,25))
+        for choices in (None, {}, [{"finish_reason":None}], ["invalid"],
+                        [{"finish_reason":"stop"},{"finish_reason":None}]):
+            observer = UsageObserver()
+            observer.frame(['data: '+json.dumps({"choices":choices,
+                            "usage":{"prompt_tokens":100,"completion_tokens":1}})])
+            self.assertIsNone(observer.result)
 
 
 if __name__ == "__main__":

@@ -115,6 +115,8 @@ def _model_failure(source):
         return "请求用量待核对，请联系管理员。", status or 409, "quota"
     if "token_quota_changed" in lower or status == 409 and "额度设置已更新" in detail:
         return "额度设置已更新，请重试本次任务。", status or 409, "quota"
+    if "token_quota_reserved" in lower or status == 409 and "请求额度已预留" in detail:
+        return "请求额度已预留，等待结算。", status or 409, "quota"
     if status == 402 or "token_quota_" in lower:
         message = ("用户额度已经用完，请充值。" if "token_quota_exhausted" in lower or "用户额度已经用完" in detail else
                    "剩余额度不足以覆盖本次输入及输出预留，请充值或缩小任务。")

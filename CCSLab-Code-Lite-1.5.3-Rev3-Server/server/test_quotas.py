@@ -40,6 +40,10 @@ class GatewayQuotaTests(unittest.TestCase):
                     'data: {"choices":[{"delta":{"content":"reply"}}]}\n\n'+
                     'data: '+json.dumps({"choices":[],"usage":usage})+'\n\n'+
                     'data: [DONE]\n\n').encode())
+            if self.response == "partial-stream":
+                return httpx.Response(200,headers={"Content-Type":"text/event-stream"},content=(
+                    'data: '+json.dumps({"choices":[{"delta":{"content":"partial"},
+                        "finish_reason":None}],"usage":usage})+'\n\n').encode())
             return httpx.Response(200,json={"choices":[],"usage":usage})
         self.accounts,self.model,app = setup(Path(self.scratch.name),upstream)
         self.client = self.enterContext(TestClient(app,base_url="https://gateway.fixture"))
@@ -115,6 +119,20 @@ class GatewayQuotaTests(unittest.TestCase):
         self.calls.clear()
         self.assertEqual(self.client.post("/v1/chat/completions",headers=self.user,json=self.payload).status_code,200)
         self.assertEqual(len(self.calls),1)
+
+    def test_full_hold_and_partial_stream_use_pending_error_not_exhaustion(self):
+        self.grant(200)
+        self.response="partial-stream"
+        result=self.client.post("/v1/chat/completions",headers=self.user,json=self.payload|{"stream":True})
+        self.assertEqual(result.status_code,200,result.text)
+        self.assertEqual(self.quota()["held_tokens"],200)
+        self.assertEqual(self.quota()["used_tokens"],0)
+        self.assertTrue(self.quota()["unconfirmed"])
+        self.calls.clear()
+        retry=self.client.post("/v1/chat/completions",headers=self.user,json=self.payload)
+        self.assertEqual(retry.status_code,409,retry.text)
+        self.assertEqual(retry.json()["error"]["code"],"token_quota_unconfirmed")
+        self.assertFalse(self.calls)
 
 
 if __name__=="__main__":

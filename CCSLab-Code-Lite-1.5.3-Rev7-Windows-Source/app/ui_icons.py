@@ -26,7 +26,7 @@ def gear_image(master, foreground, background, size=20):
 
 def apply_window_icon(root):
     base = Path(__file__).resolve().parent
-    assets = base / "assets" if getattr(sys, "frozen", False) else base.parents[1] / ".work" / "assets" / "Rev10"
+    assets = base / "assets" if getattr(sys, "frozen", False) else base.parents[1] / ".work" / "assets" / "Rev12"
     icon = assets / "app.ico"
     if icon.is_file():
         root.iconbitmap(str(icon))

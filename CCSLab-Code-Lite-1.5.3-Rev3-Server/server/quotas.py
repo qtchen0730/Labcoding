@@ -9,6 +9,18 @@ MAX_QUOTA = 10**12
 EXHAUSTED = "用户额度已经用完，请充值。"
 
 
+def require_available(quota):
+    """Distinguish spent credit from in-flight and unconfirmed reservations."""
+    if quota["mode"] != "limited":
+        return
+    if quota["unconfirmed"]:
+        raise QuotaError("有请求用量待核对，请联系管理员核对并重新设置额度。", "token_quota_unconfirmed", 409)
+    if quota["remaining_tokens"] == 0:
+        if quota["held_tokens"]:
+            raise QuotaError("请求额度已预留，等待结算。", "token_quota_reserved", 409)
+        raise QuotaError(EXHAUSTED, "token_quota_exhausted")
+
+
 def usage(data):
     """Return confirmed input/output counts, never estimates or cached double counts."""
     if not isinstance(data, dict) or not isinstance(data.get("usage"), dict):
@@ -74,11 +86,8 @@ class Quotas:
             user, _ = self.accounts._session(db, token, active=True)
             db.execute("INSERT OR IGNORE INTO token_quotas(user_id) VALUES (?)", (user["id"],))
             quota = self.snapshot(db, user["id"])
+            require_available(quota)
             if quota["mode"] == "limited":
-                if quota["unconfirmed"]:
-                    raise QuotaError("有请求用量待核对，请联系管理员核对并重新设置额度。", "token_quota_unconfirmed", 409)
-                if quota["remaining_tokens"] == 0:
-                    raise QuotaError(EXHAUSTED, "token_quota_exhausted")
                 if tokens is None:
                     raise QuotaError("额度设置已更新，请重试本次任务。", "token_quota_changed", 409)
                 if type(tokens) is not int or tokens < 1:
@@ -125,7 +134,21 @@ class UsageObserver:
     def frame(self, lines):
         raw = "\n".join(line[5:].lstrip(" ") for line in lines if line.startswith("data:"))
         if raw and raw != "[DONE]":
-            self.body(raw)
+            try:
+                data = json.loads(raw)
+            except (ValueError, RecursionError):
+                return
+            if not isinstance(data, dict) or "error" in data:
+                return
+            # Running totals in intermediate chunks do not prove final billing.
+            # Aggregate usage arrives in choices=[] or with terminal choices.
+            choices = data.get("choices")
+            terminal = isinstance(choices, list) and all(
+                isinstance(choice, dict) and choice.get("finish_reason") in
+                ("stop", "length", "tool_calls", "function_call", "content_filter")
+                for choice in choices)
+            if terminal:
+                self.body(raw)
 
     @property
     def result(self):

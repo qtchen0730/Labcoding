@@ -22,7 +22,7 @@ from starlette.concurrency import run_in_threadpool
 
 from .accounts import AccountError, Accounts
 from .model_control import ModelControl, ModelControlError
-from .quotas import UsageObserver
+from .quotas import UsageObserver, require_available
 from .account_errors import QuotaError
 
 
@@ -484,8 +484,7 @@ def create_app(settings=None, *, model_control=None, upstream_transport=None, al
             client = request.app.state.upstream
             reserve_tokens = None
             if _user.get("quota", {}).get("mode") == "limited":
-                if _user["quota"]["remaining_tokens"] == 0:
-                    raise QuotaError("用户额度已经用完，请充值。", "token_quota_exhausted")
+                require_available(_user["quota"])
                 # Use the running model's own template and tokenizer, including tools,
                 # history and system messages. Never turn a character estimate into a bill.
                 for path, body in (("apply-template", payload), ("tokenize", None)):
