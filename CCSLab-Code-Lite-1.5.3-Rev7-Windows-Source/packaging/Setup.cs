@@ -9,8 +9,8 @@ using Microsoft.Win32;
 
 [assembly: AssemblyTitle("CCSLab Code Lite")]
 [assembly: AssemblyProduct("CCSLab Code Lite")]
-[assembly: AssemblyVersion("1.5.3.8")]
-[assembly: AssemblyFileVersion("1.5.3.8")]
+[assembly: AssemblyVersion("1.5.3.11")]
+[assembly: AssemblyFileVersion("1.5.3.11")]
 
 static class Setup
 {
@@ -18,7 +18,7 @@ static class Setup
     const string AppName = "CCSLab Code Lite.exe";
     const string Marker = ".ccslab-code-lite-install";
     const string RegistryPath = @"Software\Microsoft\Windows\CurrentVersion\Uninstall\CCSLabCodeLite";
-    const string Version = "1.5.3 Rev8";
+    const string Version = "1.5.3 Rev11";
     static readonly string DefaultInstallDir = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Programs", Product);
     static readonly string ShortcutPath = Path.Combine(
@@ -234,7 +234,7 @@ static class Setup
         {
             registry.SetValue("DisplayName", Product);
             registry.SetValue("DisplayVersion", Version);
-            registry.SetValue("DisplayIcon", executable);
+            registry.SetValue("DisplayIcon", Path.Combine(directory, "_internal", "assets", "app.ico"));
             registry.SetValue("InstallLocation", directory);
             registry.SetValue("UninstallString", "\"" + Path.Combine(directory, "Uninstall.exe") + "\"");
             registry.SetValue("NoModify", 1, RegistryValueKind.DWord);
@@ -249,6 +249,8 @@ static class Setup
                 null, shortcut, new object[] { executable });
             shortcut.GetType().InvokeMember("WorkingDirectory", BindingFlags.SetProperty,
                 null, shortcut, new object[] { directory });
+            shortcut.GetType().InvokeMember("IconLocation", BindingFlags.SetProperty,
+                null, shortcut, new object[] { Path.Combine(directory, "_internal", "assets", "app.ico") + ",0" });
             shortcut.GetType().InvokeMember("Save", BindingFlags.InvokeMethod, null, shortcut, null);
         }
         finally
@@ -271,6 +273,7 @@ static class Setup
 
         public SetupForm()
         {
+            Icon = System.Drawing.Icon.ExtractAssociatedIcon(Assembly.GetExecutingAssembly().Location);
             Text = Product + " 安装";
             StartPosition = FormStartPosition.CenterScreen;
             FormBorderStyle = FormBorderStyle.FixedDialog;

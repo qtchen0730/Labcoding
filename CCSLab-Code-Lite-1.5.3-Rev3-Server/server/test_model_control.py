@@ -9,9 +9,11 @@ import unittest
 from unittest.mock import patch
 
 if __package__:
+    from .test_support import TEST_ROOT
     from . import model_control as m
     from . import model_host as host
 else:
+    from test_support import TEST_ROOT
     import model_control as m
     import model_host as host
 
@@ -69,7 +71,7 @@ class TelemetryTest(unittest.TestCase):
 class ControlTest(unittest.TestCase):
     def setUp(self):
         self.addCleanup(patch.stopall)
-        temp = tempfile.TemporaryDirectory(dir=TEST_DIR)
+        temp = tempfile.TemporaryDirectory(dir=TEST_ROOT)
         self.addCleanup(temp.cleanup)
         self.control = m.ModelControl(Path(temp.name) / "model.db", "http://example.invalid", "fixture-token")
         patch.object(self.control, "_policy", return_value=POLICY).start()
@@ -186,7 +188,7 @@ class FixtureHost:
 
 class HostRecoveryTest(unittest.TestCase):
     def test_verified_new_context(self):
-        with tempfile.TemporaryDirectory(dir=TEST_DIR) as directory:
+        with tempfile.TemporaryDirectory(dir=TEST_ROOT) as directory:
             worker = FixtureHost(directory, [True])
             self.assertEqual(host.run_change(worker, POLICY, CHANGE)["status"], "applied")
             self.assertEqual(worker.config.read_bytes(), host.settings(B))
@@ -196,7 +198,7 @@ class HostRecoveryTest(unittest.TestCase):
 
     def test_restore_on_failed_health_or_restart(self):
         for first in (False, "restart_failure"):
-            with self.subTest(first=first), tempfile.TemporaryDirectory(dir=TEST_DIR) as directory:
+            with self.subTest(first=first), tempfile.TemporaryDirectory(dir=TEST_ROOT) as directory:
                 worker = FixtureHost(directory, [first, True])
                 self.assertEqual(host.run_change(worker, POLICY, CHANGE)["status"], "rolled_back")
                 self.assertEqual(worker.config.read_bytes(), host.settings(A))
@@ -204,7 +206,7 @@ class HostRecoveryTest(unittest.TestCase):
                 self.assertEqual(worker.restarts, 2)
 
     def test_preserve_pending_when_recovery_cannot_be_verified(self):
-        with tempfile.TemporaryDirectory(dir=TEST_DIR) as directory:
+        with tempfile.TemporaryDirectory(dir=TEST_ROOT) as directory:
             worker = FixtureHost(directory, [False, False])
             self.assertEqual(host.run_change(worker, POLICY, CHANGE)["status"], "rollback_failed")
             self.assertEqual(worker.config.read_bytes(), host.settings(A))

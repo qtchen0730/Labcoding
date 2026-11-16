@@ -1,13 +1,14 @@
 param(
-    [string]$Output = (Join-Path (Split-Path (Split-Path $PSScriptRoot)) '.work\releases\CCSLab-Code-Lite-1.5.3-Rev8-Setup-x64.exe'),
+    [string]$Output = (Join-Path (Split-Path (Split-Path $PSScriptRoot)) '.work\releases\CCSLab-Code-Lite-1.5.3-Rev11-Setup-x64.exe'),
     [string]$Python = 'python',
     [string]$PyInstallerPath = '',
-    [string]$BuildRoot = (Join-Path (Split-Path (Split-Path $PSScriptRoot)) '.work\build\Rev8')
+    [string]$BuildRoot = (Join-Path (Split-Path (Split-Path $PSScriptRoot)) '.work\build\Rev11')
 )
 
 $ErrorActionPreference = 'Stop'
 $LocalWork = Join-Path (Split-Path (Split-Path $PSScriptRoot)) '.work'
 $env:PYTHONPYCACHEPREFIX = (New-Item -ItemType Directory -Force -Path (Join-Path $LocalWork 'pycache')).FullName
+$env:PYINSTALLER_CONFIG_DIR = (New-Item -ItemType Directory -Force -Path (Join-Path $LocalWork 'pyinstaller-cache')).FullName
 $env:TEMP = $env:TMP = (New-Item -ItemType Directory -Force -Path (Join-Path $LocalWork 'tmp')).FullName
 $Product = 'CCSLab Code Lite'
 $Source = Join-Path (Split-Path $PSScriptRoot) 'app'
@@ -38,10 +39,19 @@ if ((Get-FileHash -LiteralPath $OpenCode -Algorithm SHA256).Hash -ne $OpenCodeHa
 }
 
 $Dist = Join-Path $BuildRoot 'dist'
+$Assets = (New-Item -ItemType Directory -Force -Path (Join-Path $LocalWork 'assets\Rev10')).FullName
+$Icon = Join-Path $Assets 'app.ico'
+$IconPng = Join-Path $Assets 'app.png'
+$IconBuilder = Join-Path $BuildRoot 'Build-Icon.exe'
+& $Compiler /nologo /target:exe /r:System.Drawing.dll /r:System.Xml.dll "/out:$IconBuilder" (Join-Path $PSScriptRoot 'Build-Icon.cs')
+Confirm-NativeSuccess 'Compiling vector icon renderer'
+& $IconBuilder (Join-Path $Source 'assets\logo.svg') $Icon $IconPng
+Confirm-NativeSuccess 'Rendering mint monogram icons'
 $Frozen = Join-Path $Dist $Product
 $AnalysisOutput = Join-Path $BuildRoot 'pyinstaller'
 $FreezeOptions = @(
     '--noconfirm', '--windowed', '--onedir', '--noupx', '--name', $Product,
+    '--icon', $Icon, '--add-data', "$Icon;assets", '--add-data', "$IconPng;assets",
     '--specpath', $BuildRoot, '--workpath', $AnalysisOutput, '--distpath', $Dist
 )
 & $Python -m PyInstaller @FreezeOptions (Join-Path $Source 'app.py')
@@ -66,7 +76,7 @@ $Payload = Join-Path $BuildRoot 'program.zip'
 $IntermediateSetup = Join-Path $BuildRoot 'Setup.exe'
 $CompilerOptions = @(
     '/nologo', '/target:winexe', '/optimize+', '/utf8output', '/codepage:65001',
-    '/platform:x64', "/win32manifest:$(Join-Path $PSScriptRoot 'as-invoker.manifest')",
+    '/platform:x64', "/win32manifest:$(Join-Path $PSScriptRoot 'as-invoker.manifest')", "/win32icon:$Icon",
     '/r:System.dll', '/r:System.Core.dll', '/r:System.Drawing.dll',
     '/r:System.Windows.Forms.dll', '/r:System.IO.Compression.dll'
 )

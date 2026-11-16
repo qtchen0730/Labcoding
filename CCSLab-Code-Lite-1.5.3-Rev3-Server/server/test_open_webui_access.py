@@ -2,6 +2,7 @@
 
 import os
 from pathlib import Path
+from .test_support import TEST_ROOT
 import tempfile
 from time import time
 import unittest
@@ -22,7 +23,7 @@ ENTRY_PASSWORD = "fixture-webui-entry"
 
 class OpenWebUIAccessTests(unittest.TestCase):
     def setUp(self):
-        scratch = tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent.parent)
+        scratch = tempfile.TemporaryDirectory(dir=TEST_ROOT)
         self.addCleanup(scratch.cleanup)
         self.root = Path(scratch.name)
         self.accounts, _, self.gateway = setup(self.root, lambda _: None)

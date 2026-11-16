@@ -22,6 +22,8 @@ from starlette.concurrency import run_in_threadpool
 
 from .accounts import AccountError, Accounts
 from .model_control import ModelControl, ModelControlError
+from .quotas import UsageObserver
+from .account_errors import QuotaError
 
 
 _MODEL_FIELDS = frozenset({
@@ -209,7 +211,7 @@ async def _bounded_body(response, check):
         result.extend(piece)
 
 
-async def _event_frames(upstream, check, release):
+async def _event_frames(upstream, check, release, observer=None):
     """Preserve each complete SSE frame (including usage-only frames)."""
     lines = upstream.aiter_lines()
     event, size = [], 0
@@ -219,6 +221,8 @@ async def _event_frames(upstream, check, release):
                 line = await _authorize_wait(anext(lines), check)
             except StopAsyncIteration:
                 if event:
+                    if observer:
+                        observer.frame(event)
                     await check()
                     yield "\n".join(event) + "\n\n"
                 break
@@ -229,6 +233,8 @@ async def _event_frames(upstream, check, release):
                 event.append(line)
                 continue
             if event:
+                if observer:
+                    observer.frame(event)
                 await check()
                 yield "\n".join(event) + "\n\n"
                 event, size = [], 0
@@ -276,6 +282,14 @@ def create_app(settings=None, *, model_control=None, upstream_transport=None, al
     @app.exception_handler(ModelControlError)
     async def expected_error(_request, error):
         headers = {"WWW-Authenticate": "Bearer"} if error.status_code == 401 else None
+        if isinstance(error, QuotaError):
+            request_id = getattr(_request.state, "model_request_id", None)
+            diagnostics = {"stage": "quota", "request_id": request_id,
+                           **getattr(_request.state, "quota_diagnostics", {})}
+            return JSONResponse({"detail": str(error), "error": {
+                "message": str(error), "code": error.code, "type": "insufficient_quota",
+                "quota_diagnostics": diagnostics}}, error.status_code,
+                headers={"X-Request-ID": request_id} if request_id else None)
         return JSONResponse({"detail": str(error)}, error.status_code, headers=headers)
 
     @app.exception_handler(RequestValidationError)
@@ -373,6 +387,11 @@ def create_app(settings=None, *, model_control=None, upstream_transport=None, al
         status, = _only(await _json_input(request), "status")
         return {"user": await run_in_threadpool(accounts.change_status, _token(request), user_id, status)}
 
+    @app.post("/api/admin/users/{user_id}/quota")
+    async def set_quota(user_id: int, request: Request, _admin=Depends(admin_user)):
+        mode, limit = _only(await _json_input(request), "mode", "limit_tokens")
+        return {"quota": await run_in_threadpool(accounts.quotas.set, _token(request), user_id, mode, limit)}
+
     @app.post("/api/admin/authorization-code", status_code=204)
     async def change_authorization_code(request: Request, _admin=Depends(admin_user)):
         current, replacement = _only(await _json_input(request), "current_code", "new_code")
@@ -426,8 +445,10 @@ def create_app(settings=None, *, model_control=None, upstream_transport=None, al
         request_id = request.headers.get("X-Request-ID", "")
         if not re.fullmatch(r"[a-f0-9]{32}", request_id):
             request_id = uuid.uuid4().hex
+        request.state.model_request_id = request_id
         token = _token(request)
         payload = _chat_input(await _json_input(request, _MODEL_BODY_LIMIT), settings)
+        request.state.quota_diagnostics = {"output_reserve": payload["max_tokens"]}
 
         async def check():
             await run_in_threadpool(accounts.session, token, active=True)
@@ -439,6 +460,9 @@ def create_app(settings=None, *, model_control=None, upstream_transport=None, al
         upstream = None
         handed_over = False
         released = False
+        reservation = None
+        observer = UsageObserver()
+        sent = False
 
         async def release():
             nonlocal released
@@ -450,16 +474,51 @@ def create_app(settings=None, *, model_control=None, upstream_transport=None, al
                     if upstream is not None:
                         await upstream.aclose()
                 finally:
-                    model.end_inference()
+                    try:
+                        if reservation is not None:
+                            await run_in_threadpool(accounts.quotas.finish, reservation, observer.result, sent=sent)
+                    finally:
+                        model.end_inference()
 
         try:
             client = request.app.state.upstream
+            reserve_tokens = None
+            if _user.get("quota", {}).get("mode") == "limited":
+                if _user["quota"]["remaining_tokens"] == 0:
+                    raise QuotaError("用户额度已经用完，请充值。", "token_quota_exhausted")
+                # Use the running model's own template and tokenizer, including tools,
+                # history and system messages. Never turn a character estimate into a bill.
+                for path, body in (("apply-template", payload), ("tokenize", None)):
+                    if body is None:
+                        body = {"content": prompt, "add_special": True, "parse_special": True}
+                    counted = await _authorize_wait(client.post(path, json=body), check)
+                    if counted.status_code != 200 or len(counted.content) > _MODEL_RESPONSE_LIMIT:
+                        raise HTTPException(503, "模型分词接口不可用，限额账号暂不能安全发起请求。")
+                    try:
+                        value = counted.json()
+                    except (ValueError, RecursionError):
+                        raise HTTPException(503, "模型分词接口返回无效统计。") from None
+                    if not isinstance(value, dict):
+                        raise HTTPException(503, "模型分词接口返回无效统计。")
+                    if path == "apply-template":
+                        prompt = value.get("prompt")
+                        if not isinstance(prompt, str):
+                            raise HTTPException(503, "模型模板接口返回无效内容。")
+                    else:
+                        tokens = value.get("tokens")
+                        if not isinstance(tokens, list) or any(type(n) is not int for n in tokens):
+                            raise HTTPException(503, "模型分词接口返回无效统计。")
+                        reserve_tokens = len(tokens) + payload["max_tokens"]
+                        request.state.quota_diagnostics["input_tokens"] = len(tokens)
+            reservation = await run_in_threadpool(accounts.quotas.reserve, token, request_id, reserve_tokens)
             call = client.build_request("POST", "v1/chat/completions", json=payload)
             call.headers["X-Request-ID"] = request_id
             call.headers.pop("Cookie", None)
+            sent = True
             upstream = await _authorize_wait(client.send(call, stream=True), check)
             await check()
             if not 200 <= upstream.status_code < 300:
+                sent = upstream.status_code >= 500  # Unknown server failures retain an unconfirmed hold.
                 if upstream.status_code == 400:
                     # The upstream body can contain caller input. Expose only known error categories.
                     body = await _bounded_body(upstream, check)
@@ -478,12 +537,13 @@ def create_app(settings=None, *, model_control=None, upstream_transport=None, al
                 if "text/event-stream" not in upstream.headers.get("Content-Type", ""):
                     raise HTTPException(502, "模型服务未返回流式响应。")
                 response = StreamingResponse(
-                    _event_frames(upstream, check, release), media_type="text/event-stream",
+                    _event_frames(upstream, check, release, observer), media_type="text/event-stream",
                     headers={"X-Accel-Buffering": "no", "X-Request-ID": request_id}, background=BackgroundTask(release),
                 )
                 handed_over = True
                 return response
             data = await _bounded_body(upstream, check)
+            observer.body(data)
             await check()
             return Response(data, media_type="application/json", headers={"X-Request-ID": request_id})
         except httpx.HTTPError:

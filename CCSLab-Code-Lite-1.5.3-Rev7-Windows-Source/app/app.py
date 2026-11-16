@@ -10,7 +10,7 @@ from queue import Empty, Queue
 from threading import Event, Lock, Thread
 from time import monotonic, time
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from changes import Changes
 from account_client import (
@@ -29,7 +29,10 @@ from direct_view import build_direct_page
 from markdown_view import configure_markdown, insert_markdown
 from new_project import show_new_project
 from settings_view import build_settings_page
-from themes import DARK, LIGHT, THEMES, theme_key
+from themes import DARK, LIGHT, THEMES, theme_key, migrate_default_theme
+from ui_icons import ActionIcon, gear_image, apply_window_icon
+from saved_login import SavedLogin
+from quota_view import balance_text, blocked_message
 
 
 FONT = "Microsoft YaHei UI"
@@ -48,6 +51,11 @@ def write_json(path, value):
     tmp.replace(path)
 
 
+def valid_session_title(title):
+    return (isinstance(title, str) and 1 <= len(title.strip()) <= 100
+            and not any(ord(char) < 32 or ord(char) == 127 for char in title))
+
+
 class App:
     def __init__(self, root, data_dir=None, smoke=False):
         self.root = root
@@ -56,6 +64,9 @@ class App:
         self.state = self.data_root
         self.prefs_path = self.data_root / "preferences.json"
         self.prefs = read_json(self.prefs_path, {})
+        theme_migrated = migrate_default_theme(self.prefs)
+        self.saved_login = SavedLogin(self.data_root)
+        self.saved_login_suppressed = False
         self.direct_requested = self.prefs.get("connection_mode") == "direct"
         self.connection_mode = "account"
         server = preferred_account_server(self.prefs)
@@ -82,6 +93,7 @@ class App:
         self.account_online = False
         self.account_polling = False
         self.pending_locked = False
+        self.quota_locked = False
         self.account_generation = 0
         self.account_ca_path = None
         self.model_info = {}
@@ -100,6 +112,7 @@ class App:
         self.session = None
         self.history_path = None
         self.history = {}
+        self.session_titles = {}
         self.drafts = {}
         self.events = Queue()
         self.timers = {}
@@ -111,6 +124,7 @@ class App:
         self.live_markdown = ""
         self.render_later = None
         self.status = tk.StringVar(value="请登录")
+        self.quota_text = tk.StringVar()
         self.direct_status = tk.StringVar(value="待权限验证")
         self.direct_feedback = tk.StringVar()
         self.direct_address = tk.StringVar(value=self.direct_connection.model_base)
@@ -142,12 +156,18 @@ class App:
         self.style = ttk.Style()
         self.style.theme_use("clam")
         root.title("CCSLab Code Lite")
+        apply_window_icon(root)
         root.geometry(f"{min(1748, root.winfo_screenwidth() - 70)}x{min(1228, root.winfo_screenheight() - 130)}")
         root.minsize(950, 580)
         root.protocol("WM_DELETE_WINDOW", self.close)
         self.build()
         self.apply_theme()
         self.show_page("access", force=True)
+        if theme_migrated:
+            try:
+                self.save_prefs()
+            except OSError:
+                self.page_controller.feedback.set("无法保存主题设置，请检查本机数据目录权限。")
         if self.direct_requested:
             self.show_direct_login_hint()
         self.update_actions()
@@ -157,6 +177,7 @@ class App:
             self.schedule("legacy", 100, self.remove_legacy_key)
             self.schedule("connection", 3500, self.monitor_account)
             self.schedule("gateway_check", 100, self.check_account_connection)
+            self.schedule("saved_login", 250, self.restore_saved_login)
 
     def schedule(self, name, delay, callback):
         previous = self.timers.pop(name, None)
@@ -229,12 +250,20 @@ class App:
         footer = self.frame(self.root)
         footer.pack(side="bottom", fill="x")
         self.settings_button = self.button(footer, "设置", lambda: self.show_page("settings"), "Nav.TButton")
-        self.settings_button.pack(side="left", padx=13, pady=8)
+        self.settings_button.configure(compound="right", width=0)
+        self.settings_button.pack(side="left", padx=(13, 12), pady=8)
+        self.settings_icon_palette = None
+        self.quota_label = self.label(footer, variable=self.quota_text, color="heading", size=9)
         self.admin_button = self.button(bar, "管理控制台", lambda: self.show_page("admin"), "Nav.TButton")
         self.connection_button = self.button(bar, "登录 / 注册", self.account_action, "Nav.TButton")
         self.connection_button.pack(side="right", padx=(7, 15))
         self.role_button = self.button(bar, "切换角色", self.change_role, "Nav.TButton")
-        self.label(bar, variable=self.status, muted=True).pack(side="right", padx=(4, 4))
+        identity = self.frame(bar)
+        identity.pack(side="right", padx=(6, 4))
+        self.theme_icon = ActionIcon(self, identity, "sun", self.cycle_theme)
+        self.theme_icon.pack(side="left")
+        self.status_label = self.label(identity, variable=self.status, muted=True)
+        self.status_label.pack(side="left", padx=(4, 0))
         ttk.Separator(self.root).pack(fill="x")
 
         self.page_host = self.frame(self.root, "bg")
@@ -283,6 +312,12 @@ class App:
         session_panel, self.session_list = self.scroll_list(side, 7, "side")
         session_panel.pack(fill="both", expand=True, padx=12, pady=(0, 13))
         self.session_list.bind("<<ListboxSelect>>", self.select_session)
+        self.session_list.bind("<Button-3>", self.show_session_menu)
+        self.session_list.bind("<F2>", lambda _event: self.rename_session())
+        self.session_menu = self.skin(tk.Menu(self.root, tearoff=False, font=(FONT, 10)),
+                                      "panel", "text", activebackground="soft", activeforeground="heading",
+                                      disabledforeground="muted")
+        self.session_menu.add_command(label="重命名")
         self.session_search.trace_add("write", lambda *_args: self.render_session_list())
         self.refresh_recents()
 
@@ -308,6 +343,8 @@ class App:
         ttk.Separator(center).pack(fill="x", padx=16, pady=(6, 0))
         self.label(center, "输入开发任务", bold=True).pack(fill="x", padx=16, pady=(10, 5))
         composer, self.input = self.text_panel(center, editable=True, height=4)
+        self.quota_banner = self.label(self.input, "", color="remove", bg="field")
+        self.quota_banner.configure(wraplength=400)
         composer.pack(fill="x", padx=14)
         self.input.bind("<Control-Return>", self.submit_shortcut)
         actions = self.frame(center)
@@ -335,6 +372,7 @@ class App:
         tools_tab = self.frame(tabs)
         tabs.add(changes_tab, text="文件变更")
         tabs.add(tools_tab, text="执行记录")
+        tabs.select(tools_tab)
         search = self.frame(changes_tab)
         search.pack(fill="x", pady=(7, 0))
         self.label(search, "筛选", muted=True, size=9).pack(side="left", padx=(0, 6))
@@ -470,6 +508,24 @@ class App:
         self.diff_theme(self.diff, c)
         self.activity.theme(c)
         self.context_meter.theme(c)
+        self.update_settings_icon()
+        self.theme_icon.theme(c)
+
+    def update_settings_icon(self):
+        if not hasattr(self, "colors"):
+            return
+        selected = self.current_page == "settings"
+        palette = (self.colors["heading"], self.colors["soft" if selected else "panel"])
+        if palette != self.settings_icon_palette:
+            self.settings_image = gear_image(self.root, *palette)
+            self.settings_button.configure(image=self.settings_image)
+            self.settings_icon_palette = palette
+
+    def cycle_theme(self):
+        keys = list(THEMES)
+        key = keys[(keys.index(theme_key(self.theme.get())) + 1) % len(keys)]
+        self.theme.set(THEMES[key][0])
+        self.apply_preferences()
 
     @staticmethod
     def diff_theme(box, colors):
@@ -572,6 +628,23 @@ class App:
             self.pending_banner.pack_forget()
             self.input.configure(state="normal")
         self.pending_locked = self.account_pending
+        message = blocked_message(self.account) if self.connection_mode == "account" else ""
+        if message:
+            self.input.configure(state="disabled")
+        elif self.quota_locked and not self.account_pending:
+            self.input.configure(state="normal")
+        self.quota_locked = bool(message)
+        if message:
+            self.quota_banner.configure(text=message)
+            self.quota_banner.place(relx=0.5, rely=0.5, anchor="center")
+        else:
+            self.quota_banner.place_forget()
+        if self.account and self.connection_mode == "account" and not self.is_admin:
+            self.quota_text.set(balance_text(self.account, online=self.account_online))
+            if not self.quota_label.winfo_manager():
+                self.quota_label.pack(side="left")
+        else:
+            self.quota_label.pack_forget()
         if self.connection_mode == "account" and self.account and not self.role_button.winfo_manager():
             self.role_button.pack(side="right", padx=(3, 0), after=self.connection_button)
         elif (self.connection_mode != "account" or not self.account) and self.role_button.winfo_manager():
@@ -594,12 +667,14 @@ class App:
                         or (page == "workspace" and self.current_page == "status")
                         or (page == "access" and self.current_page == "direct"))
             button.configure(style="Selected.Nav.TButton" if selected else "Nav.TButton")
+        self.update_settings_icon()
 
     @property
     def can_use_agent(self):
         if self.connection_mode == "direct":
             return self.direct_unlocked and self.direct_ready
-        return bool(self.account_client and self.account_online and self.account and self.account["status"] == "active")
+        return bool(self.account_client and self.account_online and self.account and self.account["status"] == "active"
+                    and not blocked_message(self.account))
 
     @property
     def can_open_project(self):
@@ -634,7 +709,10 @@ class App:
         if not self.can_switch_role or self.busy or self.running:
             return
         target = "user" if self.is_admin else "admin"
-        prompt_role_switch(self, target, lambda code: self.switch_role(target, code))
+        if target == "user":
+            self.switch_role(target, "")
+        else:
+            prompt_role_switch(self, target, lambda code: self.switch_role(target, code))
 
     def switch_role(self, target, authorization_code):
         if not self.can_switch_role or self.busy or self.running or self.closing:
@@ -648,6 +726,10 @@ class App:
         def done(user):
             self.token = client.token
             self.account, self.account_online = user, True
+            try:
+                self.saved_login.update_session(client.base, client.token)
+            except (OSError, ValueError):
+                self.status.set("角色已切换，保存的登录未能更新")
             if self.engine:
                 self.engine.close()
                 self.engine = None
@@ -664,6 +746,8 @@ class App:
         self.worker("切换登录角色", lambda: client.switch_role(target, authorization_code), done, failed)
 
     def require_account_login(self, message):
+        self.cancel_saved_login()
+        self.saved_login.forget()
         self.clear_account()
         self.connection_mode = "account"
         self.show_page("access", force=True)
@@ -854,15 +938,22 @@ class App:
         if client is None:
             self.show_page("access")
             return
+        self.cancel_saved_login()
+        try:
+            self.saved_login.update_session(client.base, "")
+        except (OSError, ValueError):
+            pass  # The server session is still revoked; the remembered password is kept.
 
         def done(_result):
             self.clear_account()
             self.show_page("access", force=True)
+            self.page_controller.reset()
             self.check_account_connection()
 
         def failed(error):
             self.clear_account()
             self.show_page("access", force=True)
+            self.page_controller.reset()
             self.status.set("已在本机退出 · 服务器会话按设定过期")
             self.check_account_connection()
 
@@ -1186,6 +1277,74 @@ class App:
                     lambda _result: self.direct_feedback.set("工具调用通过：模型读取了测试文件并生成回复。"),
                     failed)
 
+    def cancel_saved_login(self):
+        self.saved_login_suppressed = True
+        timer = self.timers.pop("saved_login", None)
+        if timer:
+            self.root.after_cancel(timer)
+
+    def restore_saved_login(self):
+        if self.account_client or self.closing or self.saved_login_suppressed:
+            return
+        if not self.saved_login.path.is_file():
+            return
+        if self.busy:
+            self.schedule("saved_login", 1000, self.restore_saved_login)
+            return
+        if self.current_page != "access" or self.page_controller.mode != "login":
+            self.schedule("saved_login", 15000, self.restore_saved_login)
+            return
+        page = self.page_controller
+        if not page.remember.get():
+            return
+        connection = self.account_connection
+        username = page.username.get().strip()
+        page.set_busy(True)
+        page.feedback.set("正在恢复保存的登录…")
+
+        def request():
+            record = self.saved_login.load(connection[0])
+            if record is None:
+                return None
+            if username and username != record["username"]:
+                return None
+            client = self.get_account_client(connection)
+            client.token = record.get("token", "")
+            try:
+                user = client.me() if client.token else None
+            except AccountError as error:
+                if error.status != 401:
+                    raise
+                user = None
+                client.token = ""
+            if user is None:
+                # Expired administrator sessions resume as ordinary users; authorization
+                # codes are never stored or replayed for privilege elevation.
+                user = client.login(record["username"], record["password"])
+            self.saved_login.save(client.base, record["username"], record["password"], client.token)
+            return client, user
+
+        def done(result):
+            if page.container.winfo_exists():
+                page.set_busy(False)
+                page.feedback.set("")
+            if result and connection == self.account_connection and not self.account_client:
+                self.signed_in(*result)
+
+        def failed(error):
+            if page.container.winfo_exists():
+                page.set_busy(False)
+            invalid = isinstance(error, AccountError) and error.status in {401, 403}
+            if invalid:
+                self.cancel_saved_login()
+            elif not self.closing:
+                self.schedule("saved_login", 15000, self.restore_saved_login)
+            if page.container.winfo_exists():
+                page.feedback.set("保存的登录未通过验证，请检查密码后重试。" if invalid else
+                                  "暂时无法自动登录，已保留账号密码，连接恢复后重试。")
+
+        self.worker("恢复保存的登录", request, done, failed)
+
     def signed_in(self, client, user):
         self.clear_account(forget_session=False)
         self.connection_mode = "account"
@@ -1256,6 +1415,7 @@ class App:
         self.session = None
         self.history_path = None
         self.history = {}
+        self.session_titles = {}
         self.state = self.data_root
         self.drafts.clear()
         self.input.configure(state="normal")
@@ -1442,6 +1602,7 @@ class App:
         self.refresh_recents()
         self.history_path = self.state / (hashlib.sha256(os.path.normcase(path).encode()).hexdigest() + ".json")
         self.history = read_json(self.history_path, {})
+        self.load_session_titles()
         self.update_sessions([])
         self.session_search.set("")
         self.changes = None
@@ -1507,11 +1668,74 @@ class App:
             raise
 
     def update_sessions(self, sessions):
-        known = {row["id"]: row for row in sessions}
+        known = {row["id"]: dict(row) for row in sessions}
         for key, record in self.history.items():
             known.setdefault(key, {"id": key, "title": record.get("title", "历史会话")})
+        for key, row in known.items():
+            if key in self.session_titles:
+                row["title"] = self.session_titles[key]
         self.sessions = list(known.values())
         self.render_session_list()
+
+    def load_session_titles(self):
+        saved = read_json(self.history_path.with_suffix(".titles.json"), {})
+        self.session_titles = ({key: value.strip() for key, value in saved.items()
+                                if isinstance(key, str) and valid_session_title(value)}
+                               if isinstance(saved, dict) else {})
+
+    def show_session_menu(self, event):
+        index = self.session_list.nearest(event.y)
+        bounds = self.session_list.bbox(index) if self.visible_sessions else None
+        if not bounds or not bounds[1] <= event.y < bounds[1] + bounds[3]:
+            return "break"
+        session_id = self.visible_sessions[index]["id"]
+        enabled = not (self.busy or self.running or self.closing) and self.can_open_project and self.history_path
+        self.session_menu.entryconfigure(0, state="normal" if enabled else "disabled",
+                                         command=lambda: self.rename_session(session_id))
+        try:
+            self.session_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.session_menu.grab_release()
+        return "break"
+
+    def rename_session(self, session_id=None):
+        if self.busy or self.running or self.closing or not self.can_open_project or not self.history_path:
+            return
+        if session_id is None:
+            selection = self.session_list.curselection()
+            if not selection:
+                return
+            session_id = self.visible_sessions[selection[0]]["id"]
+        row = next((row for row in self.sessions if row["id"] == session_id), None)
+        if row is None:
+            return
+        project, history_path, generation = self.project, self.history_path, self.account_generation
+        title = simpledialog.askstring("重命名会话", "会话名称（1–100 个字符）：",
+                                       initialvalue=row.get("title") or "新会话", parent=self.root)
+        if title is None:
+            return
+        if (self.busy or self.running or self.closing or not self.can_open_project
+                or project != self.project or history_path != self.history_path
+                or generation != self.account_generation):
+            return
+        if not valid_session_title(title):
+            self.show_error("无法重命名", "会话名称须为 1–100 个字符，不能包含换行或控制字符。")
+            return
+        title = title.strip()
+        updated = {**self.session_titles, session_id: title}
+        try:
+            write_json(history_path.with_suffix(".titles.json"), updated)
+        except OSError as error:
+            self.show_error("重命名保存失败，请重试", error)
+            return
+        self.session_titles = updated
+        if self.session_search.get().strip().casefold() not in title.casefold():
+            self.session_search.set("")
+        self.update_sessions(self.sessions)
+        for index, item in enumerate(self.visible_sessions):
+            if item["id"] == session_id:
+                self.session_list.see(index)
+                break
 
     def render_session_list(self):
         query = self.session_search.get().strip().casefold()
@@ -1529,7 +1753,7 @@ class App:
             return
         row = self.visible_sessions[selected[0]]
         session_id = row["id"]
-        engine, history, history_path = self.engine, self.history, self.history_path
+        engine, history, history_path, titles = self.engine, self.history, self.history_path, self.session_titles
         if not messagebox.askyesno(
                 "删除历史会话", f"删除会话“{row.get('title') or '新会话'}”？\n\n"
                 "此会话的聊天记录、执行记录和草稿将被删除，无法恢复。项目文件将保留。",
@@ -1543,10 +1767,14 @@ class App:
             remaining = {key: value for key, value in history.items() if key != session_id}
             try:
                 write_json(history_path, remaining)
+                if session_id in titles:
+                    remaining_titles = {key: value for key, value in titles.items() if key != session_id}
+                    write_json(history_path.with_suffix(".titles.json"), remaining_titles)
             except OSError as error:
                 self.show_error("会话已删除，但本地显示记录保存失败，请重试删除", error)
                 return
             history.pop(session_id, None)
+            titles.pop(session_id, None)
             if history is not self.history:
                 return
             self.drafts.pop((self.project, session_id), None)
@@ -1639,7 +1867,7 @@ class App:
             if direct:
                 client.check_open_webui_access()
             elif client:
-                self.require_active(client)
+                self.require_active(client, check_quota=True)
                 try:
                     model = client.model()
                 except AccountError as error:
@@ -1667,6 +1895,7 @@ class App:
                 self.update_sessions(sessions)
             self.update_model(model)
             if not self.can_use_agent:
+                self.update_actions()
                 return
             if not self.session:
                 self.drafts.pop((self.project, None), None)
@@ -1689,9 +1918,12 @@ class App:
         self.worker("校验身份并准备任务", work, prepared, failed)
 
     @staticmethod
-    def require_active(client):
-        if client.me()["status"] != "active":
+    def require_active(client, *, check_quota=False):
+        user = client.me()
+        if user["status"] != "active":
             raise AccountError("账号未激活或已禁用。", 403)
+        if check_quota and blocked_message(user):
+            raise AccountError(blocked_message(user), 402)
 
     def run_task(self, prompt):
         session = self.session
@@ -1718,6 +1950,8 @@ class App:
         def on_event(event):
             clean = self.redact(event)
             self.events.put(lambda: self.track(record, clean))
+            if event.get("type") == "context" and event.get("state") in {"request_complete", "request_failed"}:
+                self.events.put(self.poll_account)
 
         def work():
             authorize = None
@@ -1731,6 +1965,7 @@ class App:
 
         def done(_result, error=False):
             self.running = False
+            self.poll_account()
             stopped = self.stop_requested.is_set()
             status = "已停止" if stopped else ("任务失败" if error else ("方案已生成" if planning else "任务已完成"))
             self.task_state.set(status)

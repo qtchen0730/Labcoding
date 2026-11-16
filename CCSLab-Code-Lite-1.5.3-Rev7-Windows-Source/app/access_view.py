@@ -20,6 +20,9 @@ def build_access_page(app, parent):
 def prompt_role_switch(app, target_role, submit):
     if app.busy or app.running or app.closing:
         return None
+    if target_role == "user":
+        submit("")
+        return None
     destination = {"admin": "管理员", "user": "普通用户"}[target_role]
     window = tk.Toplevel(app.root)
     window.title("切换登录身份")
@@ -81,11 +84,13 @@ class AccessPage:
         self.card.pack(fill="both", padx=26, pady=20)
         self.mode = "login"
         self.request_pending = False
+        self.credential_origin = None
         self.username = tk.StringVar(master=body)
         self.password = tk.StringVar(master=body)
         self.confirmation = tk.StringVar(master=body)
         self.authorization = tk.StringVar(master=body)
         self.admin_login = tk.BooleanVar(master=body, value=False)
+        self.remember = tk.BooleanVar(master=body, value=app.saved_login.path.exists())
         self.server_label = tk.StringVar(master=body)
         self.headline = tk.StringVar(master=body)
         self.feedback = tk.StringVar(master=body)
@@ -149,10 +154,15 @@ class AccessPage:
         self.fields.columnconfigure(1, weight=1)
         self.user_entry = self.field(0, "用户名", self.username)
         self.password_entry = self.field(1, f"账号密码（{PASSWORD_RANGE}）", self.password, masked=True)
+        for field in (self.user_entry[1], self.password_entry[1]):
+            field.bind("<KeyPress>", lambda _event: self.app.cancel_saved_login(), add=True)
         self.confirm_entry = self.field(2, "确认密码", self.confirmation, masked=True)
         self.role_checkbox = ttk.Checkbutton(self.fields, text="以管理员身份登录", variable=self.admin_login)
         self.role_checkbox.grid(row=2, column=0, columnspan=2, sticky="w", pady=5)
         self.admin_entry = self.field(3, "管理员授权密码", self.authorization, masked=True)
+        self.remember_checkbox = ttk.Checkbutton(self.fields, text="保存账号密码，下次启动自动登录",
+                                                variable=self.remember, command=self.remember_changed)
+        self.remember_checkbox.grid(row=4, column=0, columnspan=2, sticky="w", pady=5)
         feedback = app.label(self.card, variable=self.feedback, color="heading")
         feedback.configure(wraplength=382)
         feedback.pack(fill="x", pady=(7, 3))
@@ -181,6 +191,8 @@ class AccessPage:
             "admin": "需要实验室分发的管理员授权密码。",
         }[mode])
         self.feedback.set(message)
+        if mode == "login":
+            self.restore_saved_fields()
         for key, button in self.tabs.items():
             button.configure(style="Accent.TButton" if key == mode else "TButton")
         target = self.password_entry[1] if self.username.get() else self.user_entry[1]
@@ -192,6 +204,7 @@ class AccessPage:
         show_authorization = administrator or self.mode == "admin"
         for widgets, visible in (
             ((self.role_checkbox,), is_login),
+            ((self.remember_checkbox,), is_login),
             (self.confirm_entry, not is_login),
             (self.admin_entry, show_authorization),
         ):
@@ -206,12 +219,40 @@ class AccessPage:
 
     def refresh(self):
         try:
-            self.server_label.set(normalize_server(self.app.account_connection[0]))
+            server = normalize_server(self.app.account_connection[0])
+            self.server_label.set(server)
+            if self.credential_origin is not None and self.credential_origin != server:
+                self.username.set("")
+                self.clear_secrets()
+            self.credential_origin = server
+            if self.mode == "login":
+                self.restore_saved_fields()
         except AccountError:
             self.server_label.set("地址无效，请检查服务器设置")
 
+    def restore_saved_fields(self):
+        if not self.remember.get():
+            return
+        try:
+            record = self.app.saved_login.load(self.app.account_connection[0])
+        except (OSError, ValueError, AccountError):
+            self.feedback.set("无法读取本机保存的登录，请重新输入或取消保存。")
+            return
+        if record and (not self.username.get() or self.username.get() == record["username"]):
+            self.username.set(record["username"])
+            self.password.set(record["password"])
+
+    def remember_changed(self):
+        if not self.remember.get():
+            self.app.cancel_saved_login()
+            try:
+                self.app.saved_login.forget()
+            except OSError:
+                self.feedback.set("无法清除本机保存的登录，请检查数据目录权限。")
+
     def reset(self):
         self.username.set("")
+        self.remember.set(self.app.saved_login.path.exists())
         self.select("login")
         self.refresh()
 
@@ -224,12 +265,13 @@ class AccessPage:
         state = "disabled" if value else "normal"
         for widget in (*self.tabs.values(), self.action, self.settings_button, self.public_button,
                        self.user_entry[1], self.password_entry[1],
-                       self.confirm_entry[1], self.admin_entry[1], self.role_checkbox):
+                       self.confirm_entry[1], self.admin_entry[1], self.role_checkbox, self.remember_checkbox):
             widget.configure(state=state)
 
     def submit(self, _event=None):
         if self.request_pending or self.app.busy or self.app.closing:
             return "break"
+        self.app.cancel_saved_login()
         name = self.username.get().strip()
         password = self.password.get()
         role = self.mode
@@ -252,6 +294,7 @@ class AccessPage:
             self.admin_entry[1].focus_set()
             return "break"
         connection = self.app.account_connection
+        remember = self.remember.get()
         self.feedback.set("正在连接账号服务器…")
         self.set_busy(True)
 
@@ -278,10 +321,12 @@ class AccessPage:
                 return
             try:
                 self.app.signed_in(client, user)
+                if remember:
+                    self.app.saved_login.save(client.base, name, password, client.token)
+                else:
+                    self.app.saved_login.forget()
             except OSError:
-                self.app.clear_account()
-                if self.container.winfo_exists():
-                    self.feedback.set("无法写入本机账号数据目录。请检查目录权限。")
+                self.app.show_error("登录信息保存失败", "无法写入本机数据目录或加密凭据，请检查目录权限。")
 
         def failed(error):
             if not self.container.winfo_exists():

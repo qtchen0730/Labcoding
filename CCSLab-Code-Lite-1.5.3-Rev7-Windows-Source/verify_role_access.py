@@ -28,6 +28,9 @@ class AppStub:
         self.copy_account_diagnostics = Mock()
         self.show_account_diagnostics = Mock()
         self.signed_in = Mock()
+        self.saved_login = Mock()
+        self.saved_login.path.exists.return_value = False
+        self.cancel_saved_login = Mock()
 
     def frame(self, parent, _style=None):
         return ttk.Frame(parent)
@@ -146,8 +149,11 @@ class AccessUI(unittest.TestCase):
                 register.assert_called_once_with(*fields)
         self.assertIn(PASSWORD_RANGE, self.page.password_entry[0].cget("text"))
 
-    def test_switch_prompts_for_both_directions_and_requires_nonempty_code(self):
-        for target in ("user", "admin"):
+    def test_switch_only_elevation_requires_nonempty_code(self):
+        submitted = Mock()
+        self.assertIsNone(prompt_role_switch(self.app, "user", submitted))
+        submitted.assert_called_once_with("")
+        for target in ("admin",):
             submitted = Mock()
             window = prompt_role_switch(self.app, target, submitted)
             entry = widget(window, ttk.Entry)

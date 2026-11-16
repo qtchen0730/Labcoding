@@ -4,6 +4,7 @@ from http.client import HTTPConnection, HTTPSConnection
 import json
 import os
 from pathlib import Path
+from .test_support import TEST_ROOT
 import shutil
 import socket
 import ssl
@@ -22,13 +23,13 @@ PROJECT = Path(__file__).resolve().parent.parent
 @unittest.skipIf(getattr(os, "geteuid", lambda: 1)() == 0, "The Gateway CLI must run as a non-root user.")
 class ServeTests(unittest.TestCase):
     def setUp(self):
-        directory = tempfile.TemporaryDirectory(dir=PROJECT)
+        directory = tempfile.TemporaryDirectory(dir=TEST_ROOT)
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
         self.database = self.root / "accounts.sqlite3"
         token_file = self.root / "llama-api-key"
         token_file.write_text("fixture-only-key\n", encoding="ascii")
-        self.command = [sys.executable, "-m", "server", "--database", str(self.database), "serve"]
+        self.command = [sys.executable, "-B", "-m", "server", "--database", str(self.database), "serve"]
         self.process_options = {
             "cwd": PROJECT, "stdout": subprocess.PIPE, "stderr": subprocess.STDOUT, "text": True,
             "env": {key: value for key, value in os.environ.items() if not key.startswith("CCSLAB_")} | {

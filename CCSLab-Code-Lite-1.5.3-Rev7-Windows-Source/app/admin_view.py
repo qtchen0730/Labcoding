@@ -6,6 +6,7 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 from account_client import ACCOUNT_STATUS
+from quota_view import balance_text, parse_k, snapshot
 
 
 UNAVAILABLE = "暂不可用"
@@ -181,11 +182,73 @@ class AdminPage:
             for button in actions.winfo_children():
                 button.bind("<MouseWheel>", self.scroll_users)
                 button.bind("<FocusIn>", self.reveal_user_action)
+            quota = app.frame(card, "field")
+            quota.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+            app.label(quota, balance_text(user), bg="field", muted=True).pack(side="left")
+            app.button(quota, "设置额度", lambda: self.edit_quota(identity)).pack(side="left", padx=(12, 0))
 
         card.bind("<MouseWheel>", self.scroll_users)
         for child in card.winfo_children():
             child.bind("<MouseWheel>", self.scroll_users)
         return card
+
+    def edit_quota(self, identity):
+        app = self.app
+        if not app.is_admin or app.busy or app.running or app.closing:
+            return
+        user = self.users.get(identity)
+        if not user or user["role"] != "user":
+            return
+        window = tk.Toplevel(app.root)
+        window.title(f"设置 Token 额度 · {user['username']}")
+        window.transient(app.root)
+        window.resizable(False, False)
+        app.skin(window, "panel", None)
+        body = app.frame(window)
+        body.pack(padx=22, pady=18, fill="both")
+        current = snapshot(user)
+        mode = tk.StringVar(window, current["mode"] if current else "unlimited")
+        amount = tk.StringVar(window, str(current["limit_tokens"] / 1000) if current and current["mode"] == "limited" else "100")
+        app.label(body, f"{user['username']} 的 Token 额度", size=14, bold=True).pack(anchor="w", pady=(0, 12))
+        ttk.Radiobutton(body, text="不限额", variable=mode, value="unlimited").pack(anchor="w")
+        row = app.frame(body)
+        row.pack(fill="x", pady=7)
+        ttk.Radiobutton(row, text="限额", variable=mode, value="limited").pack(side="left")
+        entry = ttk.Entry(row, textvariable=amount, width=17)
+        entry.pack(side="left", padx=(8, 5))
+        app.label(row, "k Token").pack(side="left")
+        mode.trace_add("write", lambda *_: entry.configure(state="normal" if mode.get() == "limited" else "disabled"))
+        entry.configure(state="normal" if mode.get() == "limited" else "disabled")
+        app.label(body, "1k = 1000 Token，按实际输入 + 输出扣减。\n保存将重新发放所填额度，之前用量保留审计记录。", muted=True).pack(anchor="w", pady=(4, 10))
+        notice = tk.StringVar(window)
+        app.label(body, variable=notice, color="remove").pack(anchor="w")
+
+        def save():
+            if not app.is_admin or app.busy or app.closing or app.account_client is not self.client:
+                return
+            try:
+                limit = parse_k(amount.get()) if mode.get() == "limited" else None
+            except ValueError as error:
+                notice.set(str(error))
+                return
+            selected_mode = mode.get()
+
+            def done(_reply):
+                if window.winfo_exists():
+                    window.destroy()
+                if self.parent.winfo_exists():
+                    self.refresh_users()
+
+            def failed(error):
+                if window.winfo_exists():
+                    notice.set(str(error))
+
+            app.worker("保存用户额度", lambda: self.client.set_user_quota(user["id"], selected_mode, limit), done, failed)
+
+        app.button(body, "保存额度", save, "Accent.TButton").pack(anchor="e", pady=(10, 0))
+        window.bind("<Escape>", lambda _event: window.destroy())
+        app.apply_theme()
+        window.grab_set()
 
     def reveal_user_action(self, event):
         viewport = self.user_viewport

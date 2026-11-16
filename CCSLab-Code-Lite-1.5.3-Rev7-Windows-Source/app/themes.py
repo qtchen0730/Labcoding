@@ -36,12 +36,21 @@ THEMES = {
 }
 
 
+def migrate_default_theme(prefs):
+    """Apply the requested mint default once when upgrading older preferences."""
+    revision = prefs.get("theme_defaults_version")
+    if type(revision) is int and revision >= 10:
+        return False
+    prefs.update(theme="mint", theme_defaults_version=10)
+    return True
+
+
 def theme_key(value):
-    """Accept existing light/dark IDs, current IDs and UI labels; fail to light."""
+    """Accept saved IDs and UI labels; use mint for new/invalid preferences."""
     if isinstance(value, str):
         if value in THEMES:
             return value
         for key, (label, _colors) in THEMES.items():
             if value == label:
                 return key
-    return "light"
+    return "mint"

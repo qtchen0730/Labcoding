@@ -98,7 +98,7 @@ def _model_failure(source):
                                   "exceeds model context limit", "exceeds model limit", "local input budget"))):
         return "模型请求超出上下文预算，自动压缩未能完成恢复。当前会话、工具记录及文件修改已保留，可在同一会话缩小读取范围后继续。", status, "context"
     if not status:
-        code = re.search(r"\b(401|403|429|500|502|503|504)\b", lower)
+        code = re.search(r"\b(401|402|403|429|500|502|503|504)\b", lower)
         if code:
             status = int(code[0])
         elif any(text in lower for text in ("unauthorized", "authentication", "invalid api key")):
@@ -111,6 +111,14 @@ def _model_failure(source):
             status = 502
         elif "service unavailable" in lower:
             status = 503
+    if "token_quota_unconfirmed" in lower or status == 409 and "用量待核对" in detail:
+        return "请求用量待核对，请联系管理员。", status or 409, "quota"
+    if "token_quota_changed" in lower or status == 409 and "额度设置已更新" in detail:
+        return "额度设置已更新，请重试本次任务。", status or 409, "quota"
+    if status == 402 or "token_quota_" in lower:
+        message = ("用户额度已经用完，请充值。" if "token_quota_exhausted" in lower or "用户额度已经用完" in detail else
+                   "剩余额度不足以覆盖本次输入及输出预留，请充值或缩小任务。")
+        return message, 402, "quota"
     if status == 401:
         return "模型认证失败（HTTP 401）。请重新登录模型服务。", status, ""
     if status == 403:

@@ -56,10 +56,11 @@ class ThemeTests(unittest.TestCase):
 
     def test_existing_and_unknown_preferences(self):
         for saved, expected in (("light", "经典浅色"), ("dark", "经典深色"),
-                                ("no-longer-a-theme", "经典浅色"), ({"bad": "value"}, "经典浅色")):
+                                ("no-longer-a-theme", "薄荷绿"), ({"bad": "value"}, "薄荷绿")):
             with self.subTest(saved=saved), tempfile.TemporaryDirectory(dir=TEST_ROOT, prefix="theme-migrate-") as folder:
                 data = Path(folder)
-                write_json(data / "preferences.json", {"theme": saved, "chat_size": "大", "default_mode": "方案"})
+                write_json(data / "preferences.json", {"theme": saved, "theme_defaults_version": 10,
+                                                       "chat_size": "大", "default_mode": "方案"})
                 root = tk.Tk()
                 gui = App(root, data, smoke=True)
                 try:
@@ -88,6 +89,28 @@ class ThemeTests(unittest.TestCase):
                 self.assertEqual(text.tag_cget("add", "foreground"), THEMES["forest"][1]["add"])
                 self.assertEqual(popup.cget("background"), THEMES["forest"][1]["panel"])
                 popup.destroy()
+            finally:
+                gui.close()
+
+    def test_legacy_upgrade_uses_mint_once_then_remembers_selection(self):
+        with tempfile.TemporaryDirectory(dir=TEST_ROOT, prefix="theme-upgrade-") as folder:
+            data = Path(folder)
+            write_json(data / "preferences.json", {"theme":"light", "strict":True, "default_mode":"方案"})
+            root = tk.Tk()
+            gui = App(root,data,smoke=True)
+            try:
+                self.assertEqual(gui.theme.get(),"薄荷绿")
+                self.assertEqual(read_json(gui.prefs_path,{})["theme_defaults_version"],10)
+                self.assertTrue(gui.strict.get())
+                self.assertEqual(gui.default_mode.get(),"方案")
+                gui.theme.set("经典深色")
+                gui.apply_preferences()
+            finally:
+                gui.close()
+            root = tk.Tk()
+            gui = App(root,data,smoke=True)
+            try:
+                self.assertEqual(gui.theme.get(),"经典深色")
             finally:
                 gui.close()
 

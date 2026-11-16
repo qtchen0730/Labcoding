@@ -1,6 +1,7 @@
 """Gateway self-service password changes, authorization, and migration tests."""
 
 from pathlib import Path
+from .test_support import TEST_ROOT
 import tempfile
 import unittest
 
@@ -18,7 +19,7 @@ NEW_PASSWORD = "fresh!"
 
 class SelfPasswordTests(unittest.TestCase):
     def setUp(self):
-        scratch = tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent.parent)
+        scratch = tempfile.TemporaryDirectory(dir=TEST_ROOT)
         self.addCleanup(scratch.cleanup)
         self.accounts, _, self.gateway = setup(Path(scratch.name), lambda _: None)
 

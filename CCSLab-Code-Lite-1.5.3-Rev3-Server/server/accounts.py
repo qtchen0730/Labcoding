@@ -11,6 +11,8 @@ import sqlite3
 import stat
 import tempfile
 from threading import BoundedSemaphore
+from .quotas import Quotas
+from .account_errors import AccountError
 from time import time
 import unicodedata
 
@@ -32,12 +34,6 @@ _INITIAL_OPEN_WEBUI_VERIFIER = (
 _OPEN_WEBUI_GRANT_TTL = 10 * 60
 _OPEN_WEBUI_GRANT_PATTERN = re.compile(r"([0-9]{1,12})\.([a-f0-9]{64})\Z")
 _ACCOUNT_MIGRATIONS = ("001_accounts.sql", "003_session_roles.sql")
-
-
-class AccountError(RuntimeError):
-    def __init__(self, message, status_code=400):
-        super().__init__(message)
-        self.status_code = status_code
 
 
 def normalize_username(username):
@@ -130,6 +126,7 @@ class Accounts:
         self.open_webui_password_file = self.database.with_name(self.database.name + ".open-webui.argon2")
         self._open_webui_grant_key = secrets.token_bytes(32)
         self.dummy_hash = _ARGON2.hash(secrets.token_hex(32))
+        self.quotas = Quotas(self)
 
     @contextmanager
     def connect(self):
@@ -167,6 +164,12 @@ class Accounts:
                 db.execute(f"PRAGMA user_version = {next_version}")
             # An additive audit table leaves the previous server's schema version readable.
             db.execute((migrations / "004_self_password_audit.sql").read_text(encoding="utf-8"))
+            statement = ""
+            for line in (migrations / "005_token_quotas.sql").read_text(encoding="utf-8").splitlines(keepends=True):
+                statement += line
+                if sqlite3.complete_statement(statement):
+                    db.execute(statement)
+                    statement = ""
 
     def initialize_open_webui_access(self):
         if (self.admin_code_file is not None
@@ -365,10 +368,10 @@ class Accounts:
         if assigned_role != "admin" or status != "active":
             raise AccountError("当前账号没有管理员身份。", 403)
 
-    @staticmethod
-    def _public_user(row, role):
+    def _public_user(self, db, row, role):
         return {"id": row["id"], "username": row["username"], "role": role,
-                "assigned_role": row["role"], "status": row["status"]}
+                "assigned_role": row["role"], "status": row["status"],
+                "quota": self.quotas.snapshot(db, row["id"])}
 
     def _issue(self, db, user, role, expires_at, digest):
         token = secrets.token_urlsafe(32)
@@ -377,19 +380,20 @@ class Accounts:
             "INSERT INTO sessions (token_hash, user_id, expires_at, admin_code_hash) VALUES (?, ?, ?, ?)",
             (token_hash(token), user["id"], expires_at, grant),
         )
-        return {"token": token, "expires_at": expires_at, "user": self._public_user(user, role)}
+        return {"token": token, "expires_at": expires_at, "user": self._public_user(db, user, role)}
 
     def switch_role(self, token, role, code, source):
         if role not in ("admin", "user"):
             raise AccountError("无效的目标角色。")
         current = self.session(token)
         self._require_assigned_admin(current["assigned_role"], current["status"])
-        digest = self._verify_admin_code(code, source)
+        digest = self._verify_admin_code(code, source) if role == "admin" else None
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row, _ = self._session(db, token)
             self._require_assigned_admin(row["role"], row["status"])
-            self._require_current_code(digest)
+            if digest is not None:
+                self._require_current_code(digest)
             db.execute("DELETE FROM sessions WHERE token_hash = ?", (token_hash(token),))
             return self._issue(db, row, role, row["expires_at"], digest if role == "admin" else None)
 
@@ -418,7 +422,7 @@ class Accounts:
     def session(self, token, *, active=False, admin=False):
         with self.connect() as db:
             row, role = self._session(db, token, active=active, admin=admin)
-            return self._public_user(row, role)
+            return self._public_user(db, row, role)
 
     def change_open_webui_password(self, token, grant, password):
         self.verify_open_webui_grant(token, grant)
@@ -517,7 +521,7 @@ class Accounts:
 
     def users(self):
         with self.connect() as db:
-            return [dict(row) for row in db.execute(
+            return [dict(row, quota=self.quotas.snapshot(db, row["id"])) for row in db.execute(
                 f"SELECT {_USER_COLUMNS}, created_at FROM users ORDER BY (status = 'pending') DESC, id DESC"
             )]
 

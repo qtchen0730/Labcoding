@@ -261,6 +261,10 @@ class AccountClient:
                                    authorization_code)
         return self._accept_session(reply, role)
 
+    def set_user_quota(self, user_id, mode, limit_tokens):
+        return self._upgrade_request(lambda: self.request("POST", f"/api/admin/users/{int(user_id)}/quota",
+                                     {"mode": mode, "limit_tokens": limit_tokens}, expected_status=200))
+
     def change_authorization_code(self, current_code, new_code):
         self._private_post("/api/admin/authorization-code",
                            {"current_code": current_code, "new_code": new_code},

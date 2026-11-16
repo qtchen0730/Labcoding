@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "app"))
 
 from admin_view import account_time
 from app import App, DARK, LIGHT
+from themes import THEMES
 
 
 CREATED = 1735689600
@@ -82,7 +83,8 @@ def verify(gui, root):
     page = gui.page_controller
     wait(root, lambda: len(page.user_cards) == 126 and not gui.busy)
     pending = page.user_cards[14]
-    name, badge, detail = list(descendants(pending, tk.Label))
+    name, badge, detail, quota = list(descendants(pending, tk.Label))
+    assert quota.cget("text") == "额度不可用"
     assert name.cget("text") == LONG_NAME
     assert badge.cget("text") == "待审批"
     assert detail.cget("text") == f"普通用户  ·  注册于 {account_time(CREATED)}"
@@ -91,8 +93,8 @@ def verify(gui, root):
     assert [value.get() for value in page.account_overview] == ["1", "123", "1", "1"]
     assert page.user_summary.get() == "显示 126 / 126 个账号"
     assert [set(buttons(page.user_cards[identity])) for identity in (14, 8, 9, 7, 2, 3)] == [
-        {"激活", "禁用", "拒绝", "重置登录密码"}, {"禁用", "重置登录密码"},
-        {"重新激活", "重置登录密码"}, {"重新激活", "重置登录密码"}, set(), set(),
+        {"激活", "禁用", "拒绝", "重置登录密码", "设置额度"}, {"禁用", "重置登录密码", "设置额度"},
+        {"重新激活", "重置登录密码", "设置额度"}, {"重新激活", "重置登录密码", "设置额度"}, set(), set(),
     ]
 
     for width in (950, 1280):
@@ -105,7 +107,7 @@ def verify(gui, root):
         action = buttons(pending)["激活"].master
         assert detail.winfo_y() + detail.winfo_height() + 12 <= action.winfo_y()
 
-    assert badge.cget("background") == LIGHT["soft"]
+    assert badge.cget("background") == THEMES["mint"][1]["soft"]
     gui.theme.set("经典深色")
     gui.apply_theme()
     assert badge.cget("background") == DARK["soft"]
@@ -148,8 +150,8 @@ def verify(gui, root):
         buttons(page.user_cards[9])["重新激活"].invoke()
         wait(root, lambda: page.users[9]["status"] == "active" and not gui.busy)
         assert fixture.changes[-1] == (9, "active")
-    assert set(buttons(page.user_cards[14])) == {"禁用", "重置登录密码"}
-    assert set(buttons(page.user_cards[8])) == {"重新激活", "重置登录密码"}
+    assert set(buttons(page.user_cards[14])) == {"禁用", "重置登录密码", "设置额度"}
+    assert set(buttons(page.user_cards[8])) == {"重新激活", "重置登录密码", "设置额度"}
     assert [value.get() for value in page.account_overview] == ["0", "124", "1", "1"]
 
     with patch.object(gui, "show_page", wraps=gui.show_page) as navigate:

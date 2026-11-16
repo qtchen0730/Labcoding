@@ -3,6 +3,7 @@
 import asyncio
 import json
 from pathlib import Path
+from .test_support import TEST_ROOT
 import sqlite3
 import tempfile
 import unittest
@@ -82,7 +83,7 @@ def setup(root, upstream, *, admin_code_file=None, bootstrap=True):
 
 class AccountGatewayTests(unittest.TestCase):
     def test_administrator_registration_secret_and_role(self):
-        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent.parent) as scratch:
+        with tempfile.TemporaryDirectory(dir=TEST_ROOT) as scratch:
             root = Path(scratch)
             secret_file = root / "register-admin.secret"
             secret = "310742"
@@ -127,7 +128,7 @@ class AccountGatewayTests(unittest.TestCase):
                 self.assertEqual(failure.exception.status_code, 409)
 
     def test_administrator_registration_source_and_global_limits(self):
-        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent.parent) as scratch:
+        with tempfile.TemporaryDirectory(dir=TEST_ROOT) as scratch:
             root = Path(scratch)
             secret_file = root / "register-admin.secret"
             secret = "310742"
@@ -154,7 +155,7 @@ class AccountGatewayTests(unittest.TestCase):
                 }).status_code, 201)
 
     def test_accounts_auth_and_proxy(self):
-        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent.parent) as scratch:
+        with tempfile.TemporaryDirectory(dir=TEST_ROOT) as scratch:
             requests = []
 
             def upstream(request):
@@ -245,7 +246,7 @@ class AccountGatewayTests(unittest.TestCase):
                     self.assertNotIn(secret.encode("ascii"), file.read_bytes())
 
     def test_session_roles_default_and_switch(self):
-        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent.parent) as scratch:
+        with tempfile.TemporaryDirectory(dir=TEST_ROOT) as scratch:
             _, _, gateway = setup(Path(scratch), lambda _: None)
             with TestClient(gateway, base_url="https://gateway.fixture") as client:
                 result = client.post("/api/login", json={"username": "admin-test", "password": ADMIN_PASSWORD})
@@ -268,10 +269,9 @@ class AccountGatewayTests(unittest.TestCase):
                 admin = credentials(elevated["token"])
                 self.assertEqual(client.get("/api/me", headers=ordinary).status_code, 401)
                 self.assertEqual(client.get("/api/admin/users", headers=admin).status_code, 200)
-                self.assertEqual(client.post("/api/session/role", json={
-                    "role": "user", "authorization_code": "999999",
-                }, headers=admin).status_code, 403)
-                result = client.post("/api/session/role", json=elevation | {"role": "user"}, headers=admin)
+                result = client.post("/api/session/role", json={
+                    "role": "user", "authorization_code": "",
+                }, headers=admin)
                 self.assertEqual(result.status_code, 200, result.text)
                 self.assertEqual(result.json()["user"]["role"], "user")
                 self.assertEqual(client.get("/api/me", headers=admin).status_code, 401)
@@ -288,7 +288,7 @@ class AccountGatewayTests(unittest.TestCase):
                 self.assertEqual(client.get("/v1/models", headers=user).status_code, 403)
 
     def test_password_reset_and_code_rotation(self):
-        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent.parent) as scratch:
+        with tempfile.TemporaryDirectory(dir=TEST_ROOT) as scratch:
             root = Path(scratch)
             accounts, _, gateway = setup(root, lambda _: None)
             new_password = "different-user-password"
@@ -344,7 +344,7 @@ class AccountGatewayTests(unittest.TestCase):
                     self.assertNotIn(secret.encode("ascii"), file.read_bytes())
 
     def test_guess_limit_is_shared_between_admin_endpoints(self):
-        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent.parent) as scratch:
+        with tempfile.TemporaryDirectory(dir=TEST_ROOT) as scratch:
             _, _, gateway = setup(Path(scratch), lambda _: None)
             with TestClient(gateway, base_url="https://gateway.fixture") as client:
                 wrong = "123456"
@@ -362,7 +362,7 @@ class AccountGatewayTests(unittest.TestCase):
                 self.assertEqual(client.get("/api/me", headers=ordinary).status_code, 200)
 
     def test_prior_sessions_migrate_without_granting_admin(self):
-        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent.parent) as scratch:
+        with tempfile.TemporaryDirectory(dir=TEST_ROOT) as scratch:
             root = Path(scratch)
             schema = Path(__file__).with_name("migrations") / "001_accounts.sql"
             database = root / "accounts.sqlite3"
@@ -390,7 +390,7 @@ class AccountGatewayTests(unittest.TestCase):
 
 class RevocationTests(unittest.IsolatedAsyncioTestCase):
     async def test_revocation_interrupts_stalled_stream(self):
-        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent.parent) as scratch:
+        with tempfile.TemporaryDirectory(dir=TEST_ROOT) as scratch:
             entered, closed = asyncio.Event(), asyncio.Event()
 
             async def upstream(_request):

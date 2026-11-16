@@ -44,6 +44,7 @@ venv/
 !.env.example
 !.env.sample
 credentials.json
+*.dpapi
 preferences.json
 recents.json
 *.pem

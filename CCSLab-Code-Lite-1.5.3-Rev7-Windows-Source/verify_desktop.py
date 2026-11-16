@@ -278,7 +278,7 @@ def main():
         expect_status(403, lambda: user.request("GET", "/v1/models"))
         expect_status(403, lambda: user.request("GET", "/api/admin/users"))
         path = f"/api/admin/users/{pending['id']}/status"
-        assert gui.theme.get() == "经典浅色"
+        assert gui.theme.get() == "薄荷绿"
         approvals = []
         errors = []
         gui.show_error = lambda title, error: errors.append((title, str(error)))
