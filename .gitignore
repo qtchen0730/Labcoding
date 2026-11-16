@@ -1,0 +1,58 @@
+# Local releases, validation archives and build interpreters
+/releases/
+/.local-tools/
+/.local-archive/
+/*-evidence/
+/_smoke*/
+/待回收_*/
+/HANDOFF.md
+
+# Python and build output
+**/__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+/build/
+/dist/
+**/packaging/_build*/
+**/packaging/_python*/
+**/packaging/_venv*/
+**/packaging/_smoke*/
+
+# Third-party binaries and release archives (fetch/build locally)
+*.exe
+*.dll
+*.pyd
+*.zip
+*.tgz
+
+# Local state and private configuration
+*.log
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+.env
+.env.*
+!.env.example
+!.env.sample
+credentials.json
+preferences.json
+recents.json
+*.pem
+*.key
+*.pfx
+*.p12
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Standalone upload copy
+/GitHub纯源码/
