@@ -1,5 +1,7 @@
 """Local integration fixture: native Windows SSH client and deterministic test peer."""
 
+from verify_support import TEST_ROOT
+
 from pathlib import Path
 import socket
 import sys
@@ -103,7 +105,7 @@ def main():
                 break
             threading.Thread(target=serve, args=(sock,), daemon=True).start()
 
-    base = Path(__file__).resolve().parent
+    base = TEST_ROOT
     with tempfile.TemporaryDirectory(dir=base, prefix="SSH fixture ") as temporary, socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         listener.listen()

@@ -29,16 +29,9 @@ from direct_view import build_direct_page
 from markdown_view import configure_markdown, insert_markdown
 from new_project import show_new_project
 from settings_view import build_settings_page
+from themes import DARK, LIGHT, THEMES, theme_key
 
 
-DARK = dict(bg="#10151d", panel="#17202b", field="#1d2937", text="#edf2f8",
-            muted="#a3b2c6", border="#344457", accent="#a9b9ff", ink="#12182e",
-            add="#9be6aa", remove="#ffb3b8", heading="#b2c4ff",
-            side="#141c26", soft="#233046", add_bg="#1b372e", remove_bg="#442c38")
-LIGHT = dict(bg="#eef0f5", panel="#ffffff", field="#f5f6fa", text="#191f30",
-             muted="#566278", border="#dbe1ed", accent="#4056bf", ink="#ffffff",
-             add="#146135", remove="#9f223f", heading="#344993",
-             side="#f8f9fd", soft="#ecf0fe", add_bg="#e8f7ed", remove_bg="#fceef0")
 FONT = "Microsoft YaHei UI"
 
 
@@ -144,7 +137,7 @@ class App:
         self.task_started = None
         self.diff_text = ""
         self.strict = tk.BooleanVar(value=self.prefs.get("strict", False))
-        self.dark = tk.BooleanVar(value=self.prefs.get("theme") == "dark")
+        self.theme = tk.StringVar(value=THEMES[theme_key(self.prefs.get("theme"))][0])
         self.themed = []
         self.style = ttk.Style()
         self.style.theme_use("clam")
@@ -424,7 +417,7 @@ class App:
         self.results_button.configure(text="隐藏结果" if visible else "显示结果")
 
     def apply_theme(self):
-        c = DARK if self.dark.get() else LIGHT
+        c = self.colors = THEMES[theme_key(self.theme.get())][1]
         self.style.configure(".", background=c["panel"], foreground=c["text"], font=(FONT, 10))
         self.style.configure("TButton", padding=(10, 6), background=c["field"],
                              bordercolor=c["border"], focusthickness=1)
@@ -452,6 +445,9 @@ class App:
         self.style.map("TCombobox", fieldbackground=[("readonly", c["soft"])],
                        selectbackground=[("readonly", c["soft"])],
                        selectforeground=[("readonly", c["heading"])])
+        for option, color in (("background", "field"), ("foreground", "text"),
+                              ("selectBackground", "accent"), ("selectForeground", "ink")):
+            self.root.option_add(f"*TCombobox*Listbox.{option}", c[color])
         active_widgets = []
         for widget, bg, fg, extra in self.themed:
             if widget.winfo_exists():
@@ -675,7 +671,7 @@ class App:
         self.check_account_connection()
 
     def save_prefs(self):
-        self.prefs.update(strict=self.strict.get(), theme="dark" if self.dark.get() else "light",
+        self.prefs.update(strict=self.strict.get(), theme=theme_key(self.theme.get()),
                           chat_size=self.chat_size.get(), default_mode=self.default_mode.get(),
                           show_results=self.results_preference.get())
         write_json(self.prefs_path, self.prefs)
@@ -2034,7 +2030,7 @@ class App:
         self.button(window, "复制 Diff", self.copy_diff).pack(anchor="e", padx=16, pady=(0, 12))
         window.bind("<Escape>", lambda _event: window.destroy())
         self.apply_theme()
-        self.diff_theme(box, DARK if self.dark.get() else LIGHT)
+        self.diff_theme(box, self.colors)
         self.render_diff(box)
         window.grab_set()
 

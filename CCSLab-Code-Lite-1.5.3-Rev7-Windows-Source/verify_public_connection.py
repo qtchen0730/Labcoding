@@ -1,5 +1,7 @@
 """Unit-level request handling and session safety for public inference."""
 
+from verify_support import TEST_ROOT
+
 from http.client import HTTPException
 import json
 from pathlib import Path
@@ -19,7 +21,7 @@ TOKEN = "test-session-never-print-this"
 
 class PublicConnectionTests(unittest.TestCase):
     def setUp(self):
-        directory = tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent, prefix="direct-probe-")
+        directory = tempfile.TemporaryDirectory(dir=TEST_ROOT, prefix="direct-probe-")
         self.addCleanup(directory.cleanup)
         self.path = Path(directory.name)
         self.connection = DirectConnection(self.path)

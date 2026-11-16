@@ -1,5 +1,7 @@
 """Check token accounting against the bundled OpenCode event stream and Tk."""
 
+from verify_support import TEST_ROOT
+
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
@@ -99,7 +101,7 @@ class ContextVerification(unittest.TestCase):
             root.destroy()
 
     def test_native_sse_accounts_one_step_and_compaction(self):
-        with tempfile.TemporaryDirectory(dir=Path(__file__).parent, prefix="context-") as folder:
+        with tempfile.TemporaryDirectory(dir=TEST_ROOT, prefix="context-") as folder:
             parent = Path(folder)
             project = parent / "project"
             project.mkdir()

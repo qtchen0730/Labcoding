@@ -1,5 +1,7 @@
 """Verify desktop authentication and the native Agent against two local HTTPS origins."""
 
+from verify_support import TEST_ROOT
+
 from contextlib import contextmanager
 import json
 from pathlib import Path
@@ -175,7 +177,7 @@ def plan(root, app, errors):
 
 
 def main():
-    with tempfile.TemporaryDirectory(prefix="direct-desktop-", dir=Path(__file__).resolve().parent,
+    with tempfile.TemporaryDirectory(prefix="direct-desktop-", dir=TEST_ROOT,
                                      ignore_cleanup_errors=True) as temporary:
         root_dir = Path(temporary)
         data = root_dir / "desktop"

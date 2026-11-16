@@ -1,5 +1,7 @@
 """Sidebar deletion checks using isolated Tk data and the bundled OpenCode."""
 
+from verify_support import TEST_ROOT
+
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 import sys
@@ -30,7 +32,7 @@ class SessionFixture:
 
 class HistoryTests(unittest.TestCase):
     def setUp(self):
-        self.scratch = tempfile.TemporaryDirectory(dir=Path(__file__).parent, prefix="history-",
+        self.scratch = tempfile.TemporaryDirectory(dir=TEST_ROOT, prefix="history-",
                                                     ignore_cleanup_errors=True)
         self.base = Path(self.scratch.name)
         self.project = self.base / "project"
@@ -150,7 +152,7 @@ class HistoryTests(unittest.TestCase):
         self.assertLess(header.winfo_rooty(), self.gui.session_list.winfo_rooty())
         self.root.geometry("950x580")
         for dark in (False, True):
-            self.gui.dark.set(dark)
+            self.gui.theme.set("经典深色" if dark else "经典浅色")
             self.gui.apply_theme()
             self.root.update()
             self.assertTrue(header.winfo_ismapped())

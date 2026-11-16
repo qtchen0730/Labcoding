@@ -63,9 +63,11 @@ def _pick_port():
 
 def _binary():
     base = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
-    candidate = base / "vendor" / "opencode.exe"
+    candidate = (base / "vendor" / "opencode.exe" if getattr(sys, "frozen", False) else
+                 base.parent.parent / ".work" / "vendor" / "opencode.exe")
     if not candidate.is_file():
-        raise EngineError("缺少随软件提供的 OpenCode 组件（vendor/opencode.exe）。")
+        raise EngineError("缺少 OpenCode 组件，请重新安装软件。" if getattr(sys, "frozen", False) else
+                          "缺少 OpenCode 组件，请先执行 packaging/Fetch-OpenCode.py。")
     return candidate
 
 

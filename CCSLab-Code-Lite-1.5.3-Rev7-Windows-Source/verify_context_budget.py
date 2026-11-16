@@ -1,4 +1,6 @@
 """Local protocol fixtures, not measurements of real Qwen tokenization."""
+
+from verify_support import TEST_ROOT
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.client import HTTPConnection
 import json
@@ -73,7 +75,7 @@ class ModelFixture(BaseHTTPRequestHandler):
 
 class BudgetTests(unittest.TestCase):
     def test_guard_preflight_is_bounded_and_keeps_payload(self):
-        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as folder:
+        with tempfile.TemporaryDirectory(dir=TEST_ROOT) as folder:
             events = []
             guard = ContextGuard("http://127.0.0.1:1/v1", "upstream-secret", (26368, 4096), events.append,
                                  Path(folder) / "diagnostics.jsonl")
@@ -130,7 +132,7 @@ class BudgetTests(unittest.TestCase):
         self.assertIsNone(r.used_tokens)
 
     def test_complete_line_pages_and_explicit_fragments(self):
-        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as folder:
+        with tempfile.TemporaryDirectory(dir=TEST_ROOT) as folder:
             root = Path(folder)
             (root / "long.py").write_text("\n".join(f"line_{n} = '" + "中" * 80 + "'" for n in range(80)), encoding="utf-8")
             workspace = Workspace(root)
@@ -146,7 +148,7 @@ class BudgetTests(unittest.TestCase):
             self.assertEqual(len((root / "one.py").read_text()), 19005)
 
     def native(self, mode):
-        with tempfile.TemporaryDirectory(dir=Path(__file__).parent, prefix="budget-") as folder:
+        with tempfile.TemporaryDirectory(dir=TEST_ROOT, prefix="budget-") as folder:
             root = Path(folder)
             project = root / "project"
             project.mkdir()

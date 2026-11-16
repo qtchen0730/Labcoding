@@ -1,5 +1,7 @@
 """Windows HTTPS authentication, generation, and OpenCode tool tests."""
 
+from verify_support import TEST_ROOT
+
 from contextlib import contextmanager, suppress
 from http.server import ThreadingHTTPServer
 from io import BytesIO
@@ -154,7 +156,7 @@ def git(project, *args):
 class Verification(TestCase):
     def test_https_generation_and_error_handling(self):
         self.assertEqual(BASE_URL, "https://ccslab-llm.qtchen.cn/api")
-        scratch = Path(__file__).resolve().parent
+        scratch = TEST_ROOT
         with tempfile.TemporaryDirectory(prefix="direct-api-", dir=scratch) as temporary:
             root = Path(temporary)
             with direct_fixture(root) as (server, base, tls):
@@ -204,7 +206,7 @@ class Verification(TestCase):
             self.assertEqual(offline.exception.category, "network")
 
     def test_https_sign_in_without_storing_credentials(self):
-        scratch = Path(__file__).resolve().parent
+        scratch = TEST_ROOT
         with tempfile.TemporaryDirectory(prefix="direct-login-", dir=scratch) as temporary:
             root = Path(temporary)
             with direct_fixture(root) as (server, base, tls):
@@ -242,7 +244,7 @@ class Verification(TestCase):
                 self.assertEqual(server.paths, [("POST", "/prefixed/api/v1/auths/signin")])
 
     def test_windows_native_agent_and_git(self):
-        scratch = Path(__file__).resolve().parent
+        scratch = TEST_ROOT
         with tempfile.TemporaryDirectory(prefix="direct-agent-", dir=scratch, ignore_cleanup_errors=True) as temporary:
             root = Path(temporary)
             project = root / "中文 Git 项目"

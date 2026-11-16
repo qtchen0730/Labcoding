@@ -1,4 +1,6 @@
 """Rev7 coexistence: compact a real tool session, then delete it safely."""
+
+from verify_support import TEST_ROOT
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 import subprocess
@@ -14,7 +16,7 @@ from verify_context_budget import ModelFixture
 
 class MergedReleaseTests(unittest.TestCase):
     def test_delete_compacted_session_preserves_work_and_other_sessions(self):
-        with tempfile.TemporaryDirectory(dir=Path(__file__).parent, prefix="merged-") as folder:
+        with tempfile.TemporaryDirectory(dir=TEST_ROOT, prefix="merged-") as folder:
             root = Path(folder)
             project = root / "project"
             project.mkdir()

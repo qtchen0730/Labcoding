@@ -1,11 +1,14 @@
 param(
-    [string]$Output = (Join-Path (Get-Location) 'CCSLab-Code-Lite-1.5.3-Rev7-Setup-x64.exe'),
+    [string]$Output = (Join-Path (Split-Path (Split-Path $PSScriptRoot)) '.work\releases\CCSLab-Code-Lite-1.5.3-Rev8-Setup-x64.exe'),
     [string]$Python = 'python',
     [string]$PyInstallerPath = '',
-    [string]$BuildRoot = (Join-Path $PSScriptRoot '_build')
+    [string]$BuildRoot = (Join-Path (Split-Path (Split-Path $PSScriptRoot)) '.work\build\Rev8')
 )
 
 $ErrorActionPreference = 'Stop'
+$LocalWork = Join-Path (Split-Path (Split-Path $PSScriptRoot)) '.work'
+$env:PYTHONPYCACHEPREFIX = (New-Item -ItemType Directory -Force -Path (Join-Path $LocalWork 'pycache')).FullName
+$env:TEMP = $env:TMP = (New-Item -ItemType Directory -Force -Path (Join-Path $LocalWork 'tmp')).FullName
 $Product = 'CCSLab Code Lite'
 $Source = Join-Path (Split-Path $PSScriptRoot) 'app'
 $Compiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
@@ -24,12 +27,13 @@ if ($PyInstallerPath) { $env:PYTHONPATH = (Resolve-Path -LiteralPath $PyInstalle
 Confirm-NativeSuccess 'Checking x64 Python, Tk, Markdown and HTTPS proxy support'
 
 $Vendor = Join-Path $Source 'vendor'
-if (!(Test-Path -LiteralPath "$Vendor\opencode.exe") -or !(Test-Path -LiteralPath "$Vendor\LICENSE-OpenCode.txt")) {
+$OpenCode = Join-Path $LocalWork 'vendor\opencode.exe'
+if (!(Test-Path -LiteralPath $OpenCode)) {
     & $Python (Join-Path $PSScriptRoot 'Fetch-OpenCode.py')
     Confirm-NativeSuccess 'Verifying OpenCode distribution'
 }
 $OpenCodeHash = '488074BC6780C2EA7BE6B64DAB34C0D45BD03B30DEF13675CA7993889262C23E'
-if ((Get-FileHash -LiteralPath "$Vendor\opencode.exe" -Algorithm SHA256).Hash -ne $OpenCodeHash) {
+if ((Get-FileHash -LiteralPath $OpenCode -Algorithm SHA256).Hash -ne $OpenCodeHash) {
     throw 'The supplied OpenCode.exe is not the pinned Windows x64 baseline distribution.'
 }
 
@@ -44,7 +48,7 @@ $FreezeOptions = @(
 Confirm-NativeSuccess 'Freezing desktop application'
 
 $FrozenVendor = (New-Item -ItemType Directory -Force -Path (Join-Path $Frozen 'vendor')).FullName
-Copy-Item -LiteralPath "$Vendor\opencode.exe" -Destination $FrozenVendor
+Copy-Item -LiteralPath $OpenCode -Destination $FrozenVendor
 Get-ChildItem -LiteralPath $Vendor -Filter 'LICENSE-*.txt' -File |
     Copy-Item -Destination $FrozenVendor
 $PythonHome = & $Python -c "import sys; print(sys.base_prefix)"

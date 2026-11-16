@@ -9,8 +9,8 @@ using Microsoft.Win32;
 
 [assembly: AssemblyTitle("CCSLab Code Lite")]
 [assembly: AssemblyProduct("CCSLab Code Lite")]
-[assembly: AssemblyVersion("1.5.3.7")]
-[assembly: AssemblyFileVersion("1.5.3.7")]
+[assembly: AssemblyVersion("1.5.3.8")]
+[assembly: AssemblyFileVersion("1.5.3.8")]
 
 static class Setup
 {
@@ -18,7 +18,7 @@ static class Setup
     const string AppName = "CCSLab Code Lite.exe";
     const string Marker = ".ccslab-code-lite-install";
     const string RegistryPath = @"Software\Microsoft\Windows\CurrentVersion\Uninstall\CCSLabCodeLite";
-    const string Version = "1.5.3 Rev7";
+    const string Version = "1.5.3 Rev8";
     static readonly string DefaultInstallDir = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Programs", Product);
     static readonly string ShortcutPath = Path.Combine(

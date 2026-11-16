@@ -5,6 +5,7 @@ from tkinter import ttk
 
 from account_client import ACCOUNT_STATUS, DEFAULT_SERVER, AccountError
 from direct_connection import MODEL_ID
+from themes import THEMES
 
 
 PROXY_LABELS = {"auto": "自动", "system": "系统代理", "direct": "直连"}
@@ -106,9 +107,12 @@ def build_settings_page(app, parent, section="general"):
         row = app.frame(appearance, "field")
         row.pack(fill="x", padx=15, pady=(0, 10))
         app.label(row, "主题", bg="field").pack(side="left")
-        for label, dark in (("浅色", False), ("深色", True)):
-            ttk.Radiobutton(row, text=label, value=dark, variable=app.dark,
-                            command=app.apply_preferences).pack(side="left", padx=(17, 0))
+        app.theme_picker = ttk.Combobox(row, textvariable=app.theme,
+                                       values=tuple(label for label, _colors in THEMES.values()),
+                                       state="readonly", width=16)
+        app.theme_picker.pack(side="left", padx=(17, 0))
+        app.theme_picker.bind("<<ComboboxSelected>>", lambda _event: app.apply_preferences())
+        app.label(row, "自动保存", bg="field", muted=True, size=9).pack(side="left", padx=(10, 0))
         row = app.frame(appearance, "field")
         row.pack(fill="x", padx=15, pady=(0, 10))
         app.label(row, "对话字号", bg="field").pack(side="left", padx=(0, 12))

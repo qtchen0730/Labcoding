@@ -1,9 +1,12 @@
 param(
     [Parameter(Mandatory=$true)][string]$Installer,
-    [string]$TestRoot = (Join-Path $PSScriptRoot '_smoke')
+    [string]$TestRoot = ''
 )
 
 $ErrorActionPreference = 'Stop'
+if (-not $TestRoot) {
+    $TestRoot = Join-Path (Split-Path (Split-Path $PSScriptRoot)) '.work\installer-smoke'
+}
 $Installer = (Resolve-Path -LiteralPath $Installer).Path
 $TestRoot = (New-Item -ItemType Directory -Path $TestRoot -Force).FullName
 $Test = (New-Item -ItemType Directory -Path (Join-Path $TestRoot ([guid]::NewGuid().ToString('N')))).FullName

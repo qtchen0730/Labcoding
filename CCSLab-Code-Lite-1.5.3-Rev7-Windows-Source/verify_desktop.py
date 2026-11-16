@@ -1,4 +1,6 @@
 """Exercise real Tk, OpenCode, and HTTPS gateway with a scripted upstream model."""
+
+from verify_support import TEST_ROOT
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 import socket
@@ -248,7 +250,7 @@ def register_accounts(root, gui, server, tls, login_password):
 
 
 def main():
-    with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent, prefix="desktop-",
+    with tempfile.TemporaryDirectory(dir=TEST_ROOT, prefix="desktop-",
                                      ignore_cleanup_errors=True) as scratch:
         temp = Path(scratch)
         project = temp / "中文 Git 项目"
@@ -276,7 +278,7 @@ def main():
         expect_status(403, lambda: user.request("GET", "/v1/models"))
         expect_status(403, lambda: user.request("GET", "/api/admin/users"))
         path = f"/api/admin/users/{pending['id']}/status"
-        assert not gui.dark.get()
+        assert gui.theme.get() == "经典浅色"
         approvals = []
         errors = []
         gui.show_error = lambda title, error: errors.append((title, str(error)))

@@ -1,5 +1,7 @@
 """Real Windows OpenCode integration smoke test against a scripted local protocol fixture."""
 
+from verify_support import TEST_ROOT
+
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -152,7 +154,7 @@ def test_paths(root, outside):
 
 
 def main():
-    work = Path(__file__).resolve().parent
+    work = TEST_ROOT
     with tempfile.TemporaryDirectory(prefix="engine-smoke-", dir=work) as td:
         temp = Path(td)
         root = temp / "中文路径 项目"

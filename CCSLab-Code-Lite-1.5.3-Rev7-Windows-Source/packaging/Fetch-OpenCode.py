@@ -32,8 +32,8 @@ def main():
     license_text = download(LICENSE)
     if not license_text.startswith(b"MIT License"):
         raise ValueError("Unexpected OpenCode license response")
-    vendor = Path(__file__).resolve().parent.parent / "app" / "vendor"
-    vendor.mkdir(exist_ok=True)
+    vendor = Path(__file__).resolve().parents[2] / ".work" / "vendor"
+    vendor.mkdir(parents=True, exist_ok=True)
     (vendor / "opencode.exe").write_bytes(executable)
     (vendor / "LICENSE-OpenCode.txt").write_bytes(license_text)
     print(f"OpenCode {VERSION} / {hashlib.sha256(executable).hexdigest()}")

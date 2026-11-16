@@ -56,3 +56,6 @@ Desktop.ini
 
 # Standalone upload copy
 /GitHub纯源码/
+
+# All local build, test, debug and cache artifacts
+/.work/

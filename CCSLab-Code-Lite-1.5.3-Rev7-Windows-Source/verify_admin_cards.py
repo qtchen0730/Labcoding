@@ -1,5 +1,7 @@
 """Verify the approval cards in the native desktop against a local account fixture."""
 
+from verify_support import TEST_ROOT
+
 from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
@@ -104,7 +106,7 @@ def verify(gui, root):
         assert detail.winfo_y() + detail.winfo_height() + 12 <= action.winfo_y()
 
     assert badge.cget("background") == LIGHT["soft"]
-    gui.dark.set(True)
+    gui.theme.set("经典深色")
     gui.apply_theme()
     assert badge.cget("background") == DARK["soft"]
     assert page.user_viewport.yview()[0] == 0
@@ -163,7 +165,7 @@ def verify(gui, root):
 
 
 if __name__ == "__main__":
-    with TemporaryDirectory(dir=Path(__file__).resolve().parent, prefix="approval-cards-",
+    with TemporaryDirectory(dir=TEST_ROOT, prefix="approval-cards-",
                             ignore_cleanup_errors=True) as data:
         window = tk.Tk()
         app = App(window, Path(data), smoke=True)

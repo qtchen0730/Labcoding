@@ -1,5 +1,7 @@
 """Exercise the bundled OpenCode over an HTTP CONNECT proxy with real TLS."""
 
+from verify_support import TEST_ROOT
+
 from base64 import b64encode
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -66,7 +68,7 @@ class ProxyEngineTests(unittest.TestCase):
         self.verify_proxy("https")
 
     def verify_proxy(self, scheme):
-        with tempfile.TemporaryDirectory(dir=Path(__file__).parent, prefix="proxy-engine-") as folder:
+        with tempfile.TemporaryDirectory(dir=TEST_ROOT, prefix="proxy-engine-") as folder:
             state = Path(folder)
             project = state / "project"
             project.mkdir()

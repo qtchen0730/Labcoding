@@ -1,5 +1,7 @@
 """Run against loopback mock origins and CONNECT proxies. No public credentials."""
 
+from verify_support import TEST_ROOT
+
 from base64 import b64encode
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -92,7 +94,7 @@ def serving(server):
 class TransportTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.scratch = tempfile.TemporaryDirectory(prefix="transport-", dir=Path(__file__).resolve().parent)
+        cls.scratch = tempfile.TemporaryDirectory(prefix="transport-", dir=TEST_ROOT)
         cls.addClassCleanup(cls.scratch.cleanup)
         cert, key, cls.tls = tls_files(Path(cls.scratch.name))
         cls.tls_server = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
