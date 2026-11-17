@@ -1,6 +1,7 @@
 """CCSLab Code Lite desktop application."""
 
 import argparse
+from collections import deque
 from datetime import datetime
 import hashlib
 import json
@@ -11,6 +12,7 @@ from threading import Event, Lock, Thread
 from time import monotonic, time
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
+from uuid import uuid4
 
 from changes import Changes
 from account_client import (
@@ -33,6 +35,7 @@ from themes import DARK, LIGHT, THEMES, theme_key, migrate_default_theme
 from ui_icons import ActionIcon, gear_image, apply_window_icon
 from saved_login import SavedLogin
 from quota_view import balance_text, blocked_message
+from approval_policy import SessionGrants, session_scope
 
 
 FONT = "Microsoft YaHei UI"
@@ -115,6 +118,12 @@ class App:
         self.session_titles = {}
         self.drafts = {}
         self.events = Queue()
+        self.approval_queue = deque()
+        self.active_approval = None
+        self.approval_tickets = {}
+        self.approval_lock = Lock()
+        self.session_grants = SessionGrants()
+        self.active_approval_scope = None
         self.timers = {}
         self.busy = ""
         self.running = False
@@ -226,6 +235,269 @@ class App:
             box.configure(state="disabled")
         return holder, box
 
+    def build_approval_panel(self, parent):
+        self.approval_panel = self.frame(parent, "soft")
+        self.approval_heading = self.label(self.approval_panel, "", bg="soft", size=12,
+                                           bold=True, color="heading")
+        self.approval_heading.pack(anchor="w", padx=12, pady=(8, 2))
+        self.approval_hint = self.label(self.approval_panel, "", bg="soft", muted=True, size=9)
+        self.approval_hint.pack(fill="x", padx=12, pady=(0, 5))
+        self.approval_detail_holder, self.approval_detail = self.text_panel(
+            self.approval_panel, height=4, mono=True, background="field", text_size=9)
+        self.approval_detail_holder.pack(fill="x", padx=10)
+        actions = self.frame(self.approval_panel, "soft")
+        actions.pack(fill="x", padx=10, pady=(6, 8))
+        self.approval_reject_button = self.button(
+            actions, "拒绝", lambda: self.finish_approval(False))
+        self.approval_reject_button.pack(side="right")
+        self.approval_session_button = self.button(
+            actions, "允许本次会话", lambda: self.finish_approval(True, session=True))
+        self.approval_session_button.pack(side="right", padx=(0, 7))
+        self.approval_once_button = self.button(
+            actions, "仅允许本次", lambda: self.finish_approval(True), "Accent.TButton")
+        self.approval_once_button.pack(side="right", padx=(0, 7))
+        self.approval_restore_focus = None
+        self.approval_action_locked = False
+        self.approval_panel.pack_forget()
+        self.approval_key_latched = False
+        self.approval_key_bindings = None
+
+    def current_approval_scope(self):
+        account = self.account or ({"id": self.direct_identity} if self.connection_mode == "direct" else None)
+        return session_scope(account, self.project, self.session)
+
+    def update_session_grant_ui(self):
+        if not hasattr(self, "revoke_approval_button"):
+            return
+        if self.session_grants.has_scope(self.current_approval_scope()):
+            if not self.revoke_approval_button.winfo_manager():
+                self.revoke_approval_button.pack(side="right", padx=(8, 0))
+        else:
+            self.revoke_approval_button.pack_forget()
+
+    def revoke_session_approvals(self):
+        scope = self.current_approval_scope()
+        if scope:
+            self.session_grants.clear()
+            self.update_session_grant_ui()
+            self.status.set("已撤销当前会话授权")
+
+    @staticmethod
+    def approval_title(request):
+        return {"command": "运行 Windows 命令", "read": "读取文件",
+                "write": "修改文件", "delete": "删除文件"}.get(
+                    request.get("kind"), f"其他操作：{request.get('kind') or '未知类型'}")
+
+    def approval_enter(self, _event=None):
+        if _event is not None and _event.state & 0x4:
+            return None
+        if not self.active_approval:
+            return None
+        if self.approval_key_latched:
+            return "break"
+        self.approval_key_latched = True
+        self.finish_approval(True)
+        return "break"
+
+    def approval_enter_released(self, _event=None):
+        self.approval_key_latched = False
+        self.clear_approval_key_bindings_if_idle()
+        return "break"
+
+    def approval_escape(self, _event=None):
+        if not self.active_approval:
+            return None
+        if self.approval_key_latched:
+            return "break"
+        self.approval_key_latched = True
+        self.finish_approval(False)
+        return "break"
+
+    def clear_approval_key_bindings_if_idle(self):
+        if (self.active_approval or self.approval_queue or getattr(self, "approval_key_latched", False)
+                or getattr(self, "approval_key_bindings", None) is None):
+            return
+        for sequence, binding_id in zip(("<KeyPress-Return>", "<KeyRelease-Return>",
+                                         "<KeyPress-Escape>", "<KeyRelease-Escape>"),
+                                        self.approval_key_bindings):
+            if binding_id:
+                self.root._unbind(("bind", "all", sequence), binding_id)
+        self.approval_key_bindings = None
+
+    def enqueue_approval(self, ticket):
+        if (ticket["completed"].is_set() or self.closing or self.stop_requested.is_set()
+                or ticket["scope"] != self.active_approval_scope):
+            self.cancel_approval_ticket(ticket)
+            return
+        self.approval_queue.append(ticket)
+        self.show_next_approval()
+
+    def show_next_approval(self):
+        if self.active_approval or self.closing:
+            return
+        while self.approval_queue:
+            ticket = self.approval_queue.popleft()
+            if ticket["completed"].is_set():
+                continue
+            if ticket["scope"] != self.active_approval_scope:
+                self.cancel_approval_ticket(ticket)
+                continue
+            self.active_approval = ticket
+            break
+        if not self.active_approval:
+            self.approval_panel.pack_forget()
+            return
+        ticket = self.active_approval
+        request = ticket["request"]
+        if self.approval_restore_focus is None:
+            self.approval_restore_focus = self.root.focus_get()
+        self.approval_heading.configure(text=self.approval_title(request))
+        if request.get("kind") == "command":
+            hint = ("命令及其子进程拥有当前 Windows 用户权限。请核对工作目录、完整命令和参数。"
+                    "命令不会自动获得会话授权。")
+        else:
+            hint = "请检查操作类型、目标路径和完整详情。未知类型与删除操作始终需要逐次审批。"
+        self.approval_hint.configure(text=hint)
+        details = []
+        if request.get("path"):
+            if request.get("kind") == "command":
+                details.append(f"工作目录：{request['path']}")
+            elif ticket["scope"]:
+                target = Path(ticket["scope"][1]) / request["path"]
+                details.append(f"目标路径：{target}")
+            else:
+                details.append(f"目标路径：{request['path']}")
+        if request.get("command"):
+            details.append(f"完整命令：\n{request['command']}")
+        if request.get("detail"):
+            details.append(str(request["detail"]))
+        elif request.get("display"):
+            details.append(str(request["display"]))
+        has_operation_detail = bool(
+            (request.get("kind") == "command" and request.get("command") and request.get("path"))
+            or (request.get("kind") in {"read", "write", "delete"} and request.get("path"))
+            or request.get("display")
+        )
+        if not has_operation_detail:
+            details = ["无法获取完整操作详情"]
+        preview = self.redact("\n\n".join(details))
+        self.approval_detail.configure(state="normal")
+        self.approval_detail.delete("1.0", "end")
+        self.approval_detail.insert("1.0", preview)
+        self.approval_detail.configure(state="disabled")
+        grantable = bool(ticket["scope"] and self.session_grants.allowable(request))
+        unsupported_reason = ("当前命令仅支持单次授权" if request.get("kind") == "command"
+                              else "当前操作仅支持单次授权")
+        self.approval_hint.configure(text="" if grantable else unsupported_reason)
+        if not has_operation_detail:
+            self.approval_hint.configure(text="无法获取完整操作详情，已禁用批准")
+        control_state = "disabled" if self.approval_action_locked or not has_operation_detail else "normal"
+        self.approval_once_button.configure(state=control_state, command=lambda ticket_id=ticket["id"]:
+                                            self.finish_approval(True, ticket_id=ticket_id))
+        self.approval_session_button.configure(
+            state="normal" if grantable and not self.approval_action_locked and has_operation_detail else "disabled",
+            command=lambda ticket_id=ticket["id"]:
+                                                self.finish_approval(True, session=True, ticket_id=ticket_id))
+        self.approval_reject_button.configure(state=control_state, command=lambda ticket_id=ticket["id"]:
+                                               self.finish_approval(False, ticket_id=ticket_id))
+        self.task_state.set("等待审批")
+        self.approval_panel.pack(fill="x", padx=12, pady=(4, 0), before=self.composer_separator)
+        if self.approval_key_bindings is None:
+            self.approval_key_bindings = (
+                self.root.bind_all("<KeyPress-Return>", self.approval_enter, add="+"),
+                self.root.bind_all("<KeyRelease-Return>", self.approval_enter_released, add="+"),
+                self.root.bind_all("<KeyPress-Escape>", self.approval_escape, add="+"),
+                self.root.bind_all("<KeyRelease-Escape>", self.approval_enter_released, add="+"),
+            )
+        self.root.after_idle(lambda ticket_id=ticket["id"]: self.focus_approval(ticket_id))
+
+    def focus_approval(self, ticket_id):
+        ticket = self.active_approval
+        if (ticket and ticket["id"] == ticket_id and self.approval_panel.winfo_exists()
+                and self.approval_panel.winfo_ismapped()):
+            self.root.focus_force()
+            self.approval_once_button.focus_set()
+
+    def finish_approval(self, allow=False, *, session=False, ticket_id=None):
+        ticket = self.active_approval
+        if (not ticket or self.approval_action_locked
+                or (ticket_id is not None and ticket["id"] != ticket_id)):
+            return
+        with ticket["guard"]:
+            if ticket["completed"].is_set():
+                return
+            if session and allow and not self.session_grants.allow(ticket["scope"], ticket["request"]):
+                return
+            ticket["result"]["allow"] = bool(allow)
+            ticket["completed"].set()
+        with self.approval_lock:
+            self.approval_tickets.pop(ticket["id"], None)
+        self.approval_action_locked = True
+        self.schedule("approval_unlock", 250, self.unlock_approval_controls)
+        self.active_approval = None
+        self.approval_panel.pack_forget()
+        self.clear_approval_key_bindings_if_idle()
+        self.update_session_grant_ui()
+        if self.running and not self.stop_requested.is_set() and not self.closing:
+            self.task_state.set("任务执行中")
+        if self.approval_queue:
+            self.schedule("approval_next", 250, self.show_next_approval)
+        if not self.active_approval:
+            self.restore_approval_focus()
+
+    def unlock_approval_controls(self):
+        self.approval_action_locked = False
+        if not self.active_approval:
+            return
+        grantable = bool(self.active_approval["scope"] and self.session_grants.allowable(
+            self.active_approval["request"]))
+        self.approval_once_button.configure(state="normal")
+        self.approval_reject_button.configure(state="normal")
+        self.approval_session_button.configure(state="normal" if grantable else "disabled")
+
+    def cancel_approval_ticket(self, ticket):
+        with ticket["guard"]:
+            if ticket["completed"].is_set():
+                return
+            ticket["result"]["allow"] = False
+            ticket["completed"].set()
+        with self.approval_lock:
+            self.approval_tickets.pop(ticket["id"], None)
+        if self.active_approval is ticket:
+            self.active_approval = None
+            self.approval_panel.pack_forget()
+        self.show_next_approval()
+
+    def cancel_all_approvals(self):
+        had_active = self.active_approval is not None
+        with self.approval_lock:
+            tickets = list(self.approval_tickets.values())
+            self.approval_tickets.clear()
+        for ticket in tickets:
+            with ticket["guard"]:
+                ticket["result"]["allow"] = False
+                ticket["completed"].set()
+        self.approval_queue.clear()
+        self.active_approval = None
+        if hasattr(self, "approval_panel"):
+            self.approval_panel.pack_forget()
+        if had_active and not self.closing:
+            self.restore_approval_focus()
+
+    def restore_approval_focus(self):
+        target = self.approval_restore_focus
+        self.approval_restore_focus = None
+        def restore():
+            try:
+                if target and target.winfo_exists() and str(target.cget("state")) != "disabled":
+                    target.focus_set()
+                elif self.chat.winfo_exists():
+                    self.chat.focus_set()
+            except (tk.TclError, AttributeError):
+                pass
+        if not self.closing:
+            self.root.after_idle(restore)
+
     def list_widget(self, parent, height, background="field"):
         result = tk.Listbox(parent, height=height, activestyle="none", borderwidth=0,
                             font=(FONT, 10), highlightthickness=0, exportselection=False)
@@ -327,6 +599,9 @@ class App:
         self.results_button = self.button(conversation_head, "", self.toggle_results, "Nav.TButton")
         self.results_button.pack(side="right", padx=(8, 0))
         self.results_button.configure(text="隐藏结果" if self.results_visible else "显示结果")
+        self.revoke_approval_button = self.button(
+            conversation_head, "撤销会话授权", self.revoke_session_approvals, "Nav.TButton")
+        self.revoke_approval_button.pack_forget()
         self.label(conversation_head, variable=self.task_elapsed, muted=True).pack(side="right")
         self.label(conversation_head, variable=self.task_state, color="heading").pack(side="right", padx=(0, 7))
         self.pending_banner = self.frame(center, "soft")
@@ -340,7 +615,9 @@ class App:
         conversation, self.chat = self.text_panel(center, height=18, background="panel", text_size=11)
         conversation.pack(fill="both", expand=True, padx=10)
         self.show_welcome()
-        ttk.Separator(center).pack(fill="x", padx=16, pady=(6, 0))
+        self.build_approval_panel(center)
+        self.composer_separator = ttk.Separator(center)
+        self.composer_separator.pack(fill="x", padx=16, pady=(6, 0))
         self.label(center, "输入开发任务", bold=True).pack(fill="x", padx=16, pady=(10, 5))
         composer, self.input = self.text_panel(center, editable=True, height=4)
         self.quota_banner = self.label(self.input, "", color="remove", bg="field")
@@ -1382,6 +1659,9 @@ class App:
         return current
 
     def clear_account(self, *, forget_session=True):
+        self.cancel_all_approvals()
+        self.session_grants.clear()
+        self.active_approval_scope = None
         self.account_generation += 1
         self.account_polling = False
         if self.account_client:
@@ -1396,6 +1676,9 @@ class App:
         self.clear_workspace()
 
     def clear_workspace(self):
+        self.cancel_all_approvals()
+        self.session_grants.clear()
+        self.active_approval_scope = None
         self.direct_ready = False
         self.direct_identity = ""
         self.direct_status.set("待连接" if self.direct_unlocked else "待权限验证")
@@ -1589,6 +1872,10 @@ class App:
         if Path(path) == Path(path).parent:
             self.show_error("打开项目", "请选择项目子文件夹。")
             return
+        self.cancel_all_approvals()
+        self.session_grants.clear()
+        self.active_approval_scope = None
+        self.update_session_grant_ui()
         self.show_page("workspace")
         self.save_history()
         self.save_draft()
@@ -1779,6 +2066,8 @@ class App:
                 return
             self.drafts.pop((self.project, session_id), None)
             if self.session == session_id:
+                self.session_grants.clear()
+                self.update_session_grant_ui()
                 self.session = None
                 self.reset_conversation()
                 self.restore_draft()
@@ -1809,6 +2098,10 @@ class App:
         self.update_delete_actions()
 
     def open_session(self, session_id):
+        self.cancel_all_approvals()
+        self.session_grants.clear()
+        self.active_approval_scope = None
+        self.update_session_grant_ui()
         self.save_draft()
         self.session = session_id
         self.reset_conversation()
@@ -1927,6 +2220,7 @@ class App:
 
     def run_task(self, prompt):
         session = self.session
+        self.active_approval_scope = self.current_approval_scope()
         engine = self.engine
         client = self.account_client
         direct = self.connection_mode == "direct"
@@ -2111,65 +2405,25 @@ class App:
         self.task_state.set("")
 
     def approve(self, request):
-        result = {"allow": False}
-        completed = Event()
-        self.events.put(lambda: self.approval_window(request, result, completed))
-        while not completed.wait(0.1):
+        scope = self.active_approval_scope
+        if self.session_grants.allows(scope, request):
+            return True
+        ticket = {"id": uuid4().hex, "request": dict(request), "scope": scope,
+                  "result": {"allow": False}, "completed": Event(), "guard": Lock()}
+        with self.approval_lock:
+            self.approval_tickets[ticket["id"]] = ticket
+        self.events.put(lambda ticket=ticket: self.enqueue_approval(ticket))
+        while not ticket["completed"].wait(0.1):
             if self.stop_requested.is_set() or self.closing:
+                self.events.put(lambda ticket=ticket: self.cancel_approval_ticket(ticket))
                 return False
-        return result["allow"]
-
-    def approval_window(self, request, result, completed):
-        if not self.running or self.stop_requested.is_set() or self.closing:
-            completed.set()
-            return
-        self.task_state.set("等待审批")
-        window = tk.Toplevel(self.root)
-        window.title("操作审批")
-        window.transient(self.root)
-        window.geometry("620x425")
-        self.skin(window, "panel", None)
-        permission = str(request.get("kind") or request.get("permission") or request.get("action") or "")
-        command = permission in {"bash", "shell", "command", "terminal", "ccslab_run"}
-        headline = self.redact(request.get("title")) or ("允许本次命令执行？" if command else "允许本次文件操作？")
-        self.label(window, headline, size=13, bold=True).pack(fill="x", padx=16, pady=(14, 8))
-        hint = ("批准后，命令及其子进程拥有当前 Windows 用户的权限。请检查完整命令，"
-                "并确认你信任它将执行的项目代码。" if command else
-                "检查项目、路径及操作后，可仅批准本次请求。")
-        tip = self.label(window, hint, muted=True)
-        tip.configure(wraplength=588)
-        tip.pack(fill="x", padx=16, pady=(0, 8))
-        holder, body = self.text_panel(window, mono=True)
-        holder.pack(fill="both", expand=True, padx=16)
-        preview = request.get("display") or request.get("detail") or json.dumps(request, ensure_ascii=False, indent=2)
-        preview = self.redact(preview)
-        self.append(body, preview, follow=False)
-        buttons = self.frame(window)
-        buttons.pack(fill="x", padx=16, pady=12)
-
-        def finish(allow=False):
-            result["allow"] = allow
-            self.approval_cancel = None
-            completed.set()
-            window.destroy()
-            if self.running and not self.stop_requested.is_set() and not self.closing:
-                self.task_state.set("任务执行中")
-
-        self.approval_cancel = finish
-        self.button(buttons, "拒绝", finish).pack(side="right")
-        self.button(buttons, "仅允许本次", lambda: finish(True), "Accent.TButton").pack(
-            side="right", padx=(0, 8))
-        window.protocol("WM_DELETE_WINDOW", finish)
-        self.apply_theme()
-        window.grab_set()
+        return ticket["result"]["allow"]
 
     def stop(self):
         if not self.running or self.stop_requested.is_set():
             return
         self.stop_requested.set()
-        approval = getattr(self, "approval_cancel", None)
-        if approval:
-            approval()
+        self.cancel_all_approvals()
         self.task_state.set("正在停止")
         self.update_actions()
 
@@ -2276,6 +2530,9 @@ class App:
         if self.running and not messagebox.askyesno("关闭应用", "停止当前任务并退出？", parent=self.root):
             return
         self.closing = True
+        self.cancel_all_approvals()
+        self.session_grants.clear()
+        self.active_approval_scope = None
         if self.account_client:
             self.account_client.clear_open_webui_access()
         self.end_reply()
@@ -2283,9 +2540,6 @@ class App:
             self.root.after_cancel(timer)
         self.timers.clear()
         self.stop_requested.set()
-        approval = getattr(self, "approval_cancel", None)
-        if approval:
-            approval()
         self.save_history()
         try:
             if self.engine:
