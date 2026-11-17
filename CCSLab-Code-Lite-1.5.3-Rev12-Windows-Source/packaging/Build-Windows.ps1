@@ -1,5 +1,5 @@
 param(
-    [string]$Output = (Join-Path (Split-Path (Split-Path $PSScriptRoot)) '.work\releases\CCSLab-Code-Lite-1.5.3-Rev12-Setup-x64.exe'),
+    [string]$Output = (Join-Path (Split-Path (Split-Path $PSScriptRoot)) '.work\releases\CCSLab-Labcoding-1.5.3-Rev12-Setup-x64.exe'),
     [string]$Python = 'python',
     [string]$PyInstallerPath = '',
     [string]$BuildRoot = (Join-Path (Split-Path (Split-Path $PSScriptRoot)) '.work\build\Rev12')
@@ -10,7 +10,7 @@ $LocalWork = Join-Path (Split-Path (Split-Path $PSScriptRoot)) '.work'
 $env:PYTHONPYCACHEPREFIX = (New-Item -ItemType Directory -Force -Path (Join-Path $LocalWork 'pycache')).FullName
 $env:PYINSTALLER_CONFIG_DIR = (New-Item -ItemType Directory -Force -Path (Join-Path $LocalWork 'pyinstaller-cache')).FullName
 $env:TEMP = $env:TMP = (New-Item -ItemType Directory -Force -Path (Join-Path $LocalWork 'tmp')).FullName
-$Product = 'CCSLab Code Lite'
+$Product = 'CCSLab Labcoding'
 $Source = Join-Path (Split-Path $PSScriptRoot) 'app'
 $Compiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
 $BuildRoot = (New-Item -ItemType Directory -Force -Path $BuildRoot).FullName
@@ -44,9 +44,9 @@ $Icon = Join-Path $Assets 'app.ico'
 $IconPng = Join-Path $Assets 'app.png'
 $IconBuilder = Join-Path $BuildRoot 'Build-Icon.exe'
 & $Compiler /nologo /target:exe /r:System.Drawing.dll /r:System.Xml.dll "/out:$IconBuilder" (Join-Path $PSScriptRoot 'Build-Icon.cs')
-Confirm-NativeSuccess 'Compiling vector icon renderer'
-& $IconBuilder (Join-Path $Source 'assets\logo.svg') $Icon $IconPng
-Confirm-NativeSuccess 'Rendering mint monogram icons'
+Confirm-NativeSuccess 'Compiling PNG icon converter'
+& $IconBuilder (Join-Path $Source 'assets\app.png') $Icon $IconPng
+Confirm-NativeSuccess 'Rendering supplied application icon'
 $Frozen = Join-Path $Dist $Product
 $AnalysisOutput = Join-Path $BuildRoot 'pyinstaller'
 $FreezeOptions = @(

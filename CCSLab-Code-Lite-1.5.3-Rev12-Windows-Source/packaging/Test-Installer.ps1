@@ -10,7 +10,7 @@ if (-not $TestRoot) {
 $Installer = (Resolve-Path -LiteralPath $Installer).Path
 $TestRoot = (New-Item -ItemType Directory -Path $TestRoot -Force).FullName
 $Test = (New-Item -ItemType Directory -Path (Join-Path $TestRoot ([guid]::NewGuid().ToString('N')))).FullName
-$InstallDir = Join-Path $Test ('CCSLab Code Lite ' + [char]0x5B89 + [char]0x88C5)
+$InstallDir = Join-Path $Test ('CCSLab Labcoding ' + [char]0x5B89 + [char]0x88C5)
 $DataDir = Join-Path $Test ('app data ' + [char]0x5386 + [char]0x53F2)
 
 function Invoke-Checked([string]$File, [string[]]$Arguments, [int]$ExpectedExit = 0) {
@@ -32,7 +32,7 @@ New-Item -ItemType Directory -Path $InstallDir | Out-Null
 Invoke-Checked $Installer @('--smoke-install', "`"$InstallDir`"")
 # The same registered program directory supports in-place upgrades.
 Invoke-Checked $Installer @('--smoke-install', "`"$InstallDir`"")
-$Exe = Join-Path $InstallDir 'CCSLab Code Lite.exe'
+$Exe = Join-Path $InstallDir 'CCSLab Labcoding.exe'
 $OpenCode = Join-Path $InstallDir 'vendor\opencode.exe'
 $Expected = @($Exe, $OpenCode, (Join-Path $InstallDir 'Uninstall.exe'), (Join-Path $InstallDir 'vendor\LICENSE-OpenCode.txt'))
 foreach ($Path in $Expected) {
@@ -46,7 +46,7 @@ $Keep = Join-Path $OccupiedDir 'user-file.txt'
 Set-Content -LiteralPath $Keep -Value 'keep'
 Invoke-Checked $Installer @('--smoke-install', "`"$OccupiedDir`"") 1
 if ((Get-Content -LiteralPath $Keep) -ne 'keep' -or
-    (Test-Path -LiteralPath (Join-Path $OccupiedDir 'CCSLab Code Lite.exe'))) {
+    (Test-Path -LiteralPath (Join-Path $OccupiedDir 'CCSLab Labcoding.exe'))) {
     throw 'An occupied directory was modified.'
 }
 

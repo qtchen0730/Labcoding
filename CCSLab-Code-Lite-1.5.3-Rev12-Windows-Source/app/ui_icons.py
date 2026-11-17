@@ -25,12 +25,17 @@ def gear_image(master, foreground, background, size=20):
 
 
 def apply_window_icon(root):
-    base = Path(__file__).resolve().parent
-    assets = base / "assets" if getattr(sys, "frozen", False) else base.parents[1] / ".work" / "assets" / "Rev12"
-    icon = assets / "app.ico"
-    if icon.is_file():
-        root.iconbitmap(str(icon))
-        root.iconbitmap(default=str(icon))
+    assets = Path(__file__).resolve().parent / "assets"
+    if getattr(sys, "frozen", False):
+        icon = assets / "app.ico"
+        if icon.is_file():
+            root.iconbitmap(str(icon))
+            root.iconbitmap(default=str(icon))
+    else:
+        icon = assets / "app.png"
+        if icon.is_file():
+            root._app_icon = tk.PhotoImage(file=str(icon))
+            root.iconphoto(True, root._app_icon)
 
 
 class ActionIcon(tk.Canvas):

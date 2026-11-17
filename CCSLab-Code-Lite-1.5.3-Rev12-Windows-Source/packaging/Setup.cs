@@ -10,15 +10,15 @@ using System.Threading;
 using System.Windows.Forms;
 using Microsoft.Win32;
 
-[assembly: AssemblyTitle("CCSLab Code Lite")]
-[assembly: AssemblyProduct("CCSLab Code Lite")]
+[assembly: AssemblyTitle("CCSLab Labcoding")]
+[assembly: AssemblyProduct("CCSLab Labcoding")]
 [assembly: AssemblyVersion("1.5.3.12")]
 [assembly: AssemblyFileVersion("1.5.3.12")]
 
 static class Setup
 {
-    const string Product = "CCSLab Code Lite";
-    const string AppName = "CCSLab Code Lite.exe";
+    const string Product = "CCSLab Labcoding";
+    const string AppName = "CCSLab Labcoding.exe";
     const string Marker = ".ccslab-code-lite-install";
     const string RegistryPath = @"Software\Microsoft\Windows\CurrentVersion\Uninstall\CCSLabCodeLite";
     const string Version = "1.5.3 Rev12";
@@ -40,7 +40,7 @@ static class Setup
                 FinishUninstall(Int32.Parse(args[1]), args[2]);
                 return 0;
             }
-            if (MessageBox.Show("卸载 CCSLab Code Lite？连接配置和历史会话将保留。",
+            if (MessageBox.Show("卸载 CCSLab Labcoding？连接配置和历史会话将保留。",
                 Product, MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK)
                 return 0;
             var installedAt = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location);
@@ -80,7 +80,7 @@ static class Setup
         if (!Directory.Exists(folder) ||
             (File.GetAttributes(folder) & FileAttributes.ReparsePoint) != 0 ||
             !File.Exists(Path.Combine(folder, Marker)))
-            throw new IOException("找不到 CCSLab Code Lite 安装记录，请检查程序目录。");
+            throw new IOException("找不到 CCSLab Labcoding 安装记录，请检查程序目录。");
     }
 
     static string RegisteredDirectory()
@@ -99,7 +99,7 @@ static class Setup
         var text = Environment.ExpandEnvironmentVariables(input.Trim().Trim('"'));
         if (text.Length < 4 || !Char.IsLetter(text[0]) || text[1] != ':' ||
             (text[2] != '\\' && text[2] != '/'))
-            throw new IOException("请输入完整的本地安装路径，例如 D:\\Apps\\CCSLab Code Lite。");
+            throw new IOException("请输入完整的本地安装路径，例如 D:\\Apps\\CCSLab Labcoding。");
         var folder = Path.GetFullPath(text).TrimEnd(Path.DirectorySeparatorChar);
         if (folder.Length <= Path.GetPathRoot(folder).TrimEnd(Path.DirectorySeparatorChar).Length)
             throw new IOException("请选择磁盘中的子文件夹作为安装位置。");
@@ -127,7 +127,7 @@ static class Setup
                 try { executable = process.MainModule.FileName; }
                 catch (System.ComponentModel.Win32Exception) { continue; }
                 if (SamePath(executable, Path.Combine(directory, AppName)))
-                    throw new IOException("请先退出 CCSLab Code Lite，然后重试。");
+                    throw new IOException("请先退出 CCSLab Labcoding，然后重试。");
             }
         }
     }
@@ -179,7 +179,7 @@ static class Setup
             File.Delete(ShortcutPath);
             Registry.CurrentUser.DeleteSubKeyTree(RegistryPath, false);
         }
-        MessageBox.Show("已卸载 CCSLab Code Lite。", Product, MessageBoxButtons.OK, MessageBoxIcon.Information);
+        MessageBox.Show("已卸载 CCSLab Labcoding。", Product, MessageBoxButtons.OK, MessageBoxIcon.Information);
     }
 #else
     static string TransactionPath(string destination)
@@ -445,7 +445,7 @@ static class Setup
         void Browse(object sender, EventArgs e)
         {
             using (var picker = new FolderBrowserDialog {
-                Description = "选择 CCSLab Code Lite 的安装文件夹",
+                Description = "选择 CCSLab Labcoding 的安装文件夹",
                 ShowNewFolderButton = true
             })
             {
@@ -487,7 +487,7 @@ static class Setup
                     browse.Enabled = destination.Enabled = true;
                 action.Text = installed ? "启动" : "重试";
                 body.Text = installed
-                    ? "安装完成。可从 Windows 开始菜单启动 CCSLab Code Lite。"
+                    ? "安装完成。可从 Windows 开始菜单启动 CCSLab Labcoding。"
                     : "安装遇到问题。修正后可重试。";
                 if (!installed) ShowError(result.Error);
                 install.Dispose();

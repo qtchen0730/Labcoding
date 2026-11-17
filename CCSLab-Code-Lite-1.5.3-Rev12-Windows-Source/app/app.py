@@ -155,7 +155,7 @@ class App:
         self.themed = []
         self.style = ttk.Style()
         self.style.theme_use("clam")
-        root.title("CCSLab Code Lite")
+        root.title("CCSLab Labcoding")
         apply_window_icon(root)
         root.geometry(f"{min(1748, root.winfo_screenwidth() - 70)}x{min(1228, root.winfo_screenheight() - 130)}")
         root.minsize(950, 580)
@@ -244,7 +244,7 @@ class App:
         self.skin(self.root, "bg", None)
         bar = self.frame(self.root)
         bar.pack(fill="x")
-        self.label(bar, "CCSLab Code Lite", size=15, bold=True).pack(side="left", padx=(17, 19), pady=13)
+        self.label(bar, "CCSLab Labcoding", size=15, bold=True).pack(side="left", padx=(17, 19), pady=13)
         self.workspace_button = self.button(bar, "工作台", lambda: self.show_page("workspace"), "Nav.TButton")
         self.workspace_button.pack(side="left", padx=(0, 4))
         footer = self.frame(self.root)
@@ -2297,7 +2297,7 @@ class App:
 
 
 def main():
-    parser = argparse.ArgumentParser(prog="CCSLab Code Lite")
+    parser = argparse.ArgumentParser(prog="CCSLab Labcoding")
     parser.add_argument("--smoke-test", action="store_true", help="initialize the UI and exit")
     parser.add_argument("--data-dir", type=Path)
     args = parser.parse_args()
