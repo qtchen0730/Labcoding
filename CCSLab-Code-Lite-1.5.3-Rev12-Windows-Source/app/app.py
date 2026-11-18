@@ -13,6 +13,10 @@ from time import monotonic, time
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from uuid import uuid4
+from versioning import read_version_info
+from update_system import (
+    UpdateError, UpdateNetworkError, UpdateService, UpdateTrustError,
+)
 
 from changes import Changes
 from account_client import (
@@ -39,6 +43,8 @@ from approval_policy import SessionGrants, session_scope, replacement_details_co
 
 
 FONT = "Microsoft YaHei UI"
+APP_VERSION_INFO = read_version_info()
+APP_VERSION = APP_VERSION_INFO["version"]
 
 
 def read_json(path, default):
@@ -59,11 +65,31 @@ def valid_session_title(title):
             and not any(ord(char) < 32 or ord(char) == 127 for char in title))
 
 
+def update_check_error_message(error):
+    reason = " ".join(str(error).split())[:180]
+    if isinstance(error, UpdateNetworkError):
+        return f"网络连接失败：{reason}"
+    if isinstance(error, UpdateTrustError):
+        return f"更新检查失败：安全验证未通过（{reason}）"
+    if isinstance(error, UpdateError):
+        return f"更新检查失败：{reason}"
+    return f"更新检查失败：{reason or type(error).__name__}"
+
+
 class App:
     def __init__(self, root, data_dir=None, smoke=False):
         self.root = root
         self.data_root = data_dir or Path(os.environ.get("LOCALAPPDATA", Path.home())) / "CCSLabCodeLite" / "data"
         self.data_root.mkdir(parents=True, exist_ok=True)
+        self.version_info = APP_VERSION_INFO
+        self.update_service = UpdateService(self.data_root, self.version_info)
+        self.update_candidate = None
+        self.update_package = None
+        self.update_cancel = Event()
+        self.update_checking = False
+        self.update_downloading = False
+        self.update_snoozed_until = 0
+        self.update_status = tk.StringVar(value="尚未检查")
         self.state = self.data_root
         self.prefs_path = self.data_root / "preferences.json"
         self.prefs = read_json(self.prefs_path, {})
@@ -187,6 +213,8 @@ class App:
             self.schedule("connection", 3500, self.monitor_account)
             self.schedule("gateway_check", 100, self.check_account_connection)
             self.schedule("saved_login", 250, self.restore_saved_login)
+            self.schedule("update_check", 6000, lambda: self.check_for_updates(manual=False))
+            self.schedule("update_periodic", 24 * 60 * 60 * 1000, self.periodic_update_check)
 
     def schedule(self, name, delay, callback):
         previous = self.timers.pop(name, None)
@@ -635,6 +663,19 @@ class App:
         guidance.pack(anchor="w", padx=13, pady=(0, 7))
         guidance.bind("<Configure>", lambda event: event.widget.configure(wraplength=max(event.width, 90)))
         self.context_meter = ContextMeter(self, center)
+        self.update_banner = self.frame(center, "soft")
+        self.update_message = tk.StringVar(value="")
+        update_text = self.label(self.update_banner, variable=self.update_message, bg="soft", color="heading")
+        update_text.pack(side="left", fill="x", expand=True, padx=12, pady=8)
+        self.update_download_button = self.button(self.update_banner, "\u4e0b\u8f7d\u66f4\u65b0", self.download_update,
+                                                  "Accent.TButton")
+        self.update_download_button.pack(side="right", padx=(4, 8), pady=5)
+        self.update_later_button = self.button(self.update_banner, "\u7a0d\u540e\u63d0\u9192", self.snooze_update)
+        self.update_later_button.pack(side="right", padx=4, pady=5)
+        self.update_open_folder_button = self.button(
+            self.update_banner, "\u6253\u5f00\u5b89\u88c5\u5305\u6240\u5728\u6587\u4ef6\u5939", self.open_update_folder)
+        self.update_open_folder_button.pack(side="right", padx=4, pady=5)
+        self.update_banner.pack_forget()
         ttk.Separator(center).pack(fill="x", padx=16)
         conversation, self.chat = self.text_panel(center, height=1, background="panel", text_size=11)
         conversation.pack(fill="both", expand=True, padx=10)
@@ -709,12 +750,18 @@ class App:
         if self.page_panel is self.workspace_view:
             self.workspace_view.pack_forget()
         elif self.page_panel is not None:
+            if self.current_page == "settings":
+                for name in ("update_check_button", "update_settings_download_button",
+                             "update_settings_later_button", "update_settings_open_folder_button"):
+                    setattr(self, name, None)
             self.page_panel.destroy()
         self.current_page = page
         self.page_controller = None
         if page == "workspace":
             self.page_panel = self.workspace_view
             self.workspace_view.pack(fill="both", expand=True)
+            if self.update_candidate:
+                self.update_banner.pack(fill="x", padx=18, pady=(0, 8), before=self.context_meter.panel)
         else:
             self.page_panel = self.frame(self.page_host)
             self.page_panel.pack(fill="both", expand=True)
@@ -864,14 +911,16 @@ class App:
         box.configure(state="disabled")
 
     def pump(self):
-        for _ in range(200):
-            try:
-                action = self.events.get_nowait()
-            except Empty:
-                break
-            action()
-        if not self.closing:
-            self.schedule("pump", 28, self.pump)
+        try:
+            for _ in range(200):
+                try:
+                    action = self.events.get_nowait()
+                except Empty:
+                    break
+                action()
+        finally:
+            if not self.closing:
+                self.schedule("pump", 28, self.pump)
 
     def worker(self, caption, fn, on_done, on_error=None):
         if self.busy or self.closing:
@@ -921,6 +970,20 @@ class App:
         ):
             button.configure(state="normal" if active else "disabled")
         self.update_delete_actions()
+        if getattr(self, "update_download_button", None):
+            downloadable = bool(self.update_candidate and not self.update_downloading and not self.update_package)
+            for button in (getattr(self, "update_download_button", None),
+                           getattr(self, "update_settings_download_button", None)):
+                if button:
+                    button.configure(state="normal" if downloadable else "disabled")
+            for button in (getattr(self, "update_later_button", None),
+                           getattr(self, "update_settings_later_button", None)):
+                if button:
+                    button.configure(state="normal" if self.update_candidate else "disabled")
+            for button in (getattr(self, "update_open_folder_button", None),
+                           getattr(self, "update_settings_open_folder_button", None)):
+                if button:
+                    button.configure(state="normal" if self.update_package else "disabled")
         self.mode_picker.configure(state="readonly" if free and not self.account_pending else "disabled")
         if self.account_pending and not self.pending_locked:
             self.pending_banner.pack(fill="x", padx=18, pady=(0, 8), before=self.context_meter.panel)
@@ -969,6 +1032,160 @@ class App:
                         or (page == "access" and self.current_page == "direct"))
             button.configure(style="Selected.Nav.TButton" if selected else "Nav.TButton")
         self.update_settings_icon()
+
+    def check_for_updates(self, manual=True):
+        if self.update_checking or self.closing:
+            return
+        if not manual and self.update_snoozed_until > time():
+            return
+        self.update_checking = True
+        self.update_candidate = None
+        self._hide_update_banner()
+        self.update_status.set("正在检查更新…")
+        self.update_message.set("正在检查更新…")
+        self._set_update_check_button_state("disabled")
+
+        def work():
+            try:
+                result = self.update_service.check()
+                self.events.put(lambda result=result: self._update_check_done(result, manual))
+            except Exception as error:
+                self.events.put(lambda error=error: self._update_check_done(error, manual))
+
+        try:
+            Thread(target=work, daemon=True).start()
+        except Exception as error:
+            self._update_check_done(error, manual)
+
+    def periodic_update_check(self):
+        self.check_for_updates(manual=False)
+        if not self.closing:
+            self.schedule("update_periodic", 24 * 60 * 60 * 1000, self.periodic_update_check)
+
+    def _update_check_done(self, result, manual):
+        self.update_checking = False
+        self._set_update_check_button_state("normal")
+        if isinstance(result, Exception):
+            message = update_check_error_message(result)
+            self.update_status.set(message)
+            show_banner = manual and self.current_page == "workspace"
+            self.update_message.set(message if show_banner else "")
+            if show_banner:
+                self.update_banner.pack(fill="x", padx=18, pady=(0, 8), before=self.context_meter.panel)
+            self.update_actions()
+            return
+        self.update_candidate = result
+        self.update_package = None
+        if result is None:
+            message = "\u5f53\u524d\u5df2\u662f\u6700\u65b0\u7248\u672c"
+            self.update_status.set(message)
+            self.update_message.set(message)
+            self.update_actions()
+            return
+        message = f"\u53d1\u73b0\u65b0\u7248\u672c {result.version}"
+        detail = (f"\u5f53\u524d\u7248\u672c {APP_VERSION} \u2192 \u6700\u65b0\u7248\u672c {result.version}\n"
+                  f"\u66f4\u65b0\u8bf4\u660e\uff1a{result.notes or '\u6b64\u7248\u672c\u672a\u63d0\u4f9b\u66f4\u65b0\u8bf4\u660e'}\n"
+                  "\u5b89\u88c5\u5305\u672a\u7ecf\u72ec\u7acb\u53d1\u5e03\u8005\u7b7e\u540d\u9a8c\u8bc1\uff0c\u8bf7\u786e\u8ba4\u6765\u6e90\u540e\u624b\u52a8\u5b89\u88c5\u3002")
+        if result.sha256 is None:
+            detail += "\nGitHub Release Asset \u672a\u63d0\u4f9b SHA-256 \u6458\u8981\uff0c\u4e0d\u4f1a\u6807\u8bb0\u4e3a\u6458\u8981\u6821\u9a8c\u901a\u8fc7\u3002"
+        self.update_status.set(message)
+        self.update_message.set(detail)
+        if self.current_page == "workspace":
+            self.update_banner.pack(fill="x", padx=18, pady=(0, 8), before=self.context_meter.panel)
+        self.update_actions()
+
+    def _hide_update_banner(self):
+        banner = getattr(self, "update_banner", None)
+        if banner is None:
+            return
+        try:
+            if banner.winfo_manager():
+                banner.pack_forget()
+        except tk.TclError:
+            pass
+
+    def _set_update_check_button_state(self, state):
+        button = getattr(self, "update_check_button", None)
+        if button is None:
+            return
+        try:
+            if button.winfo_exists():
+                button.configure(state=state)
+        except tk.TclError:
+            pass
+
+    def download_update(self):
+        candidate = self.update_candidate
+        if not candidate or self.update_downloading or self.update_package:
+            return
+        self.update_downloading = True
+        self.update_cancel.clear()
+        self._set_update_download_controls("\u53d6\u6d88\u4e0b\u8f7d", self.cancel_update_download, "normal")
+
+        def progress(received, total):
+            self.events.put(lambda: self.update_message.set(
+                f"\u6b63\u5728\u4e0b\u8f7d {candidate.version}\uff1a{received // 1024} / {total // 1024} KB"))
+
+        def work():
+            try:
+                package = self.update_service.download(candidate, cancel=self.update_cancel, progress=progress)
+                self.events.put(lambda package=package: self._update_download_done(package, None))
+            except Exception as error:
+                self.events.put(lambda error=error: self._update_download_done(None, error))
+
+        try:
+            Thread(target=work, daemon=True).start()
+        except Exception as error:
+            self._update_download_done(None, error)
+
+    def cancel_update_download(self):
+        self.update_cancel.set()
+        self.update_message.set("\u6b63\u5728\u53d6\u6d88\u4e0b\u8f7d\u2026")
+
+    def _update_download_done(self, package, error):
+        self.update_downloading = False
+        self.update_package = package
+        if error:
+            message = f"\u66f4\u65b0\u4e0b\u8f7d\u672a\u5b8c\u6210\uff1a{error}"
+        else:
+            if package.digest_verified:
+                message = ("\u4e0b\u8f7d\u5b8c\u6210\uff1bGitHub Release Asset SHA-256 \u6458\u8981\u5339\u914d\uff08\u4ec5\u6821\u9a8c\u6587\u4ef6\u5b8c\u6574\u6027\uff0c\u4e0d\u662f\u53d1\u5e03\u8005\u8eab\u4efd\u8ba4\u8bc1\uff09\u3002")
+            else:
+                message = ("\u4e0b\u8f7d\u5b8c\u6210\uff1bGitHub \u672a\u63d0\u4f9b\u72ec\u7acb SHA-256 \u6458\u8981\uff0c\u672a\u8fdb\u884c\u72ec\u7acb\u6458\u8981\u6821\u9a8c\u3002")
+            message += ("\n\u5b89\u88c5\u5305\u672a\u7ecf\u72ec\u7acb\u53d1\u5e03\u8005\u7b7e\u540d\u9a8c\u8bc1\uff0c\u8bf7\u786e\u8ba4\u6765\u6e90\u540e\u624b\u52a8\u5b89\u88c5\u3002"
+                       "\u8bf7\u9000\u51fa CCSLab Labcoding \u540e\u624b\u52a8\u8fd0\u884c\u5b89\u88c5\u5305\u3002")
+        self.update_message.set(message)
+        self.update_status.set(message)
+        self._set_update_download_controls("\u4e0b\u8f7d\u66f4\u65b0", self.download_update, "normal")
+        self.update_actions()
+
+    def _set_update_download_controls(self, text, command, state):
+        for button in (getattr(self, "update_download_button", None),
+                       getattr(self, "update_settings_download_button", None)):
+            if button:
+                button.configure(text=text, command=command, state=state)
+
+    def open_update_folder(self):
+        candidate = self.update_candidate
+        package = self.update_package
+        if not candidate or not package:
+            return
+        try:
+            verified = self.update_service.verify_local_package(candidate)
+            if verified.path != package.path or verified.sha256 != package.sha256:
+                raise UpdateTrustError("\u5df2\u4e0b\u8f7d\u5b89\u88c5\u5305\u4e0e\u9a8c\u8bc1\u7ed3\u679c\u4e0d\u4e00\u81f4")
+            os.startfile(str(verified.path.parent))
+        except Exception as error:
+            self.update_package = None
+            message = f"\u5b89\u88c5\u5305\u518d\u6b21\u9a8c\u8bc1\u5931\u8d25\uff0c\u5df2\u7981\u7528\u6253\u5f00\uff1a{error}"
+            self.update_message.set(message)
+            self.update_status.set(message)
+            self.update_actions()
+
+    def snooze_update(self):
+        if self.update_candidate:
+            self.update_snoozed_until = time() + 24 * 60 * 60
+        self.update_banner.pack_forget()
 
     @property
     def can_use_agent(self):
@@ -2448,6 +2665,7 @@ class App:
         if not self.running or self.stop_requested.is_set():
             return
         self.stop_requested.set()
+        self.update_cancel.set()
         self.cancel_all_approvals()
         self.task_state.set("正在停止")
         self.update_actions()

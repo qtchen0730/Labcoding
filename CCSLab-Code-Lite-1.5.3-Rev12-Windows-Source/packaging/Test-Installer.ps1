@@ -38,6 +38,9 @@ $Expected = @($Exe, $OpenCode, (Join-Path $InstallDir 'Uninstall.exe'), (Join-Pa
 foreach ($Path in $Expected) {
     if (!(Test-Path -LiteralPath $Path -PathType Leaf)) { throw "Expected installed file is missing: $Path" }
 }
+if (Test-Path -LiteralPath (Join-Path $InstallDir 'CCSLabUpdater.exe')) {
+    throw 'The manual-update package must not include an automatic updater executable.'
+}
 Invoke-Checked $Exe @('--smoke-test', '--data-dir', "`"$DataDir`"")
 
 $OccupiedDir = Join-Path $Test 'occupied'

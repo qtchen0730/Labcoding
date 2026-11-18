@@ -103,6 +103,31 @@ def build_settings_page(app, parent, section="general"):
         bind_wheel(viewport)
 
     def general(parent):
+        updates = card(parent, "软件更新", f"当前版本：{app.version_info['version']}（{app.version_info['channel']} 通道）")
+        update_row = app.frame(updates, "field")
+        update_row.pack(fill="x", padx=15, pady=(0, 10))
+        app.update_check_button = app.button(update_row, "检查更新", lambda: app.check_for_updates(manual=True))
+        app.update_check_button.pack(side="left")
+        app.label(update_row, "仅连接 GitHub Releases；检查不使用 CCSLab 账号凭据。",
+                  bg="field", muted=True, size=9).pack(side="left", padx=(10, 0))
+        status = app.label(updates, variable=app.update_status, bg="field", muted=True, size=9)
+        status.configure(wraplength=580, justify="left")
+        status.pack(fill="x", padx=15, pady=(0, 10))
+        detail = app.label(updates, variable=app.update_message, bg="field", muted=True, size=9)
+        detail.configure(wraplength=580, justify="left")
+        detail.pack(fill="x", padx=15, pady=(0, 8))
+        update_actions = app.frame(updates, "field")
+        update_actions.pack(fill="x", padx=15, pady=(0, 10))
+        app.update_settings_download_button = app.button(
+            update_actions, "\u4e0b\u8f7d\u66f4\u65b0", app.download_update, "Accent.TButton")
+        app.update_settings_download_button.pack(side="left")
+        app.update_settings_later_button = app.button(
+            update_actions, "\u7a0d\u540e\u63d0\u9192", app.snooze_update)
+        app.update_settings_later_button.pack(side="left", padx=(8, 0))
+        app.update_settings_open_folder_button = app.button(
+            update_actions, "\u6253\u5f00\u5b89\u88c5\u5305\u6240\u5728\u6587\u4ef6\u5939", app.open_update_folder)
+        app.update_settings_open_folder_button.pack(side="left", padx=(8, 0))
+
         appearance = card(parent, "外观")
         row = app.frame(appearance, "field")
         row.pack(fill="x", padx=15, pady=(0, 10))

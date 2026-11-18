@@ -12,20 +12,25 @@ using Microsoft.Win32;
 
 [assembly: AssemblyTitle("CCSLab Labcoding")]
 [assembly: AssemblyProduct("CCSLab Labcoding")]
-[assembly: AssemblyVersion("1.5.3.12")]
-[assembly: AssemblyFileVersion("1.5.3.12")]
-
 static class Setup
 {
     const string Product = "CCSLab Labcoding";
     const string AppName = "CCSLab Labcoding.exe";
     const string Marker = ".ccslab-code-lite-install";
     const string RegistryPath = @"Software\Microsoft\Windows\CurrentVersion\Uninstall\CCSLabCodeLite";
-    const string Version = "1.5.3 Rev12";
+    static readonly string Version = GetProductVersion();
     static readonly string DefaultInstallDir = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Programs", Product);
     static readonly string ShortcutPath = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.Programs), Product + ".lnk");
+
+    static string GetProductVersion()
+    {
+        var attribute = Attribute.GetCustomAttribute(Assembly.GetExecutingAssembly(),
+            typeof(AssemblyInformationalVersionAttribute)) as AssemblyInformationalVersionAttribute;
+        return attribute != null && !String.IsNullOrWhiteSpace(attribute.InformationalVersion)
+            ? attribute.InformationalVersion : "1.5.3 Rev12";
+    }
 
     [STAThread]
     static int Main(string[] args)
@@ -119,15 +124,18 @@ static class Setup
 
     static void RequireAppClosed(string directory)
     {
-        foreach (Process process in Process.GetProcessesByName(Path.GetFileNameWithoutExtension(AppName)))
+        string[] executableNames = { AppName, "CCSLab Code Lite.exe" };
+        foreach (Process process in Process.GetProcesses())
         {
             using (process)
             {
                 string executable;
                 try { executable = process.MainModule.FileName; }
                 catch (System.ComponentModel.Win32Exception) { continue; }
-                if (SamePath(executable, Path.Combine(directory, AppName)))
-                    throw new IOException("请先退出 CCSLab Labcoding，然后重试。");
+                catch (InvalidOperationException) { continue; }
+                foreach (string name in executableNames)
+                    if (SamePath(executable, Path.Combine(directory, name)))
+                        throw new IOException("请先退出 CCSLab Labcoding 或 CCSLab Code Lite，然后重试。");
             }
         }
     }
@@ -390,6 +398,9 @@ static class Setup
             shortcut.GetType().InvokeMember("IconLocation", BindingFlags.SetProperty,
                 null, shortcut, new object[] { Path.Combine(directory, "_internal", "assets", "app.ico") + ",0" });
             shortcut.GetType().InvokeMember("Save", BindingFlags.InvokeMethod, null, shortcut, null);
+            string legacyShortcut = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Programs),
+                "CCSLab Code Lite.lnk");
+            if (File.Exists(legacyShortcut)) File.Delete(legacyShortcut);
         }
         finally
         {

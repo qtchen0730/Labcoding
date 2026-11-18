@@ -41,6 +41,32 @@ class InstallerTransactions(unittest.TestCase):
             if result.returncode:
                 raise RuntimeError(result.stdout+result.stderr)
             cls.installers[version] = exe
+        version_source = cls.base/"VersionAssemblyInfo.cs"
+        version_source.write_text(
+            'using System.Reflection;\n'
+            '[assembly: AssemblyInformationalVersion("1.6.0-beta.1")]\n', encoding="utf-8")
+        versioned_setup = cls.base/"versioned-setup.exe"
+        result = subprocess.run([str(compiler), "/nologo", "/target:winexe", "/codepage:65001",
+            "/r:System.dll", "/r:System.Core.dll", "/r:System.Drawing.dll",
+            "/r:System.Windows.Forms.dll", "/r:System.IO.Compression.dll",
+            "/resource:"+str(cls.base/"old.zip")+",ccslab-payload", "/out:"+str(versioned_setup),
+            str(version_source), str(source)], capture_output=True, text=True,
+            creationflags=subprocess.CREATE_NO_WINDOW)
+        if result.returncode:
+            raise RuntimeError(result.stdout+result.stderr)
+        cls.versioned_setup = versioned_setup
+        probe_source = cls.base/"ReadInstallerVersion.cs"
+        probe_source.write_text(
+            'using System; using System.Reflection; '
+            'class ReadInstallerVersion { static int Main(string[] a) { '
+            'var t=Assembly.LoadFrom(a[0]).GetType("Setup", true); '
+            'var f=t.GetField("Version", BindingFlags.NonPublic|BindingFlags.Static); '
+            'Console.WriteLine(f.GetValue(null)); return 0; } }', encoding="utf-8")
+        cls.version_probe = cls.base/"ReadInstallerVersion.exe"
+        result = subprocess.run([str(compiler), "/nologo", "/target:exe", "/out:"+str(cls.version_probe),
+            str(probe_source)], capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
+        if result.returncode:
+            raise RuntimeError(result.stdout+result.stderr)
 
     def setUp(self):
         self.case = self.base/self._testMethodName
@@ -67,6 +93,12 @@ class InstallerTransactions(unittest.TestCase):
         self.assertEqual((self.destination/"CCSLab Code Lite.exe").read_text(), version)
         self.assertEqual((self.destination/"_internal/fixture.txt").read_text(), version)
         self.assertIn('"draft":"unfinished"', self.data.read_text())
+
+    def test_setup_uses_embedded_product_version_for_registry_value(self):
+        result = subprocess.run([str(self.version_probe), str(self.versioned_setup)],
+            capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
+        self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+        self.assertEqual(result.stdout.strip(), "1.6.0-beta.1")
 
     def wait_for_point(self, process, point):
         marker = Path(str(self.destination)+".test-point")

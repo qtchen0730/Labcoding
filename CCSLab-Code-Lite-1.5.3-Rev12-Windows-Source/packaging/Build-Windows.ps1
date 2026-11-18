@@ -1,20 +1,27 @@
 param(
-    [string]$Output = (Join-Path (Split-Path (Split-Path $PSScriptRoot)) '.work\releases\CCSLab-Labcoding-1.5.3-Rev12-Setup-x64.exe'),
+    [string]$Output = (Join-Path (Split-Path (Split-Path $PSScriptRoot)) '.work\releases\CCSLab-Labcoding-Test-Setup-x64.exe'),
     [string]$Python = 'python',
     [string]$PyInstallerPath = '',
-    [string]$BuildRoot = (Join-Path (Split-Path (Split-Path $PSScriptRoot)) '.work\build\Rev12')
+    [string]$BuildRoot = (Join-Path (Split-Path (Split-Path $PSScriptRoot)) ('.work\build\test-' + (Get-Date -Format 'yyyyMMdd-HHmmss')))
 )
 
 $ErrorActionPreference = 'Stop'
 $LocalWork = Join-Path (Split-Path (Split-Path $PSScriptRoot)) '.work'
-$env:PYTHONPYCACHEPREFIX = (New-Item -ItemType Directory -Force -Path (Join-Path $LocalWork 'pycache')).FullName
-$env:PYINSTALLER_CONFIG_DIR = (New-Item -ItemType Directory -Force -Path (Join-Path $LocalWork 'pyinstaller-cache')).FullName
-$env:TEMP = $env:TMP = (New-Item -ItemType Directory -Force -Path (Join-Path $LocalWork 'tmp')).FullName
+$BuildRoot = [System.IO.Path]::GetFullPath($BuildRoot)
+$Output = [System.IO.Path]::GetFullPath($Output)
+$FixedTestOutput = [System.IO.Path]::GetFullPath((Join-Path $LocalWork 'releases\CCSLab-Labcoding-Test-Setup-x64.exe'))
+if (Test-Path -LiteralPath $BuildRoot) { throw "Build directory already exists; refusing to overwrite: $BuildRoot" }
+if ((Test-Path -LiteralPath $Output) -and $Output -ne $FixedTestOutput) {
+    throw "Only the fixed test installer may be overwritten: $Output"
+}
+$BuildRoot = (New-Item -ItemType Directory -Path $BuildRoot).FullName
+$env:PYTHONPYCACHEPREFIX = (New-Item -ItemType Directory -Force -Path (Join-Path $BuildRoot 'pycache')).FullName
+$env:PYINSTALLER_CONFIG_DIR = (New-Item -ItemType Directory -Force -Path (Join-Path $BuildRoot 'pyinstaller-cache')).FullName
+$env:TEMP = $env:TMP = (New-Item -ItemType Directory -Force -Path (Join-Path $BuildRoot 'tmp')).FullName
 $Product = 'CCSLab Labcoding'
 $Source = Join-Path (Split-Path $PSScriptRoot) 'app'
+$VersionInfo = Get-Content -LiteralPath (Join-Path $Source 'version.json') -Raw -Encoding utf8 | ConvertFrom-Json
 $Compiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
-$BuildRoot = (New-Item -ItemType Directory -Force -Path $BuildRoot).FullName
-$Output = [System.IO.Path]::GetFullPath($Output)
 
 function Confirm-NativeSuccess([string]$Operation) {
     if ($LASTEXITCODE -ne 0) {
@@ -39,7 +46,7 @@ if ((Get-FileHash -LiteralPath $OpenCode -Algorithm SHA256).Hash -ne $OpenCodeHa
 }
 
 $Dist = Join-Path $BuildRoot 'dist'
-$Assets = (New-Item -ItemType Directory -Force -Path (Join-Path $LocalWork 'assets\Rev12')).FullName
+$Assets = (New-Item -ItemType Directory -Force -Path (Join-Path $BuildRoot 'assets')).FullName
 $Icon = Join-Path $Assets 'app.ico'
 $IconPng = Join-Path $Assets 'app.png'
 $IconBuilder = Join-Path $BuildRoot 'Build-Icon.exe'
@@ -52,8 +59,20 @@ $AnalysisOutput = Join-Path $BuildRoot 'pyinstaller'
 $FreezeOptions = @(
     '--noconfirm', '--windowed', '--onedir', '--noupx', '--name', $Product,
     '--icon', $Icon, '--add-data', "$Icon;assets", '--add-data', "$IconPng;assets",
+    '--add-data', "$(Join-Path $Source 'version.json');.",
+    '--version-file', (Join-Path $BuildRoot 'version-resource.txt'),
     '--specpath', $BuildRoot, '--workpath', $AnalysisOutput, '--distpath', $Dist
 )
+$versionCore = $VersionInfo.version.Split('-')[0].Split('.')
+$fileVersion = "{0}.{1}.{2}.{3}" -f [int]$versionCore[0], [int]$versionCore[1], [int]$versionCore[2], [int]$VersionInfo.release_sequence
+$fileVersionTuple = ($fileVersion.Split('.') -join ', ')
+$productVersion = $VersionInfo.version
+@"
+VSVersionInfo(
+  ffi=FixedFileInfo(filevers=($fileVersionTuple), prodvers=($fileVersionTuple), mask=0x3f, flags=0x0, OS=0x40004, fileType=0x1, subtype=0x0, date=(0, 0)),
+  kids=[StringFileInfo([StringTable('040904B0', [StringStruct('CompanyName', 'CCSLab'), StringStruct('FileDescription', 'CCSLab Labcoding'), StringStruct('FileVersion', '$productVersion'), StringStruct('ProductName', 'CCSLab Labcoding'), StringStruct('ProductVersion', '$productVersion')])]), VarFileInfo([VarStruct('Translation', [1033, 1200])])]
+)
+"@ | Set-Content -LiteralPath (Join-Path $BuildRoot 'version-resource.txt') -Encoding utf8
 & $Python -m PyInstaller @FreezeOptions (Join-Path $Source 'app.py')
 Confirm-NativeSuccess 'Freezing desktop application'
 
@@ -80,11 +99,18 @@ $CompilerOptions = @(
     '/r:System.dll', '/r:System.Core.dll', '/r:System.Drawing.dll',
     '/r:System.Windows.Forms.dll', '/r:System.IO.Compression.dll'
 )
-& $Compiler @CompilerOptions /define:UNINSTALLER "/out:$Uninstaller" $SetupSource
+$AssemblyInfo = Join-Path $BuildRoot 'AssemblyVersion.cs'
+@"
+using System.Reflection;
+[assembly: AssemblyVersion("$fileVersion")]
+[assembly: AssemblyFileVersion("$fileVersion")]
+[assembly: AssemblyInformationalVersion("$productVersion")]
+"@ | Set-Content -LiteralPath $AssemblyInfo -Encoding utf8
+& $Compiler @CompilerOptions /define:UNINSTALLER "/out:$Uninstaller" $AssemblyInfo $SetupSource
 Confirm-NativeSuccess 'Compiling uninstall program'
 & $Python (Join-Path $PSScriptRoot 'Create-Payload.py') $Frozen $Payload
 Confirm-NativeSuccess 'Compressing application data'
-& $Compiler @CompilerOptions "/resource:$Payload,ccslab-payload" "/out:$IntermediateSetup" $SetupSource
+& $Compiler @CompilerOptions "/resource:$Payload,ccslab-payload" "/out:$IntermediateSetup" $AssemblyInfo $SetupSource
 Confirm-NativeSuccess 'Compiling installer'
 
 New-Item -ItemType Directory -Force -Path (Split-Path $Output) | Out-Null
