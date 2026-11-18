@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import tempfile
 import time
+import tkinter as tk
 from queue import Queue
 from threading import Event, get_ident
 from types import SimpleNamespace
@@ -392,6 +393,15 @@ class UpdateUiTests(unittest.TestCase):
         app.update_cancel = Event()
         app.update_status = self.Variable()
         app.update_message = self.Variable()
+        app.update_found_version = self.Variable()
+        app.update_release_notes = self.Variable()
+        app.update_security_notice = self.Variable()
+        app.update_download_status = self.Variable()
+        app.settings_update_cleanup = None
+        app.update_settings_release_section = None
+        app.update_settings_notes_text = None
+        app.update_settings_download_status_label = None
+        app.update_settings_download_actions = None
         app.update_check_button = self.Button()
         app.update_download_button = self.Button()
         app.current_page = "settings"
@@ -478,11 +488,12 @@ class UpdateUiTests(unittest.TestCase):
             UpdateService.release_asset_url("v1.6.0-beta.2",
                 "CCSLab-Labcoding-1.6.0-beta.2-Setup-x64.exe"))
         App._update_check_done(app, candidate, True)
-        self.assertIn("1.6.0-beta.2", app.update_status.get())
-        self.assertIn("\u672a\u7ecf\u72ec\u7acb\u53d1\u5e03\u8005\u7b7e\u540d\u9a8c\u8bc1", app.update_message.get())
-        self.assertIn("\u672a\u7ecf\u72ec\u7acb\u53d1\u5e03\u8005\u7b7e\u540d\u9a8c\u8bc1", app.update_message.get())
-        self.assertIn("\u672a\u7ecf\u72ec\u7acb\u53d1\u5e03\u8005\u7b7e\u540d\u9a8c\u8bc1", app.update_message.get())
-        self.assertIn("\u672a\u7ecf\u72ec\u7acb\u53d1\u5e03\u8005\u7b7e\u540d\u9a8c\u8bc1", app.update_message.get())
+        self.assertEqual(app.update_status.get(), "发现新版本")
+        self.assertEqual(app.update_found_version.get(), "1.6.0-beta.2")
+        self.assertEqual(app.update_release_notes.get(), "Fixes")
+        self.assertIn("\u672a\u7ecf\u72ec\u7acb\u53d1\u5e03\u8005\u7b7e\u540d\u9a8c\u8bc1",
+                      app.update_security_notice.get())
+        self.assertIn("1.6.0-beta.2", app.update_message.get())
 
     def test_check_failures_are_never_reported_as_latest(self):
         errors = (
@@ -496,12 +507,15 @@ class UpdateUiTests(unittest.TestCase):
                 App._update_check_done(app, error, True)
                 self.assertIn(expected, app.update_status.get())
                 self.assertNotEqual(app.update_status.get(), "当前已是最新版本")
+                self.assertEqual(app.update_release_notes.get(), "")
+                self.assertEqual(app.update_found_version.get(), "")
 
     def test_settings_error_is_not_duplicated_in_detail_label(self):
         app = self.app()
         App._update_check_done(app, UpdateNetworkError("connect timeout"), True)
         self.assertTrue(app.update_status.get())
         self.assertEqual(app.update_message.get(), "")
+        self.assertEqual(app.update_status.get().count("网络连接失败"), 1)
 
     def test_download_completion_warns_and_never_executes_installer(self):
         app = self.app()
@@ -509,9 +523,73 @@ class UpdateUiTests(unittest.TestCase):
                                   "a" * 64, False, True)
         with patch.object(os, "startfile", create=True) as open_folder:
             App._update_download_done(app, package, None)
-            self.assertIn("\u672a\u7ecf\u72ec\u7acb\u53d1\u5e03\u8005\u7b7e\u540d\u9a8c\u8bc1", app.update_status.get())
-            self.assertIn("手动运行安装包", app.update_status.get())
+            self.assertEqual(app.update_status.get(), "")
+            self.assertIn("\u672a\u7ecf\u72ec\u7acb\u53d1\u5e03\u8005\u7b7e\u540d\u9a8c\u8bc1",
+                          app.update_download_status.get())
+            self.assertIn("手动运行安装包", app.update_download_status.get())
             open_folder.assert_not_called()
+
+    def test_real_settings_release_notes_are_bounded_scrollable_and_page_local(self):
+        with tempfile.TemporaryDirectory(prefix="update-ui-") as folder:
+            root = tk.Tk()
+            gui = App(root, Path(folder), smoke=True)
+            errors = []
+            root.report_callback_exception = lambda *_args: errors.append(_args)
+            try:
+                root.geometry("900x600")
+                gui.show_page("settings")
+                root.update()
+                notes = "\u4fee\u590d\u8bf4\u660e\u4e2d\u6587\nhttps://example.test/releases\n" + "line\n" * 80
+                candidate = UpdateCandidate("1.6.0-beta.2", "beta", "v1.6.0-beta.2", notes,
+                    100, None, "CCSLab-Labcoding-1.6.0-beta.2-Setup-x64.exe",
+                    UpdateService.release_asset_url("v1.6.0-beta.2",
+                        "CCSLab-Labcoding-1.6.0-beta.2-Setup-x64.exe"))
+                App._update_check_done(gui, candidate, True)
+                root.update()
+                text = gui.update_settings_notes_text
+                self.assertEqual(text.get("1.0", "end-1c"), notes)
+                self.assertLessEqual(gui.update_settings_notes_frame.winfo_height(), 220)
+                self.assertLess(gui.update_settings_notes_frame.winfo_height(), root.winfo_height())
+                self.assertEqual(gui.update_settings_download_button.master,
+                                 gui.update_settings_download_actions)
+                self.assertLess(gui.update_settings_download_button.winfo_rooty() +
+                                gui.update_settings_download_button.winfo_height(),
+                                root.winfo_rooty() + root.winfo_height())
+                text.yview_moveto(0)
+                text.event_generate("<MouseWheel>", delta=-120)
+                root.update()
+                self.assertGreater(text.yview()[0], 0)
+                for geometry in ("800x480", "900x600"):
+                    root.geometry(geometry)
+                    root.update()
+                    button = gui.update_settings_download_button
+                    self.assertLess(button.winfo_rooty() + button.winfo_height(),
+                                    root.winfo_rooty() + root.winfo_height())
+                gui.set_update_download_feedback("\u4e0b\u8f7d\u5b8c\u6210\uff0c\u8bf7\u624b\u52a8\u5b89\u88c5")
+                root.update()
+                self.assertEqual(gui.update_status.get(), "\u53d1\u73b0\u65b0\u7248\u672c")
+                self.assertEqual(gui.update_download_status.get(),
+                                 "\u4e0b\u8f7d\u5b8c\u6210\uff0c\u8bf7\u624b\u52a8\u5b89\u88c5")
+                self.assertEqual(str(gui.update_settings_download_status_label.cget("textvariable")),
+                                 str(gui.update_download_status))
+                self.assertEqual(errors, [])
+
+                old_text = text
+                gui.show_page("direct")
+                root.update()
+                self.assertIsNone(gui.update_settings_notes_text)
+                App._update_check_done(gui, candidate, True)
+                gui.show_page("settings")
+                root.update()
+                self.assertNotEqual(old_text, gui.update_settings_notes_text)
+                self.assertEqual(gui.update_settings_notes_text.get("1.0", "end-1c"), notes)
+                App._update_check_done(gui, None, True)
+                root.update()
+                self.assertFalse(gui.update_settings_release_section.winfo_manager())
+                self.assertEqual(gui.update_status.get(), "\u5f53\u524d\u5df2\u662f\u6700\u65b0\u7248\u672c")
+                self.assertEqual(errors, [])
+            finally:
+                gui.close()
 
     def test_verified_folder_action_only_opens_download_directory(self):
         app = self.app()

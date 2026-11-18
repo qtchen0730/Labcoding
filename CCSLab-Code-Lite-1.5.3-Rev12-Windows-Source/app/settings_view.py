@@ -49,8 +49,19 @@ def build_settings_page(app, parent, section="general"):
         if chosen == key:
             return
         chosen = key
+        if app.settings_update_cleanup:
+            app.settings_update_cleanup()
+            app.settings_update_cleanup = None
         for widget in body.winfo_children():
             widget.destroy()
+        app.update_settings_status_label = None
+        app.update_settings_version_label = None
+        app.update_settings_release_section = None
+        app.update_settings_notes_frame = None
+        app.update_settings_notes_text = None
+        app.update_settings_security_label = None
+        app.update_settings_download_status_label = None
+        app.update_settings_download_actions = None
         for item, (button, _name, _build) in routes.items():
             button.configure(style="Selected.Nav.TButton" if item == key else "Nav.TButton")
         _button, name, build = routes[key]
@@ -113,10 +124,58 @@ def build_settings_page(app, parent, section="general"):
         status = app.label(updates, variable=app.update_status, bg="field", muted=True, size=9)
         status.configure(wraplength=580, justify="left")
         status.pack(fill="x", padx=15, pady=(0, 10))
-        detail = app.label(updates, variable=app.update_message, bg="field", muted=True, size=9)
-        detail.configure(wraplength=580, justify="left")
-        detail.pack(fill="x", padx=15, pady=(0, 8))
+        app.update_settings_status_label = status
+
+        release_section = app.frame(updates, "field")
+        app.update_settings_release_section = release_section
+        version_label = app.label(release_section, variable=app.update_found_version,
+                                  bg="field", bold=True, color="heading")
+        version_label.pack(anchor="w", padx=10, pady=(8, 3))
+        app.update_settings_version_label = version_label
+        app.label(release_section, "更新说明", bg="field", muted=True, size=9).pack(
+            anchor="w", padx=10, pady=(0, 4))
+        notes_frame = app.frame(release_section, "field", height=190)
+        notes_frame.pack(fill="x", padx=10, pady=(0, 6))
+        notes_frame.pack_propagate(False)
+        notes = tk.Text(notes_frame, wrap="word", height=8, borderwidth=0,
+                        padx=7, pady=5, undo=False, takefocus=True)
+        app.skin(notes, "field", "text")
+        notes_scroll = ttk.Scrollbar(notes_frame, orient="vertical", command=notes.yview)
+        notes.configure(yscrollcommand=notes_scroll.set, state="disabled")
+        notes.pack(side="left", fill="both", expand=True)
+        notes_scroll.pack(side="right", fill="y")
+        app.update_settings_notes_frame = notes_frame
+        app.update_settings_notes_text = notes
+
+        def scroll_notes(event):
+            delta = getattr(event, "delta", 0)
+            if delta:
+                units = max(1, abs(delta) // 120)
+                notes.yview_scroll(-units if delta > 0 else units, "units")
+                return "break"
+            number = getattr(event, "num", None)
+            if number in (4, 5):
+                notes.yview_scroll(-1 if number == 4 else 1, "units")
+                return "break"
+            return None
+
+        for widget in (notes, notes_frame, notes_scroll):
+            widget.bind("<MouseWheel>", scroll_notes)
+            widget.bind("<Button-4>", scroll_notes)
+            widget.bind("<Button-5>", scroll_notes)
+
+        security = app.label(release_section, variable=app.update_security_notice,
+                             bg="field", muted=True, size=9)
+        security.configure(wraplength=580, justify="left")
+        security.pack(fill="x", padx=10, pady=(0, 8))
+        app.update_settings_security_label = security
+
+        app.update_settings_download_status_label = app.label(
+            updates, variable=app.update_download_status, bg="field", muted=True, size=9)
+        app.update_settings_download_status_label.configure(wraplength=580, justify="left")
+        app.update_settings_download_status_label.pack(fill="x", padx=15, pady=(0, 8))
         update_actions = app.frame(updates, "field")
+        app.update_settings_download_actions = update_actions
         update_actions.pack(fill="x", padx=15, pady=(0, 10))
         app.update_settings_download_button = app.button(
             update_actions, "\u4e0b\u8f7d\u66f4\u65b0", app.download_update, "Accent.TButton")
@@ -127,6 +186,28 @@ def build_settings_page(app, parent, section="general"):
         app.update_settings_open_folder_button = app.button(
             update_actions, "\u6253\u5f00\u5b89\u88c5\u5305\u6240\u5728\u6587\u4ef6\u5939", app.open_update_folder)
         app.update_settings_open_folder_button.pack(side="left", padx=(8, 0))
+
+        def resize_notes(_event=None):
+            try:
+                if notes_frame.winfo_exists():
+                    dpi_height = int(app.root.winfo_fpixels("1i") * 2.0)
+                    window_height = max(120, int(app.root.winfo_height() * 0.32))
+                    notes_frame.configure(height=max(120, min(220, dpi_height, window_height)))
+            except (tk.TclError, ValueError):
+                return
+
+        resize_binding = app.root.bind("<Configure>", resize_notes, add="+")
+        resize_notes()
+
+        def cleanup_update_settings():
+            try:
+                if resize_binding:
+                    app.root.unbind("<Configure>", resize_binding)
+            except tk.TclError:
+                pass
+
+        app.settings_update_cleanup = cleanup_update_settings
+        app.refresh_update_settings_view()
 
         appearance = card(parent, "外观")
         row = app.frame(appearance, "field")

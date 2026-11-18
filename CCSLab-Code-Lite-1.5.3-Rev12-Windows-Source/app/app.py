@@ -44,7 +44,6 @@ from approval_policy import SessionGrants, session_scope, replacement_details_co
 
 FONT = "Microsoft YaHei UI"
 APP_VERSION_INFO = read_version_info()
-APP_VERSION = APP_VERSION_INFO["version"]
 
 
 def read_json(path, default):
@@ -90,6 +89,16 @@ class App:
         self.update_downloading = False
         self.update_snoozed_until = 0
         self.update_status = tk.StringVar(value="尚未检查")
+        self.update_found_version = tk.StringVar(value="")
+        self.update_release_notes = tk.StringVar(value="")
+        self.update_security_notice = tk.StringVar(value="")
+        self.update_download_status = tk.StringVar(value="")
+        self.settings_update_cleanup = None
+        self.update_settings_release_section = None
+        self.update_settings_notes_frame = None
+        self.update_settings_notes_text = None
+        self.update_settings_download_status_label = None
+        self.update_settings_download_actions = None
         self.state = self.data_root
         self.prefs_path = self.data_root / "preferences.json"
         self.prefs = read_json(self.prefs_path, {})
@@ -763,8 +772,16 @@ class App:
             self.workspace_view.pack_forget()
         elif self.page_panel is not None:
             if self.current_page == "settings":
+                if self.settings_update_cleanup:
+                    self.settings_update_cleanup()
+                    self.settings_update_cleanup = None
                 for name in ("update_check_button", "update_settings_download_button",
-                             "update_settings_later_button", "update_settings_open_folder_button"):
+                             "update_settings_later_button", "update_settings_open_folder_button",
+                             "update_settings_status_label", "update_settings_version_label",
+                             "update_settings_release_section",
+                             "update_settings_notes_frame", "update_settings_notes_text",
+                             "update_settings_security_label", "update_settings_download_status_label",
+                             "update_settings_download_actions"):
                     setattr(self, name, None)
             self.page_panel.destroy()
         self.current_page = page
@@ -1059,6 +1076,11 @@ class App:
         self._hide_update_banner()
         self.update_status.set("正在检查更新…")
         self.update_message.set("正在检查更新…")
+        self.update_found_version.set("")
+        self.update_release_notes.set("")
+        self.update_security_notice.set("")
+        self.update_download_status.set("")
+        self.refresh_update_settings_view()
         self._set_update_check_button_state("disabled")
 
         def work():
@@ -1086,29 +1108,81 @@ class App:
             self.update_status.set(message)
             show_banner = manual and self.current_page == "workspace"
             self.update_message.set(message if show_banner else "")
+            self.update_found_version.set("")
+            self.update_release_notes.set("")
+            self.update_security_notice.set("")
+            self.refresh_update_settings_view()
             if show_banner:
                 self.update_banner.pack(fill="x", padx=18, pady=(0, 8), before=self.context_meter.panel)
             self.update_actions()
             return
         self.update_candidate = result
         self.update_package = None
+        self.update_download_status.set("")
         if result is None:
             message = "\u5f53\u524d\u5df2\u662f\u6700\u65b0\u7248\u672c"
             self.update_status.set(message)
-            self.update_message.set(message)
+            self.update_message.set(message if manual and self.current_page == "workspace" else "")
+            self.update_found_version.set("")
+            self.update_release_notes.set("")
+            self.update_security_notice.set("")
+            self.refresh_update_settings_view()
             self.update_actions()
             return
-        message = f"\u53d1\u73b0\u65b0\u7248\u672c {result.version}"
-        detail = (f"\u5f53\u524d\u7248\u672c {APP_VERSION} \u2192 \u6700\u65b0\u7248\u672c {result.version}\n"
-                  f"\u66f4\u65b0\u8bf4\u660e\uff1a{result.notes or '\u6b64\u7248\u672c\u672a\u63d0\u4f9b\u66f4\u65b0\u8bf4\u660e'}\n"
-                  "\u5b89\u88c5\u5305\u672a\u7ecf\u72ec\u7acb\u53d1\u5e03\u8005\u7b7e\u540d\u9a8c\u8bc1\uff0c\u8bf7\u786e\u8ba4\u6765\u6e90\u540e\u624b\u52a8\u5b89\u88c5\u3002")
+        message = "\u53d1\u73b0\u65b0\u7248\u672c"
+        banner_message = (f"\u53d1\u73b0\u65b0\u7248\u672c {result.version}\u3002"
+                          "\u5b89\u88c5\u5305\u672a\u7ecf\u72ec\u7acb\u53d1\u5e03\u8005\u7b7e\u540d\u9a8c\u8bc1\uff0c"
+                          "\u8bf7\u786e\u8ba4\u6765\u6e90\u540e\u624b\u52a8\u5b89\u88c5\u3002")
+        security_notice = ("\u5b89\u88c5\u5305\u672a\u7ecf\u72ec\u7acb\u53d1\u5e03\u8005\u7b7e\u540d\u9a8c\u8bc1\uff0c"
+                           "\u8bf7\u786e\u8ba4\u6765\u6e90\u540e\u624b\u52a8\u5b89\u88c5\u3002")
         if result.sha256 is None:
-            detail += "\nGitHub Release Asset \u672a\u63d0\u4f9b SHA-256 \u6458\u8981\uff0c\u4e0d\u4f1a\u6807\u8bb0\u4e3a\u6458\u8981\u6821\u9a8c\u901a\u8fc7\u3002"
+            security_notice += (" GitHub Release Asset \u672a\u63d0\u4f9b SHA-256 \u6458\u8981\uff0c"
+                                "\u672a\u8fdb\u884c\u72ec\u7acb\u6458\u8981\u6821\u9a8c\u3002")
         self.update_status.set(message)
-        self.update_message.set(detail)
+        self.update_message.set(banner_message)
+        self.update_found_version.set(result.version)
+        self.update_release_notes.set(result.notes or "")
+        self.update_security_notice.set(security_notice)
+        self.refresh_update_settings_view()
         if self.current_page == "workspace":
             self.update_banner.pack(fill="x", padx=18, pady=(0, 8), before=self.context_meter.panel)
         self.update_actions()
+
+    def refresh_update_settings_view(self):
+        section = getattr(self, "update_settings_release_section", None)
+        if section is None:
+            return
+        try:
+            if not section.winfo_exists():
+                return
+            if self.update_candidate is None:
+                section.pack_forget()
+            else:
+                section.pack(fill="x", padx=15, pady=(0, 8),
+                             before=self.update_settings_download_actions)
+            notes = getattr(self, "update_settings_notes_text", None)
+            if notes is not None and notes.winfo_exists():
+                notes.configure(state="normal")
+                notes.delete("1.0", "end")
+                notes.insert("1.0", self.update_release_notes.get() or
+                             "\u6b64\u7248\u672c\u672a\u63d0\u4f9b\u66f4\u65b0\u8bf4\u660e\u3002")
+                notes.configure(state="disabled")
+                notes.yview_moveto(0)
+            download_status = getattr(self, "update_settings_download_status_label", None)
+            if download_status is not None and download_status.winfo_exists():
+                if self.update_download_status.get():
+                    download_status.pack(fill="x", padx=15, pady=(0, 8),
+                                         before=self.update_settings_download_actions)
+                else:
+                    download_status.pack_forget()
+        except tk.TclError:
+            return
+
+    def set_update_download_feedback(self, message):
+        self.update_download_status.set(message)
+        if self.current_page == "workspace":
+            self.update_message.set(message)
+        self.refresh_update_settings_view()
 
     def _hide_update_banner(self):
         banner = getattr(self, "update_banner", None)
@@ -1137,9 +1211,10 @@ class App:
         self.update_downloading = True
         self.update_cancel.clear()
         self._set_update_download_controls("\u53d6\u6d88\u4e0b\u8f7d", self.cancel_update_download, "normal")
+        self.set_update_download_feedback(f"\u6b63\u5728\u4e0b\u8f7d {candidate.version}\u2026")
 
         def progress(received, total):
-            self.events.put(lambda: self.update_message.set(
+            self.events.put(lambda: self.set_update_download_feedback(
                 f"\u6b63\u5728\u4e0b\u8f7d {candidate.version}\uff1a{received // 1024} / {total // 1024} KB"))
 
         def work():
@@ -1156,7 +1231,7 @@ class App:
 
     def cancel_update_download(self):
         self.update_cancel.set()
-        self.update_message.set("\u6b63\u5728\u53d6\u6d88\u4e0b\u8f7d\u2026")
+        self.set_update_download_feedback("\u6b63\u5728\u53d6\u6d88\u4e0b\u8f7d\u2026")
 
     def _update_download_done(self, package, error):
         self.update_downloading = False
@@ -1170,8 +1245,7 @@ class App:
                 message = ("\u4e0b\u8f7d\u5b8c\u6210\uff1bGitHub \u672a\u63d0\u4f9b\u72ec\u7acb SHA-256 \u6458\u8981\uff0c\u672a\u8fdb\u884c\u72ec\u7acb\u6458\u8981\u6821\u9a8c\u3002")
             message += ("\n\u5b89\u88c5\u5305\u672a\u7ecf\u72ec\u7acb\u53d1\u5e03\u8005\u7b7e\u540d\u9a8c\u8bc1\uff0c\u8bf7\u786e\u8ba4\u6765\u6e90\u540e\u624b\u52a8\u5b89\u88c5\u3002"
                        "\u8bf7\u9000\u51fa CCSLab Labcoding \u540e\u624b\u52a8\u8fd0\u884c\u5b89\u88c5\u5305\u3002")
-        self.update_message.set(message)
-        self.update_status.set(message)
+        self.set_update_download_feedback(message)
         self._set_update_download_controls("\u4e0b\u8f7d\u66f4\u65b0", self.download_update, "normal")
         self.update_actions()
 
@@ -1194,8 +1268,7 @@ class App:
         except Exception as error:
             self.update_package = None
             message = f"\u5b89\u88c5\u5305\u518d\u6b21\u9a8c\u8bc1\u5931\u8d25\uff0c\u5df2\u7981\u7528\u6253\u5f00\uff1a{error}"
-            self.update_message.set(message)
-            self.update_status.set(message)
+            self.set_update_download_feedback(message)
             self.update_actions()
 
     def snooze_update(self):
