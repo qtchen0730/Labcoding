@@ -146,6 +146,19 @@ class UpdateFlowTests(unittest.TestCase):
                          "https://api.github.com/repos/qtchen0730/Labcoding/releases?per_page=30")
         self.assertNotIn("Authorization", http.requests[0][2]["headers"])
 
+    def test_beta3_is_detected_from_beta2_but_not_as_an_update_to_beta3_or_stable(self):
+        beta2_service = self.service(version_info("1.6.0-beta.2", "beta"), http=QueueHttp([
+            api_response([release("1.6.0-beta.3", notes="UI fixes"), release("1.6.0-beta.2")])]))
+        candidate = beta2_service.check()
+        self.assertEqual(candidate.version, "1.6.0-beta.3")
+        self.assertEqual(candidate.asset_name, "CCSLab-Labcoding-1.6.0-beta.3-Setup-x64.exe")
+
+        beta3_service = self.service(version_info("1.6.0-beta.3", "beta"))
+        self.assertIsNone(beta3_service._release_candidate(release("1.6.0-beta.2")))
+
+        stable_service = self.service(version_info("1.6.0", "stable"))
+        self.assertIsNone(stable_service._release_candidate(release("1.6.0-beta.3")))
+
     def test_no_newer_release_returns_none(self):
         http = QueueHttp([api_response([release("1.6.0-beta.1")])])
         self.assertIsNone(self.service(http=http).check())
