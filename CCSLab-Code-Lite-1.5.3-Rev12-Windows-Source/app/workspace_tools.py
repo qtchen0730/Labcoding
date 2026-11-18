@@ -244,6 +244,8 @@ class Workspace:
 
     @staticmethod
     def approve(job, **detail):
+        if not callable(getattr(job, "approve", None)):
+            raise ValueError("缺少操作审批回调，已拒绝执行。")
         if job.stop.is_set() or not job.approve(detail):
             raise ValueError("用户未批准此操作。")
         if job.stop.is_set():
@@ -263,9 +265,9 @@ class Workspace:
         new_text = new_text.replace("\r\n", "\n")
         if text.count(old_text) != 1:
             raise ValueError("待替换内容没有唯一匹配。请重新读取文件并提供准确上下文。")
-        if job.strict:
-            self.approve(job, kind="write", title="替换文件内容", path=path,
-                         detail=f"{path}\n\n原文本\n{old_text}\n\n替换文本\n{new_text}")
+        self.approve(job, kind="write", title="替换文件内容", path=path,
+                     old_text=old_text, new_text=new_text,
+                     detail=f"{path}\n\n原文本\n{old_text}\n\n替换文本\n{new_text}")
         if job.stop.is_set():
             raise ValueError("任务已停止。")
         filename = self.path(path)
@@ -349,9 +351,27 @@ class Workspace:
             raise ValueError(f"在 Windows PATH 中未找到可直接运行的 {program} 可执行文件。")
         exact = [os.path.abspath(exe), *args]
         command = subprocess.list2cmdline(exact)
+        binary = Path(exact[0])
+        binary_info = binary.stat()
+        execution_context = {
+            "executable": os.path.realpath(binary),
+            "arguments": list(args),
+            "working_directory": os.path.normcase(os.path.realpath(cwd)),
+            "timeout_seconds": timeout,
+            "file_size": binary_info.st_size,
+            "mtime_ns": binary_info.st_mtime_ns,
+            "file_device": binary_info.st_dev,
+            "file_index": binary_info.st_ino,
+        }
         self.approve(job, kind="command", title="运行 Windows 命令", command=command, path=str(cwd),
+                     project_root=str(self.root), execution_context=execution_context,
                      detail=f"工作目录：{cwd}\n\n{command}\n\n此命令和它启动的脚本拥有当前 Windows "
                             "用户的权限，可能读写项目外文件、启动子进程或访问网络。请核对命令和脚本后批准。")
+        current_binary = binary.stat()
+        if (current_binary.st_dev, current_binary.st_ino, current_binary.st_size,
+                current_binary.st_mtime_ns) != (binary_info.st_dev, binary_info.st_ino,
+                                                 binary_info.st_size, binary_info.st_mtime_ns):
+            raise ValueError("命令可执行文件在审批期间发生变化，已拒绝运行。")
         return _run_command(job, exact, self.path(path), timeout)
 
 

@@ -27,7 +27,7 @@ def tls_files(directory, *, hostname="127.0.0.1"):
                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     run("req", "-config", config, "-x509", "-newkey", "rsa:2048", "-nodes", "-sha256", "-days", "1",
         "-keyout", ca_key, "-out", ca, "-addext", "basicConstraints=critical,CA:TRUE,pathlen:0",
-        "-addext", "subjectKeyIdentifier=hash")
+        "-addext", "keyUsage=critical,keyCertSign,cRLSign", "-addext", "subjectKeyIdentifier=hash")
     run("req", "-config", config, "-newkey", "rsa:2048", "-nodes", "-sha256", "-subj", "/CN=" + hostname,
         "-keyout", key, "-out", csr)
     run("x509", "-req", "-in", csr, "-CA", ca, "-CAkey", ca_key, "-CAcreateserial", "-days", "1",

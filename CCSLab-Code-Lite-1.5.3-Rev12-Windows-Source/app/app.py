@@ -35,7 +35,7 @@ from themes import DARK, LIGHT, THEMES, theme_key, migrate_default_theme
 from ui_icons import ActionIcon, gear_image, apply_window_icon
 from saved_login import SavedLogin
 from quota_view import balance_text, blocked_message
-from approval_policy import SessionGrants, session_scope
+from approval_policy import SessionGrants, session_scope, replacement_details_complete
 
 
 FONT = "Microsoft YaHei UI"
@@ -257,6 +257,7 @@ class App:
             actions, "仅允许本次", lambda: self.finish_approval(True), "Accent.TButton")
         self.approval_once_button.pack(side="right", padx=(0, 7))
         self.approval_restore_focus = None
+        self.approval_restore_after = None
         self.approval_action_locked = False
         self.approval_panel.pack_forget()
         self.approval_key_latched = False
@@ -271,7 +272,8 @@ class App:
             return
         if self.session_grants.has_scope(self.current_approval_scope()):
             if not self.revoke_approval_button.winfo_manager():
-                self.revoke_approval_button.pack(side="right", padx=(8, 0))
+                self.revoke_approval_button.pack(anchor="e", padx=18, pady=(0, 4),
+                                                  before=self.context_meter.panel)
         else:
             self.revoke_approval_button.pack_forget()
 
@@ -332,8 +334,21 @@ class App:
         self.approval_queue.append(ticket)
         self.show_next_approval()
 
+    @staticmethod
+    def approval_has_operation_detail(request):
+        if request.get("kind") == "write" and request.get("title") == "替换文件内容":
+            return replacement_details_complete(request)
+        return bool(
+            (request.get("kind") == "command" and request.get("command") and request.get("path"))
+            or (request.get("kind") in {"read", "write", "delete"} and request.get("path"))
+            or request.get("display")
+        )
+
     def show_next_approval(self):
         if self.active_approval or self.closing:
+            return
+        if self.approval_action_locked:
+            self.schedule("approval_next", 250, self.show_next_approval)
             return
         while self.approval_queue:
             ticket = self.approval_queue.popleft()
@@ -373,11 +388,7 @@ class App:
             details.append(str(request["detail"]))
         elif request.get("display"):
             details.append(str(request["display"]))
-        has_operation_detail = bool(
-            (request.get("kind") == "command" and request.get("command") and request.get("path"))
-            or (request.get("kind") in {"read", "write", "delete"} and request.get("path"))
-            or request.get("display")
-        )
+        has_operation_detail = self.approval_has_operation_detail(request)
         if not has_operation_detail:
             details = ["无法获取完整操作详情"]
         preview = self.redact("\n\n".join(details))
@@ -385,10 +396,16 @@ class App:
         self.approval_detail.delete("1.0", "end")
         self.approval_detail.insert("1.0", preview)
         self.approval_detail.configure(state="disabled")
-        grantable = bool(ticket["scope"] and self.session_grants.allowable(request))
-        unsupported_reason = ("当前命令仅支持单次授权" if request.get("kind") == "command"
-                              else "当前操作仅支持单次授权")
-        self.approval_hint.configure(text="" if grantable else unsupported_reason)
+        grantable = self.session_grants.allowable(request, ticket["scope"])
+        if not ticket["scope"]:
+            unsupported_reason = "当前会话范围不可用，无法授权本次会话"
+        elif request.get("kind") == "command":
+            unsupported_reason = ("只读 where.exe 查询可在本会话授权；其他命令需逐次审批" if grantable
+                                  else "仅 where.exe <name>.exe 查询可会话授权；其他命令需逐次审批")
+        else:
+            unsupported_reason = "当前操作仅支持单次授权"
+        self.approval_hint.configure(text=unsupported_reason if request.get("kind") == "command" or not ticket["scope"]
+                                      else ("" if grantable else unsupported_reason))
         if not has_operation_detail:
             self.approval_hint.configure(text="无法获取完整操作详情，已禁用批准")
         control_state = "disabled" if self.approval_action_locked or not has_operation_detail else "normal"
@@ -398,7 +415,8 @@ class App:
             state="normal" if grantable and not self.approval_action_locked and has_operation_detail else "disabled",
             command=lambda ticket_id=ticket["id"]:
                                                 self.finish_approval(True, session=True, ticket_id=ticket_id))
-        self.approval_reject_button.configure(state=control_state, command=lambda ticket_id=ticket["id"]:
+        self.approval_reject_button.configure(state="disabled" if self.approval_action_locked else "normal",
+                                               command=lambda ticket_id=ticket["id"]:
                                                self.finish_approval(False, ticket_id=ticket_id))
         self.task_state.set("等待审批")
         self.approval_panel.pack(fill="x", padx=12, pady=(4, 0), before=self.composer_separator)
@@ -421,7 +439,8 @@ class App:
     def finish_approval(self, allow=False, *, session=False, ticket_id=None):
         ticket = self.active_approval
         if (not ticket or self.approval_action_locked
-                or (ticket_id is not None and ticket["id"] != ticket_id)):
+                or (ticket_id is not None and ticket["id"] != ticket_id)
+                or (allow and not self.approval_has_operation_detail(ticket["request"]))):
             return
         with ticket["guard"]:
             if ticket["completed"].is_set():
@@ -448,10 +467,12 @@ class App:
     def unlock_approval_controls(self):
         self.approval_action_locked = False
         if not self.active_approval:
+            self.show_next_approval()
             return
-        grantable = bool(self.active_approval["scope"] and self.session_grants.allowable(
-            self.active_approval["request"]))
-        self.approval_once_button.configure(state="normal")
+        grantable = self.session_grants.allowable(
+            self.active_approval["request"], self.active_approval["scope"])
+        self.approval_once_button.configure(state="normal" if self.approval_has_operation_detail(
+            self.active_approval["request"]) else "disabled")
         self.approval_reject_button.configure(state="normal")
         self.approval_session_button.configure(state="normal" if grantable else "disabled")
 
@@ -488,6 +509,7 @@ class App:
         target = self.approval_restore_focus
         self.approval_restore_focus = None
         def restore():
+            self.approval_restore_after = None
             try:
                 if target and target.winfo_exists() and str(target.cget("state")) != "disabled":
                     target.focus_set()
@@ -496,7 +518,9 @@ class App:
             except (tk.TclError, AttributeError):
                 pass
         if not self.closing:
-            self.root.after_idle(restore)
+            if self.approval_restore_after:
+                self.root.after_cancel(self.approval_restore_after)
+            self.approval_restore_after = self.root.after_idle(restore)
 
     def list_widget(self, parent, height, background="field"):
         result = tk.Listbox(parent, height=height, activestyle="none", borderwidth=0,
@@ -600,7 +624,7 @@ class App:
         self.results_button.pack(side="right", padx=(8, 0))
         self.results_button.configure(text="隐藏结果" if self.results_visible else "显示结果")
         self.revoke_approval_button = self.button(
-            conversation_head, "撤销会话授权", self.revoke_session_approvals, "Nav.TButton")
+            center, "撤销会话授权", self.revoke_session_approvals, "Nav.TButton")
         self.revoke_approval_button.pack_forget()
         self.label(conversation_head, variable=self.task_elapsed, muted=True).pack(side="right")
         self.label(conversation_head, variable=self.task_state, color="heading").pack(side="right", padx=(0, 7))
@@ -612,7 +636,7 @@ class App:
         guidance.bind("<Configure>", lambda event: event.widget.configure(wraplength=max(event.width, 90)))
         self.context_meter = ContextMeter(self, center)
         ttk.Separator(center).pack(fill="x", padx=16)
-        conversation, self.chat = self.text_panel(center, height=18, background="panel", text_size=11)
+        conversation, self.chat = self.text_panel(center, height=1, background="panel", text_size=11)
         conversation.pack(fill="both", expand=True, padx=10)
         self.show_welcome()
         self.build_approval_panel(center)
@@ -1679,6 +1703,7 @@ class App:
         self.cancel_all_approvals()
         self.session_grants.clear()
         self.active_approval_scope = None
+        self.update_session_grant_ui()
         self.direct_ready = False
         self.direct_identity = ""
         self.direct_status.set("待连接" if self.direct_unlocked else "待权限验证")
@@ -2539,6 +2564,9 @@ class App:
         for timer in self.timers.values():
             self.root.after_cancel(timer)
         self.timers.clear()
+        if self.approval_restore_after:
+            self.root.after_cancel(self.approval_restore_after)
+            self.approval_restore_after = None
         self.stop_requested.set()
         self.save_history()
         try:
