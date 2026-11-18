@@ -141,6 +141,9 @@ class App:
         self.session = None
         self.history_path = None
         self.history = {}
+        self.task_history_index = None
+        self.task_history_scope = None
+        self.task_history_draft = ""
         self.session_titles = {}
         self.drafts = {}
         self.events = Queue()
@@ -582,12 +585,19 @@ class App:
         self.connection_button = self.button(bar, "登录 / 注册", self.account_action, "Nav.TButton")
         self.connection_button.pack(side="right", padx=(7, 15))
         self.role_button = self.button(bar, "切换角色", self.change_role, "Nav.TButton")
+        theme_gap = round((72 / 2.54) * float(self.root.tk.call("tk", "scaling")))
         identity = self.frame(bar)
         identity.pack(side="right", padx=(6, 4))
-        self.theme_icon = ActionIcon(self, identity, "sun", self.cycle_theme)
+        self.theme_control = self.frame(identity)
+        self.theme_control.pack(side="left")
+        self.theme_label = self.button(self.theme_control, "更换主题色", self.cycle_theme,
+                                       "HeaderTheme.TButton")
+        self.theme_label.pack(side="left", padx=(0, 4))
+        self.theme_label.configure(cursor="hand2")
+        self.theme_icon = ActionIcon(self, self.theme_control, "sun", self.cycle_theme)
         self.theme_icon.pack(side="left")
         self.status_label = self.label(identity, variable=self.status, muted=True)
-        self.status_label.pack(side="left", padx=(4, 0))
+        self.status_label.pack(side="left", padx=(theme_gap, 0))
         ttk.Separator(self.root).pack(fill="x")
 
         self.page_host = self.frame(self.root, "bg")
@@ -689,6 +699,8 @@ class App:
         self.quota_banner.configure(wraplength=400)
         composer.pack(fill="x", padx=14)
         self.input.bind("<Control-Return>", self.submit_shortcut)
+        self.input.bind("<Up>", self.task_history_up)
+        self.input.bind("<Down>", self.task_history_down)
         actions = self.frame(center)
         actions.pack(fill="x", padx=14, pady=(7, 12))
         self.send_button = self.button(actions, "发送任务", self.submit, "Accent.TButton")
@@ -820,6 +832,10 @@ class App:
         self.style.configure("Selected.Nav.TButton", background=c["soft"], foreground=c["heading"],
                              font=(FONT, 10, "bold"))
         self.style.map("Selected.Nav.TButton", background=[("active", c["soft"])],
+                       foreground=[("active", c["heading"])])
+        self.style.configure("HeaderTheme.TButton", anchor="w", relief="flat", borderwidth=0,
+                             background=c["panel"], foreground=c["muted"], padding=(0, 3))
+        self.style.map("HeaderTheme.TButton", background=[("active", c["panel"])],
                        foreground=[("active", c["heading"])])
         self.style.configure("TNotebook", borderwidth=0)
         self.style.configure("TNotebook.Tab", padding=(8, 6))
@@ -1917,6 +1933,7 @@ class App:
         self.clear_workspace()
 
     def clear_workspace(self):
+        self.reset_task_history_browse()
         self.cancel_all_approvals()
         self.session_grants.clear()
         self.active_approval_scope = None
@@ -2115,6 +2132,7 @@ class App:
             self.show_error("打开项目", "请选择项目子文件夹。")
             return
         self.cancel_all_approvals()
+        self.reset_task_history_browse()
         self.session_grants.clear()
         self.active_approval_scope = None
         self.update_session_grant_ui()
@@ -2341,6 +2359,7 @@ class App:
 
     def open_session(self, session_id):
         self.cancel_all_approvals()
+        self.reset_task_history_browse()
         self.session_grants.clear()
         self.active_approval_scope = None
         self.update_session_grant_ui()
@@ -2372,6 +2391,90 @@ class App:
 
     def submit_shortcut(self, _event):
         self.submit()
+        return "break"
+
+    def reset_task_history_browse(self):
+        self.task_history_index = None
+        self.task_history_scope = None
+        self.task_history_draft = ""
+
+    def task_history_identity(self):
+        account = self.account or {}
+        client = self.account_client
+        return (
+            self.connection_mode,
+            getattr(client, "base", ""),
+            account.get("id", self.direct_identity if self.connection_mode == "direct" else None),
+            account.get("username"),
+            os.path.normcase(self.project) if self.project else "",
+            str(self.history_path) if self.history_path else "",
+            self.session,
+        )
+
+    def task_history_entries(self):
+        if not self.session:
+            return []
+        record = self.history.get(self.session)
+        if not isinstance(record, dict):
+            return []
+        return [event["text"] for event in record.get("events", [])
+                if isinstance(event, dict) and event.get("type") == "user"
+                and isinstance(event.get("text"), str)]
+
+    def task_history_cursor_at_boundary(self, direction):
+        if self.input.tag_ranges("sel"):
+            return False
+        if (self.task_history_index is not None
+                and self.task_history_scope == self.task_history_identity()):
+            return True
+        if direction == "up":
+            if self.input.compare("insert", "==", "1.0"):
+                return True
+            distance = self.input.count("1.0", "insert", "displaylines")
+        else:
+            if self.input.compare("insert", "==", "end-1c"):
+                return True
+            distance = self.input.count("insert", "end-1c", "displaylines")
+        return bool(distance is not None and distance[0] == 0)
+
+    def show_task_history_entry(self, text):
+        self.input.delete("1.0", "end")
+        self.input.insert("1.0", text)
+        self.input.mark_set("insert", "end-1c")
+        self.input.see("insert")
+
+    def task_history_up(self, _event=None):
+        if str(self.input.cget("state")) != "normal" or not self.task_history_cursor_at_boundary("up"):
+            return None
+        entries = self.task_history_entries()
+        if not entries:
+            return None
+        scope = self.task_history_identity()
+        if self.task_history_index is None or self.task_history_scope != scope:
+            self.task_history_scope = scope
+            self.task_history_index = len(entries)
+            self.task_history_draft = self.input.get("1.0", "end-1c")
+        else:
+            self.task_history_index = min(self.task_history_index, len(entries))
+        self.task_history_index = max(0, self.task_history_index - 1)
+        self.show_task_history_entry(entries[self.task_history_index])
+        return "break"
+
+    def task_history_down(self, _event=None):
+        if (self.task_history_index is None or not self.task_history_cursor_at_boundary("down")
+                or self.task_history_scope != self.task_history_identity()):
+            return None
+        entries = self.task_history_entries()
+        if not entries:
+            self.reset_task_history_browse()
+            return None
+        self.task_history_index = min(self.task_history_index + 1, len(entries))
+        if self.task_history_index == len(entries):
+            draft = self.task_history_draft
+            self.reset_task_history_browse()
+            self.show_task_history_entry(draft)
+        else:
+            self.show_task_history_entry(entries[self.task_history_index])
         return "break"
 
     def save_draft(self):
@@ -2461,6 +2564,7 @@ class App:
             raise AccountError(blocked_message(user), 402)
 
     def run_task(self, prompt):
+        self.reset_task_history_browse()
         session = self.session
         self.active_approval_scope = self.current_approval_scope()
         engine = self.engine

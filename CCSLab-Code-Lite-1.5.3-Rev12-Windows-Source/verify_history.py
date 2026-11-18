@@ -323,6 +323,58 @@ class HistoryTests(unittest.TestCase):
         self.assertFalse(original_path.with_suffix('.titles.json').exists())
         self.assertFalse(self.gui.history_path.with_suffix('.titles.json').exists())
 
+    def test_task_history_browses_only_current_session_and_restores_draft(self):
+        self.gui.session = "ses_keep"
+        self.gui.history["ses_keep"] = {"title": "Keep", "events": [
+            {"type": "user", "text": "first task"},
+            {"type": "delta", "text": "assistant reply"},
+            {"type": "user", "text": "second\n任务 🚀"},
+        ]}
+        self.gui.history["ses_remove"] = {"title": "Other", "events": [
+            {"type": "user", "text": "other session secret"},
+        ]}
+        self.gui.input.delete("1.0", "end")
+        self.gui.input.insert("1.0", "unsent\ndraft")
+        self.gui.input.configure(state="normal")
+        self.gui.input.mark_set("insert", "1.0")
+        self.gui.input.focus_set()
+        self.assertTrue(self.gui.input.bind("<Up>"))
+        self.assertEqual(self.gui.task_history_up(), "break")
+        self.assertEqual(self.gui.input.get("1.0", "end-1c"), "second\n任务 🚀")
+        self.assertFalse(self.gui.running)
+        self.assertEqual(self.gui.task_history_up(), "break")
+        self.assertEqual(self.gui.input.get("1.0", "end-1c"), "first task")
+        self.assertEqual(self.gui.task_history_up(), "break")
+        self.assertEqual(self.gui.input.get("1.0", "end-1c"), "first task")
+        self.assertEqual(self.gui.task_history_down(), "break")
+        self.assertEqual(self.gui.input.get("1.0", "end-1c"), "second\n任务 🚀")
+        self.assertEqual(self.gui.task_history_down(), "break")
+        self.assertEqual(self.gui.input.get("1.0", "end-1c"), "unsent\ndraft")
+        self.assertIsNone(self.gui.task_history_index)
+        self.assertNotIn("other session secret", self.gui.input.get("1.0", "end-1c"))
+
+    def test_task_history_preserves_normal_cursor_navigation_and_resets_on_session_change(self):
+        self.gui.session = "ses_keep"
+        self.gui.history["ses_keep"] = {"title": "Keep", "events": [
+            {"type": "user", "text": "one\ntwo"},
+        ]}
+        self.gui.input.delete("1.0", "end")
+        self.gui.input.insert("1.0", "line one\nline two")
+        self.gui.input.configure(state="normal")
+        self.gui.input.mark_set("insert", "end-1c")
+        self.assertIsNone(self.gui.task_history_up())
+        self.gui.input.tag_add("sel", "1.0", "1.2")
+        self.gui.input.mark_set("insert", "1.0")
+        self.assertIsNone(self.gui.task_history_up())
+        self.gui.input.tag_remove("sel", "1.0", "end")
+        self.gui.input.delete("1.0", "end")
+        self.gui.input.insert("1.0", "")
+        self.gui.input.mark_set("insert", "1.0")
+        self.assertEqual(self.gui.task_history_up(), "break")
+        self.gui.open_session("ses_remove")
+        self.assertIsNone(self.gui.task_history_index)
+        self.assertIsNone(self.gui.task_history_scope)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

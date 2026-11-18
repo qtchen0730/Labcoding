@@ -22,6 +22,45 @@ def contrast(a, b):
 
 
 class ThemeTests(unittest.TestCase):
+    def test_theme_header_label_and_icon_share_action_and_keep_dpi_gap(self):
+        with tempfile.TemporaryDirectory(dir=TEST_ROOT, prefix="theme-header-") as folder:
+            root = tk.Tk()
+            gui = App(root, Path(folder), smoke=True)
+            try:
+                root.geometry("950x620")
+                gui.account = {"id": 1, "username": "A" * 150, "role": "admin", "status": "active"}
+                gui.account_online = True
+                gui.account_state_changed()
+                gui.update_actions()
+                root.update()
+                initial = gui.theme.get()
+                gui.theme_label.event_generate("<ButtonPress-1>", x=5, y=5, when="now")
+                gui.theme_label.event_generate("<ButtonRelease-1>", x=5, y=5, when="now")
+                root.update()
+                self.assertNotEqual(gui.theme.get(), initial)
+                after_label = gui.theme.get()
+                gui.theme_icon.event_generate("<Button-1>", x=14, y=14, when="now")
+                root.update()
+                self.assertNotEqual(gui.theme.get(), after_label)
+                self.assertEqual(gui.theme_icon.master, gui.theme_control)
+                expected_gap = round((72 / 2.54) * float(root.tk.call("tk", "scaling")))
+                actual_gap = gui.status_label.winfo_rootx() - (
+                    gui.theme_icon.winfo_rootx() + gui.theme_icon.winfo_width())
+                self.assertGreaterEqual(actual_gap, expected_gap - 2)
+                self.assertLessEqual(actual_gap, expected_gap + 3)
+                for width in (950, 1280):
+                    root.geometry(f"{width}x620")
+                    root.update()
+                    self.assertLessEqual(gui.theme_label.winfo_rootx() + gui.theme_label.winfo_width(),
+                                         gui.theme_icon.winfo_rootx())
+                    self.assertLessEqual(gui.theme_icon.winfo_rootx() + gui.theme_icon.winfo_width(),
+                                         gui.status_label.winfo_rootx())
+                    self.assertLessEqual(gui.status_label.winfo_rootx() + gui.status_label.winfo_width(),
+                                         gui.role_button.winfo_rootx())
+                self.assertIn("…", gui.status.get())
+            finally:
+                gui.close()
+
     def test_select_all_themes_and_restart(self):
         with tempfile.TemporaryDirectory(dir=TEST_ROOT, prefix="themes-") as folder:
             data = Path(folder)

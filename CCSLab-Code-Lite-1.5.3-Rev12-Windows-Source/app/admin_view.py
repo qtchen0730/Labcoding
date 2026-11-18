@@ -436,7 +436,7 @@ class AdminPage:
         ready = self.total.get() in CONTEXT_OPTIONS and self.slots.get() in SLOT_OPTIONS
         self.preview_button.configure(state="normal" if ready else "disabled")
 
-    def refresh_model(self, message=None):
+    def refresh_model(self, message=None, expected=None):
         def draw(reply):
             model = reply.get("model", reply)
             self.has_model = True
@@ -452,7 +452,20 @@ class AdminPage:
             self.total.set(total if total in CONTEXT_OPTIONS else "")
             self.slots.set(slots if slots in SLOT_OPTIONS else "")
             self.control_detail = model.get("detail") or "配置变更由服务器校验，并可能中断当前推理。"
-            self.model_note.set(f"{message}  {self.control_detail}" if message else self.control_detail)
+            status_message = message or ""
+            if expected is not None:
+                if (model.get("total_context"), model.get("slots")) == (
+                        expected["total_context"], expected["slots"]):
+                    status_message = "配置已保存；Gateway 重新读取的运行参数与目标一致。"
+                else:
+                    status_message = (
+                        "服务端报告配置已应用，但当前运行状态未匹配目标；"
+                        f"目标 {count(expected['total_context'])} Token / {count(expected['slots'])} 槽，"
+                        f"运行状态 {count(model.get('total_context'))} Token / "
+                        f"{count(model.get('slots'))} 槽，尚未确认生效。"
+                    )
+            self.model_note.set(f"{status_message}  {self.control_detail}" if status_message
+                                else self.control_detail)
             self.app.update_model(model)
         self.call("刷新模型状态", "GET", "/api/model", None, draw, error_text=self.model_note)
 
@@ -486,7 +499,7 @@ class AdminPage:
             self.review_ticket = ticket
             self.review_deadline = monotonic() + seconds
             self.review_card.pack(fill="x", pady=(9, 0))
-            self.model_note.set(f"请核对配置，预览可在 {seconds} 秒内确认。")
+            self.model_note.set(f"预览不会保存配置；请在 {seconds} 秒内点击“确认应用”完成保存。")
         self.call("预览模型配置", "POST", "/api/admin/model/preview", requested, draw, error_text=self.model_note)
 
     def clear_review(self):
@@ -502,16 +515,20 @@ class AdminPage:
         if self.app.busy or not self.owns_session() or not self.review_ticket:
             return
         ticket, deadline = self.review_ticket, self.review_deadline
+        expected = {"total_context": int(self.total.get()), "slots": int(self.slots.get())}
         self.clear_review()
         if deadline <= monotonic():
             self.model_note.set("预览已过期，请重新获取。")
             return
 
         def applied(reply):
+            if reply.get("status") != "applied":
+                self.model_note.set("服务端未确认配置已应用；请刷新模型状态并检查服务端响应。")
+                return
             updated = reply.get("model")
             if isinstance(updated, dict):
                 self.app.update_model(updated)
-            self.refresh_model("配置已应用。")
+            self.refresh_model("正在核对模型运行状态。", expected=expected)
         self.model_note.set("正在应用，服务会验证实际配置。")
         self.call("应用模型配置", "POST", "/api/admin/model/apply", {"confirmation": ticket},
                   applied, timeout=280, error_text=self.model_note)

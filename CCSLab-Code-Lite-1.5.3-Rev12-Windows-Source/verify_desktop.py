@@ -34,8 +34,11 @@ class DialogControlFixture(ModelControl):
     def __init__(self, settings):
         super().__init__(settings.database, settings.llama_url, settings.upstream_token)
         self.applied = []
+        self.previewed = []
+        self.applied_profile = None
 
     def preview(self, actor, total_context, slots):
+        self.previewed.append((actor, total_context, slots))
         return {"confirmation": "fixture-confirmation",
                 "current": self.status(), "requested": {"total_context": total_context, "slots": slots},
                 "estimated_slot_context": total_context // slots, "gpu_risk": "隔离测试数据",
@@ -43,8 +46,15 @@ class DialogControlFixture(ModelControl):
 
     def apply(self, actor, confirmation):
         assert confirmation == "fixture-confirmation"
-        self.applied.append(actor)
+        self.applied.append((actor, self.previewed[-1][1:]))
+        self.applied_profile = self.previewed[-1][1:]
         return {"status": "applied", "model": self.status()}
+
+    def status(self):
+        model = super().status()
+        if self.applied_profile:
+            model.update(total_context=self.applied_profile[0], slots=self.applied_profile[1])
+        return model
 
 
 def start_gateway(directory, model):
@@ -80,10 +90,18 @@ def expect_status(status, request):
         raise AssertionError(f"Expected HTTP {status}")
 
 
-def wait(root, condition, timeout=30):
+def wait(root, condition, timeout=30, *, approval_gui=None, approvals=None):
     end = time.monotonic() + timeout
     while time.monotonic() < end:
         root.update()
+        ticket = approval_gui.active_approval if approval_gui is not None else None
+        if ticket is not None and ticket["id"] not in {item["id"] for item in approvals}:
+            request = ticket["request"]
+            approvals.append({"id": ticket["id"], **request})
+            if request.get("kind") in {"write", "command"}:
+                approval_gui.approval_once_button.invoke()
+            else:
+                approval_gui.approval_reject_button.invoke()
         if condition():
             return
         time.sleep(0.02)
@@ -107,6 +125,14 @@ def button(parent, text):
 
 def switch_role(root, gui, target, old_token):
     gui.role_button.invoke()
+    if target == "user":
+        wait(root, lambda: not gui.busy and gui.account["role"] == target)
+        client = gui.account_client
+        assert gui.token == client.token and client.token != old_token
+        old_client = AccountClient(client.base, tls=client.tls)
+        old_client.token = old_token
+        expect_status(401, old_client.me)
+        return
     window = next(widgets(root, tk.Toplevel))
     field = next(widgets(window, ttk.Entry))
     assert field["show"]
@@ -179,8 +205,14 @@ def dialogue_confirmation(root, gui, control):
     root.update()
     wait(root, lambda: page.has_model and not gui.busy)
     page.total.set("65536")
+    page.slots.set("2")
+    page.total.set("65535")
+    assert page.preview_button.instate(["disabled"])
+    assert not control.previewed
+    page.total.set("65536")
     page.preview_button.invoke()
     wait(root, lambda: page.review_ticket and not gui.busy)
+    assert control.previewed[-1][1:] == (65536, 2)
     cancel = next(b for b in widgets(page.review_card, ttk.Button) if b["text"] == "取消预览")
     apply = next(b for b in widgets(page.review_card, ttk.Button) if b["text"] == "确认应用")
     cancel.invoke()
@@ -189,6 +221,9 @@ def dialogue_confirmation(root, gui, control):
     wait(root, lambda: page.review_ticket and not gui.busy)
     apply.invoke()
     wait(root, lambda: len(control.applied) == 1 and not gui.busy)
+    assert control.applied[-1][1] == (65536, 2)
+    assert "配置已保存；Gateway 重新读取的运行参数与目标一致" in page.model_note.get()
+    assert page.total.get() == "65536" and page.slots.get() == "2"
     gui.workspace_button.invoke()
     print("PASS Tk administrator console and explicit confirm/cancel before model apply")
 
@@ -288,12 +323,6 @@ def main():
         assert gui.open_button.instate(["disabled"]) and gui.input["state"] == "disabled"
         assert not gui.admin_button.winfo_manager()
 
-        def decide(request, result, done):
-            approvals.append(request)
-            result["allow"] = request["kind"] == "command"
-            done.set()
-
-        gui.approval_window = decide
         try:
             assert any(u["id"] == pending["id"] for u in admin.request("GET", "/api/admin/users")["users"])
             admin.request("POST", path, {"status": "active"})
@@ -310,12 +339,21 @@ def main():
             assert not errors, errors
             gui.input.insert("1.0", "修复加法并运行测试")
             gui.send_button.invoke()
-            wait(root, lambda: gui.session and not gui.running and not gui.busy or errors)
+            try:
+                wait(root, lambda: gui.session and not gui.running and not gui.busy or errors,
+                     approval_gui=gui, approvals=approvals)
+            except AssertionError as error:
+                calls = [(item.get("step"), item.get("tools")) for item in model.calls]
+                raise AssertionError(
+                    f"desktop task stalled: busy={gui.busy!r}, running={gui.running}, "
+                    f"task_state={gui.task_state.get()!r}, errors={errors!r}, "
+                    f"model_calls={calls!r}, approvals={[item.get('kind') for item in approvals]!r}"
+                ) from error
             assert not errors, errors
             response = gui.chat.get("1.0", "end")
             assert all(part in response for part in ("测试通过", "已运行", "unittest", "assert add")), response
             assert not any(delimiter in response for delimiter in ("## 测试通过", "**已运行**", "```", "`unittest`")), response
-            assert [item["kind"] for item in approvals] == ["command", "command", "delete"], approvals
+            assert [item["kind"] for item in approvals] == ["write", "command", "write", "command", "delete"], approvals
             tools = gui.activity.transcript()
             assert "退出码：1" in tools and "退出码：0" in tools, tools
             files = [item.path for item in gui.change_rows]
@@ -353,7 +391,7 @@ def main():
             wait(root, lambda: not gui.running and not gui.busy or errors)
             response = gui.chat.get("1.0", "end")
             assert "实施方案" in response and "## 实施方案" not in response, response
-            assert len(approvals) == 3
+            assert len(approvals) == 5
             assert "+ b" in (project / "example.py").read_text(encoding="utf-8")
             assert gui.task_state.get() == "方案已生成", gui.task_state.get()
             admin.request("POST", path, {"status": "disabled"})
@@ -368,7 +406,8 @@ def main():
             print("PASS new theme default, rendered heading, inline formatting and code; real engine read-only tool set")
             print("PASS installed app source flow: Windows Tk project open, submit, stream, tool/test output, real Git diff")
         finally:
-            gui.close()
+            with patch("app.messagebox.askyesno", return_value=True):
+                gui.close()
 
         root = tk.Tk()
         gui = App(root, temp / "state", smoke=True)
@@ -378,6 +417,10 @@ def main():
             ordinary = admin.login("fixture.admin", ADMIN_PASSWORD)
             assert ordinary["role"] == "user" and ordinary["assigned_role"] == "admin"
             expect_status(403, lambda: admin.request("GET", "/api/admin/users"))
+            expect_status(403, lambda: user.request(
+                "POST", "/api/admin/model/preview", {"total_context": 65536, "slots": 2}))
+            expect_status(403, lambda: user.request(
+                "POST", "/api/admin/model/apply", {"confirmation": "not-a-ticket"}))
             gui.signed_in(admin, ordinary)
             assert gui.can_switch_role and not gui.is_admin and not gui.admin_button.winfo_manager()
             switch_role(root, gui, "admin", admin.token)
@@ -412,7 +455,8 @@ def main():
             assert admin.me()["role"] == "admin"
             print("PASS ordinary user changed own password and all old sessions were revoked without affecting the administrator")
         finally:
-            gui.close()
+            with patch("app.messagebox.askyesno", return_value=True):
+                gui.close()
             gateway.should_exit = True
             runner.join(10)
             model.shutdown()

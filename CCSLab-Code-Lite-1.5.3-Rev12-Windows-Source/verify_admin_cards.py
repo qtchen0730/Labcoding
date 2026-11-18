@@ -12,7 +12,8 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "app"))
 
-from admin_view import account_time
+from account_client import AccountError
+from admin_view import AdminPage, account_time, build_admin_page
 from app import App, DARK, LIGHT
 from themes import THEMES
 
@@ -166,6 +167,88 @@ def verify(gui, root):
     assert picker.get().endswith("（9）")
 
 
+class ModelConfigFixture:
+    def __init__(self):
+        self.model = {"status": "running", "model_id": "fixture", "model_name": "Fixture",
+                      "total_context": 131072, "slots": 5, "effective_context_limit": 26368,
+                      "output_token_limit": 4096, "gpu": None, "control_available": True, "detail": ""}
+        self.requests = []
+        self.requested = None
+        self.fail_apply = False
+        self.no_effect = False
+
+    def request(self, method, path, body=None, **_options):
+        self.requests.append((method, path, body))
+        if (method, path) == ("GET", "/api/model"):
+            return {"model": dict(self.model)}
+        if (method, path) == ("POST", "/api/admin/model/preview"):
+            self.requested = dict(body)
+            return {"confirmation": "fixture-confirmation", "expires_in": 90,
+                    "current": dict(self.model), "requested": dict(body),
+                    "estimated_slot_context": body["total_context"] // body["slots"],
+                    "gpu_risk": "隔离测试", "restart_required": True, "user_impact": "隔离测试"}
+        if (method, path) == ("POST", "/api/admin/model/apply"):
+            if self.fail_apply:
+                raise AccountError("fixture apply failure", 503)
+            if not self.no_effect:
+                self.model.update(self.requested)
+                self.model["effective_context_limit"] = self.requested["total_context"] // self.requested["slots"]
+            return {"status": "applied", "model": dict(self.model)}
+        raise AssertionError((method, path, body))
+
+    def clear_open_webui_access(self):
+        pass
+
+
+def verify_model_configuration(root, gui):
+    fixture = ModelConfigFixture()
+    gui.account_client = fixture
+    gui.account = {"id": 2, "username": "Current.Admin", "role": "admin", "status": "active"}
+    gui.account_online = True
+    parent = gui.frame(root)
+    page = AdminPage(gui, parent)
+    page.refresh_model()
+    wait(root, lambda: page.has_model and not gui.busy)
+    assert page.total.get() == "131072" and page.slots.get() == "5"
+
+    page.total.set("65535")
+    assert page.preview_button.instate(["disabled"])
+    page.total.set("65536")
+    page.slots.set("2")
+    page.preview_button.invoke()
+    wait(root, lambda: bool(page.review_ticket) and not gui.busy)
+    assert fixture.requests[-1] == ("POST", "/api/admin/model/preview",
+                                    {"total_context": 65536, "slots": 2})
+    page.apply_preview()
+    wait(root, lambda: not gui.busy and page.total.get() == "65536")
+    assert fixture.requests[-2] == ("POST", "/api/admin/model/apply",
+                                    {"confirmation": "fixture-confirmation"})
+    assert "运行参数与目标一致" in page.model_note.get()
+
+    fixture.fail_apply = True
+    page.total.set("131072")
+    page.slots.set("5")
+    page.preview()
+    wait(root, lambda: bool(page.review_ticket) and not gui.busy)
+    page.apply_preview()
+    wait(root, lambda: not gui.busy and "fixture apply failure" in page.model_note.get())
+
+    fixture.fail_apply = False
+    fixture.no_effect = True
+    page.preview()
+    wait(root, lambda: bool(page.review_ticket) and not gui.busy)
+    page.apply_preview()
+    wait(root, lambda: not gui.busy and "尚未确认生效" in page.model_note.get())
+
+    gui.account["role"] = "user"
+    before = len(fixture.requests)
+    page.preview()
+    root.update()
+    assert len(fixture.requests) == before
+    assert build_admin_page(gui, parent) is None
+    parent.destroy()
+
+
 if __name__ == "__main__":
     with TemporaryDirectory(dir=TEST_ROOT, prefix="approval-cards-",
                             ignore_cleanup_errors=True) as data:
@@ -175,4 +258,12 @@ if __name__ == "__main__":
             verify(app, window)
         finally:
             app.close()
+    with TemporaryDirectory(dir=TEST_ROOT, prefix="admin-model-") as data:
+        window = tk.Tk()
+        app = App(window, Path(data), smoke=True)
+        try:
+            verify_model_configuration(window, app)
+        finally:
+            app.close()
     print("PASS native approval cards: data, sizes, themes, scrolling, filters, counts, protected status actions and reset targeting")
+    print("PASS admin model settings: typed payload, validation, apply/error/mismatch status, admin access gate")
