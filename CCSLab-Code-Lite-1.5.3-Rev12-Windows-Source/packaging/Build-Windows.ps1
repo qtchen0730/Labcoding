@@ -10,9 +10,18 @@ $LocalWork = Join-Path (Split-Path (Split-Path $PSScriptRoot)) '.work'
 $BuildRoot = [System.IO.Path]::GetFullPath($BuildRoot)
 $Output = [System.IO.Path]::GetFullPath($Output)
 $FixedTestOutput = [System.IO.Path]::GetFullPath((Join-Path $LocalWork 'releases\CCSLab-Labcoding-Test-Setup-x64.exe'))
+$VersionInfo = Get-Content -LiteralPath (Join-Path (Split-Path $PSScriptRoot) 'app\version.json') -Raw -Encoding utf8 | ConvertFrom-Json
+if ($VersionInfo.version -notmatch '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$') {
+    throw "Invalid semantic version for installer output: $($VersionInfo.version)"
+}
+$VersionedTestOutput = [System.IO.Path]::GetFullPath((Join-Path $LocalWork `
+    ('releases\CCSLab-Labcoding-' + $VersionInfo.version + '-Setup-x64.exe')))
 if (Test-Path -LiteralPath $BuildRoot) { throw "Build directory already exists; refusing to overwrite: $BuildRoot" }
+if ($Output -ne $FixedTestOutput -and $Output -ne $VersionedTestOutput) {
+    throw "Output must be the fixed test installer or the versioned installer for $($VersionInfo.version): $Output"
+}
 if ((Test-Path -LiteralPath $Output) -and $Output -ne $FixedTestOutput) {
-    throw "Only the fixed test installer may be overwritten: $Output"
+    throw "Refusing to overwrite a versioned installer: $Output"
 }
 $BuildRoot = (New-Item -ItemType Directory -Path $BuildRoot).FullName
 $env:PYTHONPYCACHEPREFIX = (New-Item -ItemType Directory -Force -Path (Join-Path $BuildRoot 'pycache')).FullName
@@ -20,7 +29,6 @@ $env:PYINSTALLER_CONFIG_DIR = (New-Item -ItemType Directory -Force -Path (Join-P
 $env:TEMP = $env:TMP = (New-Item -ItemType Directory -Force -Path (Join-Path $BuildRoot 'tmp')).FullName
 $Product = 'CCSLab Labcoding'
 $Source = Join-Path (Split-Path $PSScriptRoot) 'app'
-$VersionInfo = Get-Content -LiteralPath (Join-Path $Source 'version.json') -Raw -Encoding utf8 | ConvertFrom-Json
 $Compiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
 
 function Confirm-NativeSuccess([string]$Operation) {
