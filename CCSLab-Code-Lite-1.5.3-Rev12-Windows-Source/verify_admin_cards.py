@@ -207,9 +207,24 @@ def verify_model_configuration(root, gui):
     gui.account_online = True
     parent = gui.frame(root)
     page = AdminPage(gui, parent)
+    fixture.model["control_available"] = False
+    fixture.model["detail"] = "服务器未启用受控模型重配置。当前页面仅提供运行状态。"
     page.refresh_model()
     wait(root, lambda: page.has_model and not gui.busy)
     assert page.total.get() == "131072" and page.slots.get() == "5"
+    assert page.preview_button.instate(["disabled"])
+    before = len(fixture.requests)
+    page.preview_button.invoke()
+    page.preview()
+    root.update()
+    assert len(fixture.requests) == before
+    assert "仅提供运行状态" in page.model_note.get()
+
+    fixture.model["control_available"] = True
+    fixture.model["detail"] = ""
+    page.refresh_model()
+    wait(root, lambda: not gui.busy)
+    assert not page.preview_button.instate(["disabled"])
 
     page.total.set("65535")
     assert page.preview_button.instate(["disabled"])
@@ -240,6 +255,26 @@ def verify_model_configuration(root, gui):
     page.apply_preview()
     wait(root, lambda: not gui.busy and "尚未确认生效" in page.model_note.get())
 
+    # Older responses without an explicit capability must remain read-only too.
+    page.total.set("131072")
+    page.slots.set("5")
+    page.preview()
+    wait(root, lambda: bool(page.review_ticket) and not gui.busy)
+    fixture.model.pop("control_available")
+    page.refresh_model()
+    wait(root, lambda: not gui.busy)
+    assert page.preview_button.instate(["disabled"])
+    assert page.review_ticket is None
+    before = len(fixture.requests)
+    page.preview()
+    root.update()
+    assert len(fixture.requests) == before
+    assert "仅可查看运行状态" in page.model_note.get()
+
+    fixture.model["control_available"] = True
+    page.refresh_model()
+    wait(root, lambda: not gui.busy)
+    assert not page.preview_button.instate(["disabled"])
     gui.account["role"] = "user"
     before = len(fixture.requests)
     page.preview()

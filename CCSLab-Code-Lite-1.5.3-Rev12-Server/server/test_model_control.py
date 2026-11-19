@@ -1,6 +1,9 @@
 """Isolated model telemetry, permission, journaling and rollback tests."""
 
 from contextlib import closing
+from dataclasses import dataclass
+import json
+import os
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -18,10 +21,15 @@ else:
     import model_host as host
 
 
-A = m.Profile(total_context=131072, slots=5, slot_context=26368, peak_model_mib=27200)
-B = m.Profile(total_context=65536, slots=2, slot_context=32768, peak_model_mib=23900)
-POLICY = m.Policy("a" * 64, "llama.service", 0, "GPU-abcd", 1024,
-                  {(p.total_context, p.slots): p for p in (A, B)}, "http://127.0.0.1:8000", "lab-general")
+@dataclass(frozen=True)
+class Parameters:
+    total_context: int
+    slots: int
+
+
+A = Parameters(total_context=131072, slots=5)
+B = Parameters(total_context=65536, slots=2)
+POLICY = m.Policy("a" * 64, 0, "http://127.0.0.1:8000", "lab-general", Path("/tmp/api-key"))
 CHANGE = {"old_context": A.total_context, "old_slots": A.slots,
           "new_context": B.total_context, "new_slots": B.slots, "policy": POLICY.digest}
 TEST_DIR = Path(__file__).resolve().parent
@@ -32,10 +40,12 @@ def snapshot(profile=A, *, busy=0, used=27000, current_model=25000, total=32000,
     return {
         "model_id": "lab-general", "model_name": "Model", "status": "running",
         "total_context": profile.total_context, "slots": profile.slots,
-        "effective_context_limit": profile.slot_context, "output_limit": 4096,
-        "gpu": {"index": 0, "used_mib": used, "total_mib": total, "_uuid": POLICY.gpu_uuid,
+        "effective_context_limit": m.slot_context(profile.total_context, profile.slots),
+        "output_limit": 4096,
+        "gpu": {"index": 0, "used_mib": used, "total_mib": total, "_uuid": "GPU-fixture",
                 "_model_mib": current_model},
-        "_train_context": train, "_observed_slot_context": profile.slot_context, "_uniform_context": True,
+        "_train_context": train, "_observed_slot_context": m.slot_context(profile.total_context, profile.slots),
+        "_uniform_context": True,
         "_active_slots": busy, "_pid": 1234,
         "_config": config, "_managed_environment": config,
     }
@@ -76,17 +86,17 @@ class ControlTest(unittest.TestCase):
         self.control = m.ModelControl(Path(temp.name) / "model.db", "http://example.invalid", "fixture-token")
         patch.object(self.control, "_policy", return_value=POLICY).start()
         self.runtime = patch.object(self.control, "_runtime", return_value=snapshot()).start()
-        patch.object(m, "maintenance_open", return_value=True).start()
 
     def preview(self):
         return self.control.preview("owner", B.total_context, B.slots)
 
-    def test_refuse_invalid_or_unqualified_combo_and_missing_evidence(self):
-        for total, slots in [(70000, 3), (65536, 1), (65536, True)]:
+    def test_refuse_out_of_range_values_or_unverifiable_runtime(self):
+        for total, slots in [(70000, 3), (65536, 0), (65536, True), (65536, 11)]:
             with self.assertRaises(m.ModelControlError):
                 self.control.preview("owner", total, slots)
-        for unsafe in (snapshot(used=32000, current_model=9000), snapshot(train=30000),
-                       dict(snapshot(), gpu=None)):
+        for unsafe in (snapshot(train=30000), dict(snapshot(), status="unavailable"),
+                       dict(snapshot(), _config={"total_context": 1, "slots": 5}),
+                       dict(snapshot(), _managed_environment={})):
             self.runtime.return_value = unsafe
             with self.assertRaises(m.ModelControlError):
                 self.preview()
@@ -95,7 +105,7 @@ class ControlTest(unittest.TestCase):
 
     def test_apply_only_after_single_use_actor_bound_confirmation(self):
         preview = self.preview()
-        self.assertEqual(preview["estimated_slot_context"], B.slot_context)
+        self.assertEqual(preview["estimated_slot_context"], m.slot_context(B.total_context, B.slots))
         self.assertTrue(preview["restart_required"])
         token = preview["confirmation"]
         with self.assertRaises(m.ModelControlError):
@@ -154,7 +164,7 @@ class FixtureHost:
         self.config = Path(directory) / "current"
         self.backup = Path(directory) / "backup"
         self.journal = Path(directory) / "pending"
-        self.config.write_bytes(host.settings(A))
+        self.config.write_bytes(host.settings(A.total_context, A.slots))
         self.restarts = 0
         self.outcomes = list(outcomes)
 
@@ -177,9 +187,9 @@ class FixtureHost:
             self.outcomes.pop(0)
             raise subprocess.SubprocessError()
 
-    def wait_verified(self, profile, old_pid):
+    def wait_verified(self, total_context, slots, old_pid):
         assert old_pid == 1234
-        assert self.config.read_bytes() == host.settings(profile)
+        assert self.config.read_bytes() == host.settings(total_context, slots)
         return self.outcomes.pop(0)
 
     def clear_pending(self):
@@ -187,12 +197,41 @@ class FixtureHost:
 
 
 class HostRecoveryTest(unittest.TestCase):
+    @unittest.skipUnless(os.name == "posix", "fixed helper file checks require POSIX")
+    def test_helper_api_key_ascii_validation_does_not_compare_string_to_integer(self):
+        with tempfile.TemporaryDirectory(dir=TEST_ROOT) as directory:
+            key_file = Path(directory) / "api-key"
+            key_file.write_text("fixture-key", encoding="ascii")
+            self.assertEqual(host.api_key(key_file), "fixture-key")
+
+            key_file.write_text("invalid key", encoding="ascii")
+            with self.assertRaisesRegex(ValueError, "invalid API key"):
+                host.api_key(key_file)
+
+    def test_helper_request_accepts_only_fixed_integer_fields(self):
+        self.assertEqual(host.parse_request(json.dumps(CHANGE).encode("ascii")), CHANGE)
+        for invalid in (dict(CHANGE, path="/etc/passwd"), dict(CHANGE, new_slots=True),
+                        dict(CHANGE, new_slots=11)):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                host.parse_request(json.dumps(invalid).encode("ascii"))
+        with self.assertRaises(ValueError):
+            host.parse_request(b" " * 1025)
+
+    def test_rejects_stale_baseline_before_writing(self):
+        with tempfile.TemporaryDirectory(dir=TEST_ROOT) as directory:
+            worker = FixtureHost(directory, [True])
+            stale = dict(CHANGE, old_slots=4)
+            self.assertEqual(host.run_change(worker, POLICY, stale)["status"], "refused")
+            self.assertEqual(worker.config.read_bytes(), host.settings(A.total_context, A.slots))
+            self.assertEqual(worker.restarts, 0)
+            self.assertFalse(worker.journal.exists())
+
     def test_verified_new_context(self):
         with tempfile.TemporaryDirectory(dir=TEST_ROOT) as directory:
             worker = FixtureHost(directory, [True])
             self.assertEqual(host.run_change(worker, POLICY, CHANGE)["status"], "applied")
-            self.assertEqual(worker.config.read_bytes(), host.settings(B))
-            self.assertEqual(worker.backup.read_bytes(), host.settings(A))
+            self.assertEqual(worker.config.read_bytes(), host.settings(B.total_context, B.slots))
+            self.assertEqual(worker.backup.read_bytes(), host.settings(A.total_context, A.slots))
             self.assertFalse(worker.journal.exists())
             self.assertEqual(worker.restarts, 1)
 
@@ -201,7 +240,7 @@ class HostRecoveryTest(unittest.TestCase):
             with self.subTest(first=first), tempfile.TemporaryDirectory(dir=TEST_ROOT) as directory:
                 worker = FixtureHost(directory, [first, True])
                 self.assertEqual(host.run_change(worker, POLICY, CHANGE)["status"], "rolled_back")
-                self.assertEqual(worker.config.read_bytes(), host.settings(A))
+                self.assertEqual(worker.config.read_bytes(), host.settings(A.total_context, A.slots))
                 self.assertFalse(worker.journal.exists())
                 self.assertEqual(worker.restarts, 2)
 
@@ -209,7 +248,7 @@ class HostRecoveryTest(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=TEST_ROOT) as directory:
             worker = FixtureHost(directory, [False, False])
             self.assertEqual(host.run_change(worker, POLICY, CHANGE)["status"], "rollback_failed")
-            self.assertEqual(worker.config.read_bytes(), host.settings(A))
+            self.assertEqual(worker.config.read_bytes(), host.settings(A.total_context, A.slots))
             self.assertTrue(worker.journal.exists())
             self.assertEqual(worker.restarts, 2)
 

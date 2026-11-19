@@ -18,13 +18,14 @@ from urllib.parse import urlsplit
 
 CONTEXT_OPTIONS = (32768, 65536, 131072, 262144)
 MODEL_SPEC = Path("/etc/ccslab/model-control.json")
-MAINTENANCE = Path("/etc/ccslab/model-maintenance-until")
 CONTEXT_ENV = Path("/etc/ccslab/model-context.env")
-LLAMA_API_KEY = Path("/etc/ccslab/llama-api-key")
 ROLLBACK_PENDING = Path("/etc/ccslab/model-change.pending")
 CONTROLLER = "/usr/local/sbin/ccslab-model-controller"
 SYSTEMCTL = "/usr/bin/systemctl"
 NVIDIA_SMI = "/usr/bin/nvidia-smi"
+MODEL_UNIT = "ccslab-llm.service"
+MIN_SLOTS = 1
+MAX_SLOTS = 10
 CONFIRM_SECONDS = 90
 MAX_RESPONSE = 512 * 1024
 OUTCOMES = {"applied", "rolled_back", "rollback_failed", "refused"}
@@ -245,32 +246,13 @@ def normalized_llama_url(value):
     return f"{url.scheme}://{url.netloc}"
 
 
-def maintenance_open():
-    try:
-        until = int(_root_file(MAINTENANCE).strip())
-        return time() < until <= time() + 900
-    except (OSError, ValueError):
-        return False
-
-
-@dataclass(frozen=True)
-class Profile:
-    total_context: int
-    slots: int
-    slot_context: int
-    peak_model_mib: int
-
-
 @dataclass(frozen=True)
 class Policy:
     digest: str
-    unit: str
     gpu_index: int
-    gpu_uuid: str
-    reserve_mib: int
-    profiles: dict
     llama_url: str
     model_id: str
+    api_key_file: Path
 
     @classmethod
     def read(cls, spec_path):
@@ -278,50 +260,39 @@ class Policy:
         data = json.loads(raw)
         if not isinstance(data, dict) or data.get("enabled") is not True:
             raise ModelControlError("服务器尚未启用模型配置修改。", 503)
-        unit, index, uuid = data.get("unit"), data.get("gpu_index"), data.get("gpu_uuid")
-        reserve = positive(data.get("reserve_mib"))
+        index = data.get("gpu_index")
         llama_url = normalized_llama_url(data.get("llama_url", ""))
         model_id = data.get("model_id", "")
-        if not (unit_name(unit) and type(index) is int and 0 <= index < 16 and isinstance(uuid, str)
-                and re.fullmatch(r"GPU-[a-fA-F0-9-]+", uuid) and reserve and reserve >= 512
-                and isinstance(model_id, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,100}", model_id)):
-            raise ValueError("invalid GPU or systemd model-control policy")
-        profiles = {}
-        if not isinstance(data.get("profiles"), list) or not 2 <= len(data["profiles"]) <= 40:
-            raise ValueError("missing qualified profiles")
-        for item in data["profiles"]:
-            p = Profile(**item)
-            if (type(p.total_context) is not int or p.total_context not in CONTEXT_OPTIONS
-                    or type(p.slots) is not int or not 1 <= p.slots <= 10
-                    or not positive(p.slot_context) or not positive(p.peak_model_mib)
-                    or (p.total_context, p.slots) in profiles):
-                raise ValueError("invalid qualified profile")
-            profiles[p.total_context, p.slots] = p
-        return cls(hashlib.sha256(raw).hexdigest(), unit, index, uuid, reserve, profiles, llama_url, model_id)
+        key_file = data.get("api_key_file")
+        if (set(data) != {"enabled", "gpu_index", "llama_url", "model_id", "api_key_file"}
+                or type(index) is not int or not 0 <= index < 16
+                or not isinstance(model_id, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,100}", model_id)
+                or not isinstance(key_file, str) or not Path(key_file).is_absolute()):
+            raise ValueError("invalid fixed model-control configuration")
+        return cls(hashlib.sha256(raw).hexdigest(), index, llama_url, model_id, Path(key_file))
 
 
-def validate_change(policy, runtime, requested, require_idle=False):
-    current = policy.profiles.get((runtime["total_context"], runtime["slots"]))
-    if (runtime["status"] != "running" or not current or not runtime["_pid"]
-            or runtime["_config"] != {"total_context": current.total_context, "slots": current.slots}
-            or not runtime["_uniform_context"] or runtime["_observed_slot_context"] != current.slot_context):
-        raise ModelControlError("当前运行配置与服务器核准的基线不一致，暂不能修改。", 409)
-    if (not runtime["_train_context"]
-            or max(current.slot_context, requested.slot_context) > runtime["_train_context"]):
-        raise ModelControlError("缺少模型训练上下文证据，或每槽上下文超出模型支持范围。", 409)
-    if runtime["output_limit"] and runtime["output_limit"] >= requested.slot_context:
-        raise ModelControlError("预计每槽上下文必须大于当前单次输出上限。", 409)
+def slot_context(total_context, slots):
+    return ((total_context // slots + 255) // 256) * 256
+
+
+def validate_change(runtime, total_context, slots, require_idle=False):
+    current = {"total_context": runtime["total_context"], "slots": runtime["slots"]}
+    if (runtime["status"] != "running" or not runtime["_pid"]
+            or current["total_context"] not in CONTEXT_OPTIONS
+            or type(current["slots"]) is not int or not MIN_SLOTS <= current["slots"] <= MAX_SLOTS
+            or runtime["_config"] != current or not runtime["_uniform_context"]
+            or runtime["_managed_environment"] != current
+            or runtime["_observed_slot_context"] != slot_context(*current.values())):
+        raise ModelControlError("当前模型配置或槽位状态无法核实，暂不能修改。", 409)
+    requested_slot_context = slot_context(total_context, slots)
+    if runtime["_train_context"] and requested_slot_context > runtime["_train_context"]:
+        raise ModelControlError("目标每槽上下文超过模型训练上下文。", 409)
+    if runtime["output_limit"] and runtime["output_limit"] >= requested_slot_context:
+        raise ModelControlError("目标每槽上下文必须大于当前单次输出上限。", 409)
     if require_idle and runtime["_active_slots"] != 0:
-        raise ModelControlError("模型仍在处理请求，或无法确认槽位空闲。请关闭其他调用后重试。", 409)
-    gpu = runtime["gpu"]
-    if not gpu or gpu.get("_uuid") != policy.gpu_uuid or not positive(gpu.get("_model_mib")):
-        raise ModelControlError("无法验证指定 GPU 和模型进程的实际显存用量。", 409)
-    if gpu["_model_mib"] > current.peak_model_mib:
-        raise ModelControlError("当前显存已超过基线实测峰值，请重新核准配置。", 409)
-    estimated = gpu["used_mib"] - gpu["_model_mib"] + requested.peak_model_mib
-    if estimated + policy.reserve_mib > gpu["total_mib"]:
-        raise ModelControlError("目标配置的实测显存预算和安全余量超过该 GPU 容量。", 409)
-    return current, estimated
+        raise ModelControlError("模型仍在处理请求，或无法确认槽位空闲。请等槽位空闲后重试。", 409)
+    return current, requested_slot_context
 
 
 def _public(runtime, control_available, detail):
@@ -379,9 +350,9 @@ class ModelControl:
             raise ModelControlError("无法验证服务器模型控制组件或核准配置。", 503) from error
 
     def _runtime(self, policy=None):
-        unit = policy.unit if policy else self.runtime_unit
+        unit = MODEL_UNIT if policy else self.runtime_unit
         index = policy.gpu_index if policy else self.gpu_index
-        runtime = read_runtime(self.base, self.token, self.model_id, unit, index)
+        runtime = read_runtime(self.base, self.token, self.model_id, unit, index, verify_environment=bool(policy))
         if self.gateway_output_limit:
             upstream_cap = runtime["output_limit"] or self.gateway_output_limit
             runtime["output_limit"] = min(upstream_cap, self.gateway_output_limit)
@@ -401,35 +372,30 @@ class ModelControl:
     def status(self):
         try:
             policy = self._policy()
-            allowed = maintenance_open() and not ROLLBACK_PENDING.exists()
-            detail = "" if allowed else "模型配置只能在 Ubuntu 运维人员开启的维护窗口内修改。"
+            allowed = not ROLLBACK_PENDING.exists()
+            detail = "" if allowed else "上次模型重启未完成恢复。模型请求已暂停，等待运维检查。"
             if ROLLBACK_PENDING.exists():
-                detail = "上次变更未完成。模型请求已暂停，等待 Ubuntu 运维检查。"
+                detail = "上次模型重启未完成恢复。模型请求已暂停，等待运维检查。"
         except ModelControlError as error:
             policy, allowed, detail = None, False, str(error)
         return _public(self._runtime(policy), allowed, detail)
 
-    def _check_window(self):
+    def _check_pending(self):
         if ROLLBACK_PENDING.exists():
-            raise ModelControlError("上次变更未完成。请联系 Ubuntu 运维。", 409)
-        if not maintenance_open():
-            raise ModelControlError("模型配置只能在 Ubuntu 运维人员开启的维护窗口内修改。", 409)
+            raise ModelControlError("上次模型重启未完成恢复。请运维检查后再试。", 409)
 
     def preview(self, actor, total_context, slots):
         if type(total_context) is not int or total_context not in CONTEXT_OPTIONS \
-                or type(slots) is not int or not 1 <= slots <= 10:
+                or type(slots) is not int or not MIN_SLOTS <= slots <= MAX_SLOTS:
             raise ModelControlError("上下文或槽位数超出可选范围。")
         policy = self._policy()
-        self._check_window()
+        self._check_pending()
         runtime = self._runtime(policy)
-        requested = policy.profiles.get((total_context, slots))
-        if not requested:
-            raise ModelControlError("此组合未通过该模型与 GPU 的实测核准。")
-        current, estimated = validate_change(policy, runtime, requested)
-        if current == requested:
+        current, requested_slot_context = validate_change(runtime, total_context, slots)
+        if (current["total_context"], current["slots"]) == (total_context, slots):
             raise ModelControlError("请求的数值与当前配置一致。")
         token = secrets.token_urlsafe(32)
-        payload = dict(old_context=current.total_context, old_slots=current.slots,
+        payload = dict(old_context=current["total_context"], old_slots=current["slots"],
                        new_context=total_context, new_slots=slots, policy=policy.digest)
         with closing(sqlite3.connect(self.db)) as db, db:
             now = time()
@@ -439,9 +405,8 @@ class ModelControl:
         return {
             "confirmation": token, "current": _public(runtime, True, ""),
             "requested": {"total_context": total_context, "slots": slots},
-            "estimated_slot_context": requested.slot_context,
-            "gpu_risk": (f"估算 GPU 峰值 {estimated} MiB，安全余量 {policy.reserve_mib} MiB，"
-                         f"设备容量 {runtime['gpu']['total_mib']} MiB。负载变化仍可能导致启动失败。"),
+            "estimated_slot_context": requested_slot_context,
+            "gpu_risk": "未测量目标配置的显存峰值。提高上下文或槽位可能导致显存不足、模型重启失败。",
             "restart_required": True, "user_impact": "会重启模型服务。维护期间所有模型请求暂停，服务缓存会清空。",
             "expires_in": CONFIRM_SECONDS,
         }
@@ -478,14 +443,18 @@ class ModelControl:
     def _invoke(self, payload):
         try:
             process = subprocess.run(
-                ["/usr/bin/sudo", "-n", "--", CONTROLLER], input=json.dumps(payload),
-                timeout=250, encoding="utf-8", stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                ["/usr/bin/sudo", "-n", "--", CONTROLLER],
+                input=json.dumps(payload, separators=(",", ":")), timeout=250, encoding="utf-8",
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                 env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"}, check=False,
             )
             result = json.loads(process.stdout[:4096])
-            if isinstance(result, dict) and result.get("status") in OUTCOMES:
-                reason = result.get("reason")
-                return {"status": result["status"], "reason": reason if reason in REASONS else "unknown"}
+            if (isinstance(result, dict) and set(result) == {"status", "reason"}
+                    and result["status"] in OUTCOMES and isinstance(result["reason"], str)):
+                if result["status"] == "applied" and process.returncode != 0:
+                    return {"status": "unknown", "reason": "unknown"}
+                return {"status": result["status"],
+                        "reason": result["reason"] if result["reason"] in REASONS else "unknown"}
         except (OSError, ValueError, subprocess.SubprocessError):
             pass
         return {"status": "unknown", "reason": "unknown"}
@@ -497,13 +466,13 @@ class ModelControl:
             self._maintenance = True
         try:
             policy = self._policy()
-            self._check_window()
+            self._check_pending()
             payload = self._consume(actor, confirmation)
             if payload["policy"] != policy.digest:
-                raise ModelControlError("服务器核准配置已经变更。请重新预览。", 409)
-            requested = policy.profiles[payload["new_context"], payload["new_slots"]]
-            current, _ = validate_change(policy, self._runtime(policy), requested, require_idle=True)
-            if (current.total_context, current.slots) != (payload["old_context"], payload["old_slots"]):
+                raise ModelControlError("服务器模型控制配置已经变更。请重新预览。", 409)
+            current, _ = validate_change(self._runtime(policy), payload["new_context"], payload["new_slots"],
+                                         require_idle=True)
+            if (current["total_context"], current["slots"]) != (payload["old_context"], payload["old_slots"]):
                 raise ModelControlError("服务基线已变更。请重新预览。", 409)
             self._audit(actor, payload, "requested")
             result = self._invoke(payload)
@@ -514,7 +483,7 @@ class ModelControl:
             messages = {
                 "rolled_back": "新配置启动或校验失败，已经恢复并验证原配置。",
                 "rollback_failed": "新配置启动失败，恢复校验也未通过。请运维从备份检查。",
-                "refused": "服务器控制组件拒绝应用，请运维检查维护窗口、模型基线和显存证据。",
+                "refused": "固定模型控制程序拒绝应用，请运维检查模型状态和服务配置。",
                 "unknown": "无法确认服务器控制组件响应。请运维检查配置与运行状态。",
             }
             raise ModelControlError(messages[outcome], 503)

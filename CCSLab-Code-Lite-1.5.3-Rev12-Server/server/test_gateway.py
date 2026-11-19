@@ -1,12 +1,16 @@
 """Account API, gateway authorization and proxy behavior tests."""
 
 import asyncio
+from contextlib import closing
 import json
+import os
 from pathlib import Path
 from .test_support import TEST_ROOT
 import sqlite3
+import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 import httpx
@@ -421,6 +425,261 @@ class RevocationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("should not arrive", response.text)
                 self.assertTrue(closed.is_set())
                 self.assertEqual(controller.in_flight, 0)
+
+
+class ModelApplyIntegrationTests(unittest.TestCase):
+    """Real API/SQLite/policy/transaction files; mock fixed sudo boundary and model host.
+
+    POSIX ownership and directory fsync require a separate Linux acceptance run.
+    All dimensions and GPU budgets here are synthetic test fixtures.
+    """
+
+    def setUp(self):
+        from . import model_control as m, model_host as host
+        from .test_model_control import A, B, snapshot
+        self.m, self.host, self.A, self.B = m, host, A, B
+        temp = tempfile.TemporaryDirectory(dir=TEST_ROOT)
+        self.addCleanup(temp.cleanup)
+        root = self.root = Path(temp.name)
+        paths = {"MODEL_SPEC": root / "policy.json", "CONTEXT_ENV": root / "context.env",
+                 "ROLLBACK_PENDING": root / "pending",
+                 "CONTROLLER": str(root / "controller")}
+        for key, value in paths.items():
+            self.enterContext(patch.object(m, key, value))
+        self.enterContext(patch.object(host, "BACKUP", root / "previous"))
+        Path(m.CONTROLLER).write_text("isolated helper boundary", encoding="ascii")
+        m.MODEL_SPEC.write_text(json.dumps({
+            "enabled": True, "gpu_index": 0, "llama_url": "http://127.0.0.1:8000",
+            "model_id": "lab-general", "api_key_file": str(root / "key"),
+        }), encoding="ascii")
+        (root / "key").write_text("fixture-key", encoding="ascii")
+        m.CONTEXT_ENV.write_bytes(host.settings(A.total_context, A.slots))
+
+        def read_fixture(path):
+            path = Path(path).resolve()
+            self.assertTrue(path.is_relative_to(root.resolve()))
+            return path.read_bytes()
+        self.enterContext(patch.object(m, "_root_file", side_effect=read_fixture))
+        if os.name == "nt":
+            self.enterContext(patch.object(host, "_sync_directory"))
+        self.profile, self.pid, self.bad_dimensions = A, 1000, False
+        self.runtime_failure = ""
+        self.explicit_override = False
+        self.restarts, self.restart_modes = 0, []
+
+        def telemetry(*_args, **_kwargs):
+            result = snapshot(self.profile)
+            result["_pid"] = self.pid
+            if self.bad_dimensions:
+                result["_observed_slot_context"] = 1
+            if self.runtime_failure == "health_timeout":
+                result["status"] = "unavailable"
+            elif self.runtime_failure == "wrong_slots":
+                result["slots"] = A.slots
+            if self.explicit_override:
+                result["_managed_environment"] = {}
+            return result
+        self.enterContext(patch.object(m, "read_runtime", side_effect=telemetry))
+
+        def systemctl(args, **_kwargs):
+            self.assertEqual(args, [m.SYSTEMCTL, "restart", "--", m.MODEL_UNIT])
+            self.restarts += 1
+            mode = self.restart_modes.pop(0) if self.restart_modes else "ok"
+            if mode == "restart_failed":
+                raise subprocess.SubprocessError("isolated restart failure")
+            values = m.context_env(m.CONTEXT_ENV.read_bytes())
+            self.profile = { (p.total_context, p.slots): p for p in (A, B) }[
+                values["total_context"], values["slots"]]
+            self.pid += 1
+            self.bad_dimensions = mode == "wrong_dimensions"
+            self.runtime_failure = mode
+            return ""
+        self.enterContext(patch.object(m, "_fixed_command", side_effect=systemctl))
+        self.clock = 0
+        def tick():
+            self.clock += 10
+            return self.clock
+        self.enterContext(patch.object(host, "monotonic", side_effect=tick))
+        self.enterContext(patch.object(host, "sleep"))
+
+        def sudo_run(args, **kwargs):
+            self.assertEqual(args, ["/usr/bin/sudo", "-n", "--", m.CONTROLLER])
+            self.assertEqual(kwargs["timeout"], 250)
+            self.assertFalse(self.control.begin_inference())
+            policy = m.Policy.read(m.MODEL_SPEC)
+            payload = json.loads(kwargs["input"])
+            self.assertEqual(set(payload), {"old_context", "old_slots", "new_context", "new_slots", "policy"})
+            self.assertTrue(all(type(payload[key]) is int for key in
+                                ("old_context", "old_slots", "new_context", "new_slots")))
+            result = host.run_change(host.Host(policy, "fixture-key"), policy, payload)
+            return subprocess.CompletedProcess(args, 0 if result["status"] == "applied" else 1,
+                                               json.dumps(result), "")
+        self.sudo = self.enterContext(patch.object(m.subprocess, "run", side_effect=sudo_run))
+        accounts, _, _ = setup(root, lambda _request: None)
+        self.control = m.ModelControl(accounts.database, "http://127.0.0.1:8000", UPSTREAM_KEY,
+                                      config_path=m.MODEL_SPEC)
+        app = create_app(Settings(accounts.database, self.control.base, "lab-general", UPSTREAM_KEY,
+                                  admin_registration_code_file=root / "administrator.verifier"),
+                         model_control=self.control, upstream_transport=httpx.MockTransport(lambda _: None))
+        self.client = self.enterContext(TestClient(app, base_url="https://gateway.fixture"))
+        reply = self.client.post("/api/login", json=admin_login())
+        self.assertEqual(reply.status_code, 200)
+        self.admin = credentials(reply.json()["token"])
+
+    def preview(self):
+        reply = self.client.post("/api/admin/model/preview", headers=self.admin,
+                                 json={"total_context": self.B.total_context, "slots": self.B.slots})
+        self.assertEqual(reply.status_code, 200, reply.text)
+        self.assertEqual(self.m.CONTEXT_ENV.read_bytes(), self.host.settings(self.A.total_context, self.A.slots))
+        self.assertEqual(self.restarts, 0)
+        return reply.json()["confirmation"]
+
+    def apply(self, ticket):
+        return self.client.post("/api/admin/model/apply", headers=self.admin, json={"confirmation": ticket})
+
+    def test_apply_reads_environment_and_reports_verified_dimensions(self):
+        user = self.client.post("/api/register", json={"username": "quota-fixture", "password": USER_PASSWORD})
+        self.assertEqual(user.status_code, 201)
+        identity = user.json()["user"]["id"]
+        quota = self.client.post(f"/api/admin/users/{identity}/quota", headers=self.admin,
+                                 json={"mode": "limited", "limit_tokens": 50000})
+        self.assertEqual(quota.status_code, 200)
+        ticket = self.preview()
+        tables = ("users", "sessions", "token_quotas", "token_requests", "token_quota_audit")
+        with closing(sqlite3.connect(self.control.db)) as db:
+            unchanged = {table: db.execute(f"SELECT * FROM {table}").fetchall() for table in tables}
+        reply = self.apply(ticket)
+        self.assertEqual(reply.status_code, 200, reply.text)
+        self.assertEqual(reply.json()["status"], "applied")
+        live = self.client.get("/api/model", headers=self.admin).json()
+        self.assertEqual((live["total_context"], live["slots"]), (65536, 2))
+        self.assertEqual(self.m.CONTEXT_ENV.read_bytes(), self.host.settings(self.B.total_context, self.B.slots))
+        self.assertEqual(self.host.BACKUP.read_bytes(), self.host.settings(self.A.total_context, self.A.slots))
+        self.assertFalse(self.m.ROLLBACK_PENDING.exists())
+        self.assertEqual(self.restarts, 1)
+        self.assertEqual(self.apply(ticket).status_code, 409)
+        self.assertEqual(self.client.get("/api/me", headers=self.admin).status_code, 200)
+        self.assertEqual(self.client.get("/v1/models", headers=self.admin).json()["data"][0]["id"], "lab-general")
+        with closing(sqlite3.connect(self.control.db)) as db:
+            for table in tables:
+                self.assertEqual(db.execute(f"SELECT * FROM {table}").fetchall(), unchanged[table], table)
+            self.assertEqual(db.execute("SELECT result FROM model_configuration_audit ORDER BY id").fetchall(),
+                             [("requested",), ("applied",)])
+
+    def test_failed_dimensions_restore_original_file(self):
+        # Each test instance starts from A; rollback must verify a new PID too.
+        self.restart_modes = ["wrong_dimensions", "ok"]
+        reply = self.apply(self.preview())
+        self.assertEqual(reply.status_code, 503)
+        self.assertIn("恢复", reply.json()["detail"])
+        self.assertEqual(self.m.CONTEXT_ENV.read_bytes(), self.host.settings(self.A.total_context, self.A.slots))
+        self.assertFalse(self.m.ROLLBACK_PENDING.exists())
+        self.assertEqual(self.restarts, 2)
+
+    def test_restart_error_rolls_back_without_success_response(self):
+        self.restart_modes = ["restart_failed", "ok"]
+        reply = self.apply(self.preview())
+        self.assertEqual(reply.status_code, 503)
+        self.assertEqual(self.m.CONTEXT_ENV.read_bytes(), self.host.settings(self.A.total_context, self.A.slots))
+        self.assertFalse(self.m.ROLLBACK_PENDING.exists())
+
+    def test_unverified_recovery_preserves_pending_and_blocks_requests(self):
+        self.restart_modes = ["wrong_dimensions", "wrong_dimensions"]
+        reply = self.apply(self.preview())
+        self.assertEqual(reply.status_code, 503)
+        self.assertTrue(self.m.ROLLBACK_PENDING.exists())
+        self.assertFalse(self.control.begin_inference())
+        self.assertEqual(self.apply("expired-or-invalid").status_code, 409)
+        with closing(sqlite3.connect(self.control.db)) as db:
+            self.assertEqual(db.execute("SELECT result FROM model_configuration_audit ORDER BY id DESC LIMIT 1").fetchone()[0], "rollback_failed")
+
+    def test_explicit_launch_flags_are_refused_before_writing(self):
+        self.explicit_override = True
+        reply = self.client.post("/api/admin/model/preview", headers=self.admin,
+                                 json={"total_context": self.B.total_context, "slots": self.B.slots})
+        self.assertEqual(reply.status_code, 409)
+        self.sudo.assert_not_called()
+        self.assertEqual(self.restarts, 0)
+        self.assertFalse(self.host.BACKUP.exists())
+        self.assertEqual(self.m.CONTEXT_ENV.read_bytes(), self.host.settings(self.A.total_context, self.A.slots))
+
+    def test_unavailable_runtime_prevents_privileged_invocation(self):
+        ticket = self.preview()
+        self.runtime_failure = "health_timeout"
+        self.assertEqual(self.apply(ticket).status_code, 409)
+        self.sudo.assert_not_called()
+        self.assertEqual(self.restarts, 0)
+        self.assertEqual(self.m.CONTEXT_ENV.read_bytes(), self.host.settings(self.A.total_context, self.A.slots))
+
+    def audit_tail(self):
+        with closing(sqlite3.connect(self.control.db)) as db:
+            return db.execute("SELECT result, reason FROM model_configuration_audit ORDER BY id DESC LIMIT 1").fetchone()
+
+    def test_configuration_write_failure_restores_original_configuration(self):
+        original = self.host.atomic_write
+        def failing_write(path, contents, mode=0o644):
+            if path == self.m.CONTEXT_ENV and contents == self.host.settings(self.B.total_context, self.B.slots):
+                raise PermissionError("isolated configuration write denied")
+            return original(path, contents, mode)
+        with patch.object(self.host, "atomic_write", side_effect=failing_write):
+            reply = self.apply(self.preview())
+        self.assertEqual(reply.status_code, 503)
+        self.assertEqual(self.m.CONTEXT_ENV.read_bytes(), self.host.settings(self.A.total_context, self.A.slots))
+        self.assertFalse(self.m.ROLLBACK_PENDING.exists())
+        self.assertEqual(self.audit_tail()[0], "rolled_back")
+
+    def test_backup_write_failure_refuses_before_changing_configuration(self):
+        original = self.host.atomic_write
+        def failing_write(path, contents, mode=0o644):
+            if path == self.host.BACKUP:
+                raise PermissionError("isolated backup denied")
+            return original(path, contents, mode)
+        with patch.object(self.host, "atomic_write", side_effect=failing_write):
+            reply = self.apply(self.preview())
+        self.assertEqual(reply.status_code, 503)
+        self.assertEqual(self.m.CONTEXT_ENV.read_bytes(), self.host.settings(self.A.total_context, self.A.slots))
+        self.assertEqual(self.restarts, 0)
+        self.assertEqual(self.audit_tail()[0], "refused")
+
+    def test_helper_permission_failure_is_audited_without_success(self):
+        self.sudo.side_effect = PermissionError("isolated sudo authorization denied")
+        reply = self.apply(self.preview())
+        self.assertEqual(reply.status_code, 503)
+        self.assertEqual(self.restarts, 0)
+        self.assertEqual(self.m.CONTEXT_ENV.read_bytes(), self.host.settings(self.A.total_context, self.A.slots))
+        self.assertEqual(self.audit_tail(), ("unknown", "unknown"))
+
+    def test_health_check_timeout_restores_original_configuration(self):
+        self.restart_modes = ["health_timeout", "ok"]
+        reply = self.apply(self.preview())
+        self.assertEqual(reply.status_code, 503)
+        self.assertEqual(self.m.CONTEXT_ENV.read_bytes(), self.host.settings(self.A.total_context, self.A.slots))
+        self.assertFalse(self.m.ROLLBACK_PENDING.exists())
+        self.assertEqual(self.audit_tail(), ("rolled_back", "health_or_dimensions_failed"))
+
+    def test_actual_slots_mismatch_restores_original_configuration(self):
+        self.restart_modes = ["wrong_slots", "ok"]
+        reply = self.apply(self.preview())
+        self.assertEqual(reply.status_code, 503)
+        self.assertEqual(self.m.CONTEXT_ENV.read_bytes(), self.host.settings(self.A.total_context, self.A.slots))
+        self.assertFalse(self.m.ROLLBACK_PENDING.exists())
+        self.assertEqual(self.audit_tail(), ("rolled_back", "health_or_dimensions_failed"))
+
+    def test_rollback_write_failure_retains_pending_and_blocks_inference(self):
+        original = self.host.atomic_write
+        def failing_write(path, contents, mode=0o644):
+            if path == self.m.CONTEXT_ENV and contents == self.host.settings(self.A.total_context, self.A.slots):
+                raise PermissionError("isolated rollback write denied")
+            return original(path, contents, mode)
+        self.restart_modes = ["wrong_dimensions"]
+        with patch.object(self.host, "atomic_write", side_effect=failing_write):
+            reply = self.apply(self.preview())
+        self.assertEqual(reply.status_code, 503)
+        self.assertTrue(self.m.ROLLBACK_PENDING.exists())
+        self.assertEqual(self.host.BACKUP.read_bytes(), self.host.settings(self.A.total_context, self.A.slots))
+        self.assertEqual(self.m.CONTEXT_ENV.read_bytes(), self.host.settings(self.B.total_context, self.B.slots))
+        self.assertFalse(self.control.begin_inference())
+        self.assertEqual(self.audit_tail()[0], "rollback_failed")
 
 
 if __name__ == "__main__":

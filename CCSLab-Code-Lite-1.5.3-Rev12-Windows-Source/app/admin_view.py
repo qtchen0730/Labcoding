@@ -74,6 +74,7 @@ class AdminPage:
         self.user_cards = {}
         self.user_wheel_delta = 0
         self.has_model = False
+        self.control_available = False
         self.review_ticket = None
         self.review_deadline = None
         self.control_detail = ""
@@ -433,13 +434,15 @@ class AdminPage:
 
     def parameters_changed(self, *_args):
         self.clear_review()
-        ready = self.total.get() in CONTEXT_OPTIONS and self.slots.get() in SLOT_OPTIONS
+        ready = (self.control_available and self.total.get() in CONTEXT_OPTIONS
+                 and self.slots.get() in SLOT_OPTIONS)
         self.preview_button.configure(state="normal" if ready else "disabled")
 
     def refresh_model(self, message=None, expected=None):
         def draw(reply):
             model = reply.get("model", reply)
             self.has_model = True
+            self.control_available = model.get("control_available") is True
             self.model_title.set(model_name(model))
             self.model_meta.set(f"{model_state(model)}  ·  模型 ID {model.get('model_id') or UNAVAILABLE}"
                                 f"  ·  网关输出上限 {count(model.get('output_token_limit'))} Token")
@@ -451,7 +454,10 @@ class AdminPage:
             total, slots = str(model.get("total_context")), str(model.get("slots"))
             self.total.set(total if total in CONTEXT_OPTIONS else "")
             self.slots.set(slots if slots in SLOT_OPTIONS else "")
-            self.control_detail = model.get("detail") or "配置变更由服务器校验，并可能中断当前推理。"
+            self.control_detail = model.get("detail") or (
+                "配置变更由服务器校验，并可能中断当前推理。" if self.control_available
+                else "当前仅可查看运行状态；服务器未开放模型配置修改，请联系运维。"
+            )
             status_message = message or ""
             if expected is not None:
                 if (model.get("total_context"), model.get("slots")) == (
@@ -470,6 +476,9 @@ class AdminPage:
         self.call("刷新模型状态", "GET", "/api/model", None, draw, error_text=self.model_note)
 
     def preview(self):
+        if not self.control_available:
+            self.model_note.set(self.control_detail)
+            return
         if self.total.get() not in CONTEXT_OPTIONS or self.slots.get() not in SLOT_OPTIONS:
             return
         requested = {"total_context": int(self.total.get()), "slots": int(self.slots.get())}

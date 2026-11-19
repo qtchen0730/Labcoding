@@ -1,10 +1,7 @@
 {
   "enabled": false,
-  "unit": "REPLACE-WITH-EXACT-UNIT.service",
+  "gpu_index": 0,
   "llama_url": "http://172.17.0.1:8000",
   "model_id": "lab-general",
-  "gpu_index": 0,
-  "gpu_uuid": "REPLACE-WITH-OBSERVED-GPU-UUID",
-  "reserve_mib": 2048,
-  "profiles": []
+  "api_key_file": "/etc/ccslab/llama-api-key"
 }
