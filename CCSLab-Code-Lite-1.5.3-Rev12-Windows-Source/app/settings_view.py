@@ -35,12 +35,12 @@ def model_fields(model):
 def build_settings_page(app, parent, section="general"):
     panel = app.frame(parent)
     panel.pack(fill="both", expand=True)
-    side = app.frame(panel, "side", width=204)
+    side = app.frame(panel, "side", width=176)
     side.pack(side="left", fill="y")
     side.pack_propagate(False)
-    app.label(side, "设置", bg="side", bold=True, size=20).pack(fill="x", padx=21, pady=(25, 18))
+    app.label(side, "设置", bg="side", bold=True, size=18).pack(fill="x", padx=16, pady=(19, 14))
     body = app.frame(panel)
-    body.pack(side="left", fill="both", expand=True, padx=(29, 28), pady=(25, 18))
+    body.pack(side="left", fill="both", expand=True, padx=(20, 18), pady=(18, 14))
     routes = {}
     chosen = None
 
@@ -76,19 +76,17 @@ def build_settings_page(app, parent, section="general"):
         title.pack(fill="x", padx=15, pady=(11, 4 if detail else 10))
         if detail:
             label = app.label(shelf, detail, bg="field", muted=True, size=9)
-            label.configure(wraplength=580)
+            label.bind("<Configure>", lambda event: label.configure(wraplength=max(180, event.width)))
             label.pack(fill="x", padx=15, pady=(0, 7))
         return shelf
 
     def scrollable(parent, build):
         scroller = app.frame(parent)
         scroller.pack(fill="both", expand=True)
-        viewport = tk.Canvas(scroller, borderwidth=0, highlightthickness=0, takefocus=False)
+        viewport = tk.Canvas(scroller, borderwidth=0, highlightthickness=0, takefocus=True)
         app.skin(viewport, "panel", None)
         viewport.pack(side="left", fill="both", expand=True)
-        scroll = ttk.Scrollbar(scroller, orient="vertical", command=viewport.yview)
-        viewport.configure(yscrollcommand=scroll.set)
-        scroll.pack(side="right", fill="y")
+        app.overlay_scrollbar(scroller, viewport)
         inner = app.frame(viewport)
         content = viewport.create_window((0, 0), window=inner, anchor="nw")
         inner.bind("<Configure>", lambda _event: viewport.configure(scrollregion=viewport.bbox(content)))
@@ -106,8 +104,15 @@ def build_settings_page(app, parent, section="general"):
             viewport.yview_scroll(-int(event.delta / 120), "units")
             return "break"
 
+        def scroll_keyboard(event):
+            viewport.yview_scroll(-1 if event.keysym == "Prior" else 1, "pages")
+            return "break"
+
+        viewport.bind("<Prior>", scroll_keyboard)
+        viewport.bind("<Next>", scroll_keyboard)
+
         def bind_wheel(widget):
-            widget.bind("<MouseWheel>", scroll_page)
+            widget.bind("<MouseWheel>", scroll_page, add="+")
             for child in widget.winfo_children():
                 bind_wheel(child)
 
@@ -119,10 +124,13 @@ def build_settings_page(app, parent, section="general"):
         update_row.pack(fill="x", padx=15, pady=(0, 10))
         app.update_check_button = app.button(update_row, "检查更新", lambda: app.check_for_updates(manual=True))
         app.update_check_button.pack(side="left")
-        app.label(update_row, "仅连接 GitHub Releases；检查不使用 CCSLab 账号凭据。",
-                  bg="field", muted=True, size=9).pack(side="left", padx=(10, 0))
+        update_hint = app.label(update_row, "仅连接 GitHub Releases；检查不使用 CCSLab 账号凭据。",
+                                bg="field", muted=True, size=9)
+        update_hint.pack(side="left", fill="x", expand=True, padx=(10, 0))
+        update_hint.bind("<Configure>", lambda event: update_hint.configure(wraplength=max(160, event.width)))
         status = app.label(updates, variable=app.update_status, bg="field", muted=True, size=9)
-        status.configure(wraplength=580, justify="left")
+        status.configure(justify="left")
+        status.bind("<Configure>", lambda event: status.configure(wraplength=max(180, event.width)))
         status.pack(fill="x", padx=15, pady=(0, 10))
         app.update_settings_status_label = status
 
@@ -140,10 +148,9 @@ def build_settings_page(app, parent, section="general"):
         notes = tk.Text(notes_frame, wrap="word", height=8, borderwidth=0,
                         padx=7, pady=5, undo=False, takefocus=True)
         app.skin(notes, "field", "text")
-        notes_scroll = ttk.Scrollbar(notes_frame, orient="vertical", command=notes.yview)
-        notes.configure(yscrollcommand=notes_scroll.set, state="disabled")
+        app.overlay_scrollbar(notes_frame, notes)
+        notes.configure(state="disabled")
         notes.pack(side="left", fill="both", expand=True)
-        notes_scroll.pack(side="right", fill="y")
         app.update_settings_notes_frame = notes_frame
         app.update_settings_notes_text = notes
 
@@ -159,20 +166,24 @@ def build_settings_page(app, parent, section="general"):
                 return "break"
             return None
 
-        for widget in (notes, notes_frame, notes_scroll):
+        for widget in (notes, notes_frame):
             widget.bind("<MouseWheel>", scroll_notes)
             widget.bind("<Button-4>", scroll_notes)
             widget.bind("<Button-5>", scroll_notes)
 
         security = app.label(release_section, variable=app.update_security_notice,
                              bg="field", muted=True, size=9)
-        security.configure(wraplength=580, justify="left")
+        security.configure(justify="left")
+        security.bind("<Configure>", lambda event: security.configure(wraplength=max(180, event.width)))
         security.pack(fill="x", padx=10, pady=(0, 8))
         app.update_settings_security_label = security
 
         app.update_settings_download_status_label = app.label(
             updates, variable=app.update_download_status, bg="field", muted=True, size=9)
-        app.update_settings_download_status_label.configure(wraplength=580, justify="left")
+        app.update_settings_download_status_label.configure(justify="left")
+        app.update_settings_download_status_label.bind(
+            "<Configure>", lambda event: app.update_settings_download_status_label.configure(
+                wraplength=max(180, event.width)))
         app.update_settings_download_status_label.pack(fill="x", padx=15, pady=(0, 8))
         update_actions = app.frame(updates, "field")
         app.update_settings_download_actions = update_actions
@@ -392,6 +403,8 @@ def build_settings_page(app, parent, section="general"):
         categories.insert(2, ("passwords", "密码管理",
                               lambda parent: scrollable(parent, lambda inner: build_password_settings(app, inner))))
     for key, name, build in categories:
+        if key == "general":
+            build = lambda parent, builder=build: scrollable(parent, builder)
         button = app.button(side, name, lambda key=key: select(key), "Nav.TButton")
         button.pack(fill="x", padx=14, pady=(0, 5))
         routes[key] = (button, name, build)

@@ -128,16 +128,16 @@ class ActivityPanel:
         self.last_id = ""
         self.displayed = None
         self.summary = tk.StringVar(master=parent, value="暂无执行记录")
-        self.container = app.frame(parent)
+        self.container = app.frame(parent, "result_panel")
         self.container.pack(fill="both", expand=True, pady=(7, 0))
-        bar = app.frame(self.container)
+        bar = app.frame(self.container, "result_panel")
         bar.pack(fill="x", pady=(0, 6))
         app.label(bar, variable=self.summary, muted=True, size=9).pack(side="left")
         self.copy_button = app.button(bar, "复制输出", self.copy_output)
         self.copy_button.pack(side="right")
         self.copy_button.configure(state="disabled")
 
-        table = app.frame(self.container)
+        table = app.frame(self.container, "result_panel")
         table.pack(fill="x")
         self.tree = ttk.Treeview(table, columns=("activity", "status"), show="headings",
                                  height=6, selectmode="browse", style="Activity.Treeview")
@@ -145,10 +145,8 @@ class ActivityPanel:
         self.tree.heading("status", text="状态", anchor="w")
         self.tree.column("activity", minwidth=105, width=165, stretch=True)
         self.tree.column("status", width=73, minwidth=73, stretch=False)
-        scrollbar = ttk.Scrollbar(table, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=scrollbar.set)
-        scrollbar.pack(side="right", fill="y")
         self.tree.pack(side="left", fill="both", expand=True)
+        app.overlay_scrollbar(table, self.tree)
         self.tree.bind("<<TreeviewSelect>>", self.show_selected)
 
         detail, self.output_view = app.text_panel(self.container, mono=True, height=5)
@@ -160,8 +158,8 @@ class ActivityPanel:
                                  background=colors["field"], fieldbackground=colors["field"],
                                  foreground=colors["text"], borderwidth=0, rowheight=26)
         self.app.style.map("Activity.Treeview",
-                           background=[("selected", colors["border"])],
-                           foreground=[("selected", colors["text"])])
+                           background=[("selected", colors["selection"])],
+                           foreground=[("selected", colors["heading"])])
         self.app.style.configure("Activity.Treeview.Heading",
                                  background=colors["panel"], foreground=colors["muted"],
                                  padding=(6, 4), borderwidth=0)

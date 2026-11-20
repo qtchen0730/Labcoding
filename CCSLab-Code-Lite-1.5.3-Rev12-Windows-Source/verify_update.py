@@ -565,6 +565,18 @@ class UpdateUiTests(unittest.TestCase):
                 self.assertLess(gui.update_settings_notes_frame.winfo_height(), root.winfo_height())
                 self.assertEqual(gui.update_settings_download_button.master,
                                  gui.update_settings_download_actions)
+                viewport = next(bar.target for bar in gui.overlay_scrollbars
+                                if isinstance(bar.target, tk.Canvas)
+                                and bar.target.winfo_exists())
+                self.assertIn(viewport.cget("takefocus"), (True, "1"))
+                viewport.yview_moveto(0)
+                viewport.focus_force()
+                root.update()
+                viewport.event_generate("<KeyPress>", keysym="Next")
+                root.update()
+                self.assertGreater(viewport.yview()[0], 0)
+                viewport.yview_moveto(1.0)
+                root.update()
                 self.assertLess(gui.update_settings_download_button.winfo_rooty() +
                                 gui.update_settings_download_button.winfo_height(),
                                 root.winfo_rooty() + root.winfo_height())

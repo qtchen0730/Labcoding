@@ -119,10 +119,8 @@ class AdminPage:
         roster.pack(fill="both", expand=True)
         self.user_viewport = app.skin(tk.Canvas(roster, highlightthickness=0, borderwidth=0,
                                                 yscrollincrement=USER_SCROLL_STEP), "panel", None)
-        scroll = ttk.Scrollbar(roster, orient="vertical", command=self.user_viewport.yview)
-        scroll.pack(side="right", fill="y")
-        self.user_viewport.configure(yscrollcommand=scroll.set)
         self.user_viewport.pack(side="left", fill="both", expand=True)
+        app.overlay_scrollbar(roster, self.user_viewport)
         self.user_list = app.frame(self.user_viewport)
         window = self.user_viewport.create_window(0, 0, anchor="nw", window=self.user_list)
         self.user_viewport.bind("<Configure>", lambda event: self.user_viewport.itemconfigure(window, width=event.width))
@@ -176,8 +174,10 @@ class AdminPage:
             actions = app.frame(card, "field")
             actions.grid(row=2, column=0, columnspan=2, sticky="w", pady=(12, 0))
             for title, status in USER_STATUS_ACTIONS[user["status"]]:
+                style = ("Accent.TButton" if status == "active" else
+                         "Danger.TButton" if status == "rejected" else "TButton")
                 button = app.button(actions, title, lambda target=status: self.update_status(identity, target),
-                                    "Accent.TButton" if status == "active" else "TButton")
+                                    style)
                 button.pack(side="left", padx=(0, 8))
             app.button(actions, "重置登录密码", lambda: self.reset_password(identity)).pack(side="left")
             for button in actions.winfo_children():

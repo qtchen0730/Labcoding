@@ -33,15 +33,15 @@ class UserFeatures(unittest.TestCase):
 
     def test_sun_cycles_persists_and_gear_opens_settings(self):
         app = self.gui
-        self.assertEqual(app.theme.get(), "薄荷绿")
+        self.assertEqual(app.theme.get(), "Dark")
         self.assertEqual(app.result_tabs.tab(app.result_tabs.select(), "text"), "执行记录")
         self.assertGreater(len(app.theme_icon.find_all()), 8)
         self.assertEqual(str(app.settings_button.cget("compound")), "right")
         self.assertTrue(app.settings_button.cget("image"))
         app.theme_icon.event_generate("<Button-1>")
         self.root.update()
-        self.assertEqual(app.theme.get(), "晴空蓝")
-        self.assertEqual(app.prefs["theme"], "sky")
+        self.assertEqual(app.theme.get(), "Midnight")
+        self.assertEqual(app.prefs["theme"], "herdr-midnight")
         app.settings_button.invoke()
         self.root.update()
         self.assertEqual(app.current_page, "settings")

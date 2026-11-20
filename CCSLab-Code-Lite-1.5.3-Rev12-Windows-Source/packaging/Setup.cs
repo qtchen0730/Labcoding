@@ -159,7 +159,7 @@ static class Setup
             {
                 int code = error.HResult & 0xffff;
                 if (!(error is IOException || error is UnauthorizedAccessException) ||
-                    (code != 5 && code != 32 && code != 33) || attempt == delays.Length)
+                    (code != 5 && code != 32 && code != 33 && code != 1175) || attempt == delays.Length)
                     throw;
                 Thread.Sleep(delays[attempt]);
             }
@@ -217,8 +217,10 @@ static class Setup
             stream.Write(bytes, 0, bytes.Length);
             stream.Flush(true);
         }
-        if (File.Exists(journal)) File.Replace(temporary, journal, null);
-        else File.Move(temporary, journal);
+        // ReplaceFile error 1175 retains both original names, so retry is safe.
+        // Errors 1176/1177 can change names and must still fail into recovery.
+        if (File.Exists(journal)) RetryFileOperation(delegate { File.Replace(temporary, journal, null); });
+        else RetryFileOperation(delegate { File.Move(temporary, journal); });
     }
 
     static void CleanPayload(string folder)

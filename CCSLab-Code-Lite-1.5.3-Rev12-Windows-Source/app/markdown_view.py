@@ -1,6 +1,12 @@
 """Render CommonMark in a native Tk text widget."""
 
 from dataclasses import dataclass
+import ast
+import builtins
+import io
+import keyword
+import re
+import tokenize
 from urllib.parse import urlsplit
 import webbrowser
 
@@ -10,7 +16,28 @@ from markdown_it import MarkdownIt
 _PARSER = MarkdownIt("commonmark", {"html": False}).enable(["table", "strikethrough"])
 _HEADINGS = {"h1": 19, "h2": 16, "h3": 14, "h4": 12, "h5": 11, "h6": 10}
 _URL_TAG = "md:url:"
+_PATH_PATTERN = re.compile(
+    r"(?<![\w])(?:[A-Za-z]:[\\/](?:[^\\/\s<>:\"|?*]+[\\/])*[^\\/\s<>:\"|?*]+"
+    r"|(?:\.\.?[\\/])?[\w.-]+(?:[\\/][\w.-]+)+"
+    r"|[\w.-]+\.(?:py|pyw|js|jsx|ts|tsx|json|toml|yaml|yml|md|txt|sql|html|css|bat|ps1))"
+    r"(?![\w])",
+    re.IGNORECASE,
+)
 _BLOCKS = {"body", "list", "quote", "code", "code_label", "table", "table_head", "rule", *_HEADINGS}
+_SYNTAX_ROLES = {
+    "keyword": "code_keyword", "string": "code_string", "function": "code_function",
+    "type": "code_type", "number": "code_number", "comment": "code_comment",
+    "class": "code_class", "parameter": "code_parameter", "variable": "code_variable",
+    "builtin": "code_builtin", "constant": "code_constant", "decorator": "code_decorator",
+    "operator": "code_operator", "punctuation": "code_punctuation",
+}
+_PYTHON_TYPES = {"bool", "bytearray", "bytes", "complex", "dict", "float", "frozenset",
+                 "int", "list", "memoryview", "object", "range", "set", "str", "tuple", "type"}
+_NOTICE_PREFIXES = {
+    "error": re.compile(r"^(?:\[!CAUTION\]|\[!ERROR\]|错误[：:]|失败[：:]|error\s*:|❌)", re.I),
+    "warning": re.compile(r"^(?:\[!WARNING\]|\[!IMPORTANT\]|警告[：:]|注意[：:]|warning\s*:|⚠)", re.I),
+    "success": re.compile(r"^(?:\[!SUCCESS\]|成功[：:]|通过[：:]|success\s*:|✅)", re.I),
+}
 
 
 def configure_markdown(text, colors, font_family="Microsoft YaHei UI", zoom=0):
@@ -28,22 +55,36 @@ def configure_markdown(text, colors, font_family="Microsoft YaHei UI", zoom=0):
                     )
                     text.tag_configure(_font(role, bold, italic, code), font=font)
 
-    text.tag_configure("md:body", spacing1=2, spacing2=3, spacing3=7)
+    text.tag_configure("md:body", foreground=colors["text"], spacing1=2, spacing2=3, spacing3=7)
     text.tag_configure("md:list", spacing1=1, spacing2=3, spacing3=4)
-    text.tag_configure("md:quote", foreground=colors["muted"], spacing2=3, spacing3=5)
+    text.tag_configure("md:quote", foreground=colors.get("quote", colors["muted"]),
+                       spacing2=3, spacing3=5, lmargin1=14, lmargin2=14)
     for heading in _HEADINGS:
-        text.tag_configure(f"md:{heading}", foreground=colors["text"], spacing1=10, spacing3=5)
+        level = int(heading[1])
+        text.tag_configure(f"md:{heading}", foreground=colors.get(f"heading_{min(level, 4)}", colors["text"]),
+                           spacing1=10, spacing3=5)
 
     code_bg = colors.get("code", colors["bg"])
     text.tag_configure("md:code", background=code_bg, foreground=colors["text"], spacing2=1)
     text.tag_configure("md:code_label", background=code_bg, foreground=colors["muted"],
                        spacing1=7, spacing3=4)
-    text.tag_configure("md:inline_code", background=code_bg, foreground=colors["heading"])
+    text.tag_configure("md:inline_code", background=code_bg,
+                       foreground=colors.get("inline_code", colors["heading"]))
+    text.tag_configure("md:strong", foreground=colors.get("strong", colors["heading"]))
+    text.tag_configure("md:emphasis", foreground=colors["emphasis"])
+    for role in _NOTICE_PREFIXES:
+        text.tag_configure(f"md:{role}", foreground=colors[role])
+    text.tag_configure("md:list_marker", foreground=colors.get("list_marker", colors["heading"]),
+                       font=(font_family, 11, "bold"))
+    for role, token_role in _SYNTAX_ROLES.items():
+        text.tag_configure(f"md:syntax:{role}", foreground=colors.get(token_role, colors["heading"]))
     text.tag_configure("md:table", spacing1=4, spacing3=3)
     text.tag_configure("md:table_head", background=code_bg, foreground=colors["text"],
                        spacing1=6, spacing3=6)
     text.tag_configure("md:rule", foreground=colors["border"], spacing1=5, spacing3=5)
-    text.tag_configure("md:link", foreground=colors["heading"], underline=True)
+    text.tag_configure("md:link", foreground=colors.get("link", colors["heading"]), underline=True)
+    text.tag_configure("md:path", foreground=colors.get("path", colors["heading"]))
+    text.tag_configure("md:filename", foreground=colors.get("filename", colors["heading"]))
     text.tag_configure("md:strike", overstrike=True)
 
     for level in range(1, 9):
@@ -54,6 +95,9 @@ def configure_markdown(text, colors, font_family="Microsoft YaHei UI", zoom=0):
     text.tag_bind("md:link", "<Enter>", lambda _event: text.configure(cursor="hand2"))
     text.tag_bind("md:link", "<Leave>", lambda _event: text.configure(cursor="xterm"))
     text.tag_bind("md:link", "<ButtonRelease-1>", lambda event: _follow_link(text, event))
+    for role in ("emphasis", "strong", *_NOTICE_PREFIXES, "inline_code", "path", "filename",
+                 "link", "list_marker", *_SYNTAX_ROLES):
+        text.tag_raise(f"md:{'syntax:' if role in _SYNTAX_ROLES else ''}{role}")
 
 
 def _font(role, bold, italic, code):
@@ -145,13 +189,28 @@ class _Layout:
                 if index == 0 and first_skip:
                     value = value[first_skip:]
                 tags = [*extra, _font(role, bool(bold), bool(italic), code)]
+                if bold:
+                    tags.append("md:strong")
+                if italic:
+                    tags.append("md:emphasis")
                 if code:
                     tags.append("md:inline_code")
+                    if _PATH_PATTERN.fullmatch(value):
+                        tags.append("md:path" if "/" in value or "\\" in value else "md:filename")
                 if strike:
                     tags.append("md:strike")
                 if link:
                     tags.extend(("md:link", _URL_TAG + link))
-                self.emit(value, role, *tags)
+                if kind == "text" and value and not link:
+                    cursor = 0
+                    for match in _PATH_PATTERN.finditer(value):
+                        self.emit(value[cursor:match.start()], role, *tags)
+                        tag = "md:path" if any(separator in match.group() for separator in ("/", "\\")) else "md:filename"
+                        self.emit(match.group(), role, *tags, tag)
+                        cursor = match.end()
+                    self.emit(value[cursor:], role, *tags)
+                else:
+                    self.emit(value, role, *tags)
 
     def indent(self, *, increment=0, bullet=False):
         level = min(8, self.quotes + len(self.lists) + increment)
@@ -162,7 +221,7 @@ class _Layout:
 
     def list_prefix(self, role, extra):
         if self.lists and self.lists[-1].prefix:
-            self.emit(self.lists[-1].prefix + "\u2002", role, *extra)
+            self.emit(self.lists[-1].prefix + "\u2002", role, *extra, "md:list_marker")
             self.lists[-1].prefix = ""
 
     def token(self, token):
@@ -210,6 +269,13 @@ class _Layout:
         role = self.heading or ("list" if self.lists else "quote" if self.quotes else "body")
         bullet = bool(self.lists and self.lists[-1].prefix)
         extra = self.indent(increment=bool(self.lists and not bullet), bullet=bullet)
+        # Only explicit leading labels/alert markers imply status; ordinary prose does not.
+        if not self.heading:
+            plain = "".join(token.content for token in tokens if token.type in {"text", "code_inline"}).lstrip()
+            for notice, pattern in _NOTICE_PREFIXES.items():
+                if pattern.match(plain):
+                    extra = (*extra, f"md:{notice}")
+                    break
         skip = 0
         if bullet and self.lists[-1].counter is None and tokens and tokens[0].type == "text":
             marker = tokens[0].content[:4].lower()
@@ -229,8 +295,147 @@ class _Layout:
         language = (token.info.split(maxsplit=1) or ["代码"])[0][:36]
         self.emit(language + "\n", "code_label", *extra, _font("code_label", False, False, False))
         content = token.content
-        self.emit(content if content.endswith("\n") else content + "\n", "code",
-                  *extra, _font("code", False, False, False))
+        content = content if content.endswith("\n") else content + "\n"
+        base_tags = (*extra, _font("code", False, False, False))
+        spans = _python_highlight_spans(content) if language.lower() in {"py", "python", "python3"} else ()
+        cursor = 0
+        for start, end, role in spans:
+            if start > cursor:
+                self.emit(content[cursor:start], "code", *base_tags)
+            self.emit(content[start:end], "code", *base_tags, f"md:syntax:{role}")
+            cursor = end
+        self.emit(content[cursor:], "code", *base_tags)
+
+
+def _python_highlight_spans(source):
+    """Color Python tokens without executing code; AST adds parameter scopes when parseable."""
+    lines = source.splitlines(keepends=True)
+    offsets = [0]
+    for line in lines:
+        offsets.append(offsets[-1] + len(line))
+
+    def offset(position):
+        row, column = position
+        return min(len(source), offsets[min(max(0, row - 1), len(offsets) - 1)] + column)
+
+    try:
+        tokens = list(tokenize.generate_tokens(io.StringIO(source).readline))
+    except (IndentationError, SyntaxError, tokenize.TokenError):
+        return ()
+
+    parameter_positions = set()
+    classes = set()
+    functions = set()
+
+    def position(node):
+        # AST columns are UTF-8 byte offsets; Tk/tokenize use character offsets.
+        prefix = lines[node.lineno - 1].encode("utf-8")[:node.col_offset]
+        return node.lineno, len(prefix.decode("utf-8"))
+
+    class Parameters(ast.NodeVisitor):
+        def __init__(self):
+            self.scopes = []
+
+        def visit_Name(self, node):
+            if any(node.id in scope for scope in reversed(self.scopes)):
+                parameter_positions.add(position(node))
+
+        def function(self, node):
+            args = node.args
+            arguments = [*args.posonlyargs, *args.args, *args.kwonlyargs]
+            arguments += [arg for arg in (args.vararg, args.kwarg) if arg is not None]
+            for value in (*args.defaults, *args.kw_defaults,
+                          *getattr(node, "decorator_list", ()), getattr(node, "returns", None)):
+                if value is not None:
+                    self.visit(value)
+            for argument in arguments:
+                parameter_positions.add(position(argument))
+                if argument.annotation is not None:
+                    self.visit(argument.annotation)
+            self.scopes.append({arg.arg for arg in arguments})
+            if isinstance(node, ast.Lambda):
+                self.visit(node.body)
+            else:
+                for statement in node.body:
+                    self.visit(statement)
+            self.scopes.pop()
+
+        visit_FunctionDef = function
+        visit_AsyncFunctionDef = function
+        visit_Lambda = function
+
+        def visit_keyword(self, node):
+            if node.arg is not None:
+                parameter_positions.add(position(node))
+            self.visit(node.value)
+
+    try:
+        tree = ast.parse(source)
+        classes = {node.name for node in ast.walk(tree) if isinstance(node, ast.ClassDef)}
+        functions = {node.name for node in ast.walk(tree)
+                     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        Parameters().visit(tree)
+    except (SyntaxError, ValueError, RecursionError):
+        # Partial streamed snippets still receive lexical highlighting.
+        pass
+
+    significant = [token for token in tokens if token.type not in {
+        tokenize.ENCODING, tokenize.ENDMARKER, tokenize.INDENT, tokenize.DEDENT,
+        tokenize.NL, tokenize.NEWLINE}]
+    spans = []
+    decorator = False
+    for index, token in enumerate(significant):
+        kind = token.type
+        previous = significant[index - 1].string if index else ""
+        following = significant[index + 1].string if index + 1 < len(significant) else ""
+        if index and token.start[0] != significant[index - 1].end[0]:
+            decorator = False
+        role = None
+        if kind == tokenize.NAME:
+            if previous == "class":
+                role = "class"
+            elif previous == "def":
+                role = "function"
+            elif token.string in {"True", "False", "None"}:
+                role = "constant"
+            elif token.string in keyword.kwlist:
+                role = "keyword"
+            elif decorator:
+                role = "decorator"
+            elif token.start in parameter_positions:
+                role = "parameter"
+            elif token.string in classes:
+                role = "class"
+            elif token.string in functions:
+                role = "function"
+            elif token.string.isupper():
+                role = "constant"
+            elif token.string in _PYTHON_TYPES:
+                role = "type"
+            elif token.string in vars(builtins) and previous != ".":
+                role = "builtin"
+            elif following == "(":
+                role = "function"
+            else:
+                role = "variable"
+        elif kind == tokenize.STRING or tokenize.tok_name.get(kind, "").startswith("FSTRING_"):
+            role = "string"
+        elif kind == tokenize.NUMBER:
+            role = "number"
+        elif kind == tokenize.COMMENT:
+            role = "comment"
+        elif kind == tokenize.OP:
+            if token.string == "@" and not token.line[:token.start[1]].strip():
+                decorator = True
+                role = "decorator"
+            else:
+                role = "punctuation" if token.string in {"(", ")", "[", "]", "{", "}", ":", ",", ".", ";"} else "operator"
+            if token.string == "(":
+                decorator = False
+        start, end = offset(token.start), offset(token.end)
+        if role and end > start:
+            spans.append((start, end, role))
+    return tuple(spans)
 
 
 def insert_markdown(text, source):

@@ -2,6 +2,8 @@
 
 import argparse
 from collections import deque
+import ctypes
+from ctypes import wintypes
 from datetime import datetime
 import hashlib
 import json
@@ -11,6 +13,7 @@ from queue import Empty, Queue
 from threading import Event, Lock, Thread
 from time import monotonic, time
 import tkinter as tk
+from tkinter import font as tkfont
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from uuid import uuid4
 from versioning import read_version_info
@@ -44,6 +47,265 @@ from approval_policy import SessionGrants, session_scope, replacement_details_co
 
 FONT = "Microsoft YaHei UI"
 APP_VERSION_INFO = read_version_info()
+
+
+def _colorref(value):
+    value = value.lstrip("#")
+    red, green, blue = (int(value[index:index + 2], 16) for index in (0, 2, 4))
+    return (blue << 16) | (green << 8) | red
+
+
+def apply_windows_titlebar(window, colors):
+    """Apply supported DWM title-bar attributes to Tk's actual top-level HWND."""
+    try:
+        if window.tk.call("tk", "windowingsystem") not in ("win", "win32"):
+            return False
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+        user32.GetAncestor.restype = wintypes.HWND
+        hwnd = user32.GetAncestor(wintypes.HWND(window.winfo_id()), 2)
+        if not hwnd:
+            return False
+        dwmapi = ctypes.WinDLL("dwmapi", use_last_error=True)
+        dwmapi.DwmSetWindowAttribute.argtypes = [
+            wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
+        ]
+        dwmapi.DwmSetWindowAttribute.restype = wintypes.HRESULT
+
+        def set_attribute(attribute, value):
+            return dwmapi.DwmSetWindowAttribute(
+                hwnd, attribute, ctypes.byref(value), ctypes.sizeof(value)) == 0
+
+        rgb = colors["bg"].lstrip("#")
+        dark = wintypes.BOOL(sum(int(rgb[index:index + 2], 16) for index in (0, 2, 4)) < 435)
+        dark_ok = set_attribute(20, dark) or set_attribute(19, dark)
+        caption = wintypes.DWORD(_colorref(colors["header"]))
+        foreground = wintypes.DWORD(_colorref(colors["text"]))
+        caption_ok = set_attribute(35, caption)
+        text_ok = set_attribute(36, foreground)
+        return dark_ok or caption_ok or text_ok
+    except (AttributeError, OSError, tk.TclError, TypeError, ValueError):
+        # Unsupported Windows builds retain the native title bar and all WM behavior.
+        return False
+
+
+class OverlayScrollbar:
+    """A narrow, auto-hiding Canvas thumb layered over an existing y/x view."""
+
+    def __init__(self, app, parent, target, orient="vertical", width=7):
+        self.app = app
+        self.parent = parent
+        self.target = target
+        self.orient = orient
+        self.width = width
+        self.colors = app.colors
+        self.first = 0.0
+        self.last = 1.0
+        self.thumb_start = 0
+        self.thumb_size = 0
+        self.drag_offset = 0
+        self.dragging = False
+        self.hovered = False
+        self.wheel_delta = 0
+        self.hide_after = None
+        self.hide_token = None
+        self.closed = False
+        self.canvas = tk.Canvas(parent, width=width if orient == "vertical" else 1,
+                                height=width if orient == "horizontal" else 1,
+                                borderwidth=0, highlightthickness=0, takefocus=False)
+        self.thumb = self.canvas.create_rectangle(0, 0, 0, 0, outline="")
+        self.canvas.bind("<Enter>", self._enter)
+        self.canvas.bind("<Leave>", self._leave)
+        self.canvas.bind("<ButtonPress-1>", self._press)
+        self.canvas.bind("<B1-Motion>", self._drag)
+        self.canvas.bind("<ButtonRelease-1>", self._release)
+        self.canvas.bind("<MouseWheel>", self._wheel)
+        self.canvas.bind("<Configure>", lambda _event: self._draw())
+        target_bindings = []
+        for sequence, callback in (("<Enter>", self._enter), ("<Leave>", self._leave),
+                                   ("<Destroy>", self._target_destroy)):
+            binding = target.bind(sequence, callback, add="+")
+            if binding:
+                target_bindings.append((sequence, binding))
+        self.target_bindings = target_bindings
+        parent.bind("<Destroy>", self._parent_destroy, add="+")
+        self.parent_binding = None
+        self.refresh_command = target.yview if orient == "vertical" else target.xview
+        target.configure(**{"yscrollcommand" if orient == "vertical" else "xscrollcommand": self.set})
+        self.theme(self.colors)
+
+    def theme(self, colors):
+        self.colors = colors
+        try:
+            self.canvas.configure(background=self.parent.cget("background"))
+            self.canvas.itemconfigure(self.thumb, fill=colors["scrollbar_thumb"])
+            self._draw()
+        except tk.TclError:
+            self.close()
+
+    def _place(self):
+        if self.closed or self.canvas.winfo_ismapped():
+            return
+        if self.orient == "vertical":
+            self.canvas.place(relx=1.0, x=-self.width, y=2, relheight=1.0,
+                              height=-4, width=self.width)
+        else:
+            self.canvas.place(relx=0.0, rely=1.0, x=2, y=-self.width,
+                              relwidth=1.0, width=-4, height=self.width)
+        self.canvas.tk.call("raise", self.canvas._w)
+
+    def set(self, first, last):
+        if self.closed:
+            return
+        try:
+            self.first, self.last = float(first), float(last)
+            if self.last - self.first >= .999:
+                self._cancel_hide()
+                self.canvas.place_forget()
+                return
+            self._place()
+            self._draw()
+            if not self.hovered and not self.dragging:
+                self._schedule_hide()
+        except (tk.TclError, TypeError, ValueError):
+            self.close()
+
+    def _draw(self):
+        if self.closed or not self.canvas.winfo_exists():
+            return
+        if self.orient == "vertical":
+            length = max(0, self.canvas.winfo_height())
+        else:
+            length = max(0, self.canvas.winfo_width())
+        if length <= 1:
+            return
+        minimum = min(24, length)
+        self.thumb_size = max(minimum, round(length * max(0.0, self.last - self.first)))
+        self.thumb_size = min(length, self.thumb_size)
+        travel = max(0, length - self.thumb_size)
+        self.thumb_start = round(travel * self.first / max(.0001, 1.0 - (self.last - self.first)))
+        self.thumb_start = min(travel, max(0, self.thumb_start))
+        if self.orient == "vertical":
+            self.canvas.coords(self.thumb, 1, self.thumb_start, self.width - 1,
+                               self.thumb_start + self.thumb_size)
+        else:
+            self.canvas.coords(self.thumb, self.thumb_start, 1,
+                               self.thumb_start + self.thumb_size, self.width - 1)
+
+    def _enter(self, _event=None):
+        self.hovered = True
+        self._cancel_hide()
+        if self.last - self.first < .999:
+            self._place()
+            self._draw()
+            self.canvas.itemconfigure(self.thumb, fill=self.colors["scrollbar_hover"])
+
+    def _leave(self, _event=None):
+        self.hovered = False
+        if not self.dragging:
+            self._schedule_hide()
+
+    def _schedule_hide(self):
+        self._cancel_hide()
+        try:
+            self.app.overlay_hide_serial += 1
+            token = str(self.app.overlay_hide_serial)
+            self.app.overlay_hide_targets[token] = self
+            self.hide_token = token
+            self.hide_after = self.app.root.tk.call(
+                "after", 850, self.app.overlay_hide_command, token)
+        except tk.TclError:
+            self.close()
+
+    def _cancel_hide(self):
+        if self.hide_after is not None:
+            try:
+                self.app.root.tk.call("after", "cancel", self.hide_after)
+            except tk.TclError:
+                pass
+            self.hide_after = None
+        if self.hide_token is not None:
+            self.app.overlay_hide_targets.pop(self.hide_token, None)
+            self.hide_token = None
+
+    def _hide(self):
+        self._cancel_hide()
+        if not self.hovered and not self.dragging and not self.closed:
+            try:
+                self.canvas.place_forget()
+            except tk.TclError:
+                self.close()
+
+    def _press(self, event):
+        coordinate = event.y if self.orient == "vertical" else event.x
+        if not (self.thumb_start <= coordinate <= self.thumb_start + self.thumb_size):
+            self._move_to(coordinate - self.thumb_size / 2)
+        self.dragging = True
+        self.drag_offset = coordinate - self.thumb_start
+        self.canvas.itemconfigure(self.thumb, fill=self.colors["scrollbar_hover"])
+
+    def _drag(self, event):
+        if not self.dragging:
+            return
+        coordinate = event.y if self.orient == "vertical" else event.x
+        self._move_to(coordinate - self.drag_offset)
+
+    def _move_to(self, start):
+        length = self.canvas.winfo_height() if self.orient == "vertical" else self.canvas.winfo_width()
+        travel = max(1, length - self.thumb_size)
+        fraction = min(1.0, max(0.0, start / travel))
+        try:
+            view = self.target.yview_moveto if self.orient == "vertical" else self.target.xview_moveto
+            view(fraction)
+        except tk.TclError:
+            self.close()
+
+    def _release(self, _event):
+        self.dragging = False
+        if self.hovered:
+            self.canvas.itemconfigure(self.thumb, fill=self.colors["scrollbar_hover"])
+        else:
+            self.canvas.itemconfigure(self.thumb, fill=self.colors["scrollbar_thumb"])
+            self._schedule_hide()
+
+    def _wheel(self, event):
+        if self.orient == "vertical" and event.delta:
+            self.wheel_delta += event.delta
+            steps = int(self.wheel_delta / 120)
+            self.wheel_delta -= steps * 120
+            if not steps:
+                return "break"
+            try:
+                self.target.yview_scroll(-steps, "units")
+            except tk.TclError:
+                self.close()
+            return "break"
+        return None
+
+    def _target_destroy(self, event):
+        if event.widget is self.target:
+            self.close()
+
+    def _parent_destroy(self, event):
+        if event.widget is self.parent:
+            self.close()
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        self._cancel_hide()
+        for sequence, binding in self.target_bindings:
+            try:
+                self.target.unbind(sequence, binding)
+            except tk.TclError:
+                pass
+        try:
+            if self.canvas.winfo_exists():
+                self.canvas.destroy()
+        except tk.TclError:
+            pass
+        self.app.overlay_scrollbars = [item for item in self.app.overlay_scrollbars if item is not self]
 
 
 def read_json(path, default):
@@ -200,13 +462,20 @@ class App:
         self.strict = tk.BooleanVar(value=self.prefs.get("strict", False))
         self.theme = tk.StringVar(value=THEMES[theme_key(self.prefs.get("theme"))][0])
         self.themed = []
+        self.overlay_scrollbars = []
+        self.overlay_hide_targets = {}
+        self.overlay_hide_serial = 0
+        self.overlay_hide_command = self.root.register(self._dispatch_overlay_hide)
         self.style = ttk.Style()
         self.style.theme_use("clam")
+        self.colors = THEMES[theme_key(self.theme.get())][1]
+        self.titlebar_after = {}
         root.title("CCSLab Labcoding")
         apply_window_icon(root)
         root.geometry(f"{min(1748, root.winfo_screenwidth() - 70)}x{min(1228, root.winfo_screenheight() - 130)}")
-        root.minsize(950, 580)
+        root.minsize(760, 540)
         root.protocol("WM_DELETE_WINDOW", self.close)
+        root.bind_all("<Map>", self.apply_titlebar_to_mapped_window, add="+")
         self.build()
         self.apply_theme()
         self.show_page("access", force=True)
@@ -251,7 +520,15 @@ class App:
             font=(FONT, size, "bold" if bold else "normal")), bg, color)
 
     def frame(self, parent, bg="panel", **kwargs):
-        return self.skin(tk.Frame(parent, **kwargs), bg, None)
+        semantic = dict(kwargs)
+        for option in ("background", "highlightbackground", "highlightcolor"):
+            value = kwargs.get(option)
+            if isinstance(value, str) and value in self.colors:
+                kwargs[option] = self.colors[value]
+        semantic_colors = {key: value for key, value in semantic.items()
+                           if key in {"background", "highlightbackground", "highlightcolor"}
+                           and isinstance(value, str) and value in self.colors}
+        return self.skin(tk.Frame(parent, **kwargs), bg, None, **semantic_colors)
 
     def button(self, parent, text, command, style="TButton"):
         return ttk.Button(parent, text=text, command=command, style=style)
@@ -263,13 +540,9 @@ class App:
                       highlightthickness=0, padx=12, pady=9,
                       font=("Consolas" if mono else FONT, text_size), spacing1=2, spacing3=3)
         self.skin(box, background, "text", insertbackground="text", selectbackground="border")
-        vertical = ttk.Scrollbar(holder, command=box.yview)
-        vertical.pack(side="right", fill="y")
-        box.configure(yscrollcommand=vertical.set)
+        self.overlay_scrollbar(holder, box)
         if wrap == "none":
-            horizontal = ttk.Scrollbar(holder, orient="horizontal", command=box.xview)
-            horizontal.pack(side="bottom", fill="x")
-            box.configure(xscrollcommand=horizontal.set)
+            self.overlay_scrollbar(holder, box, orient="horizontal")
         box.pack(side="left", fill="both", expand=True)
         if not editable:
             box.configure(state="disabled")
@@ -459,7 +732,7 @@ class App:
                                                command=lambda ticket_id=ticket["id"]:
                                                self.finish_approval(False, ticket_id=ticket_id))
         self.task_state.set("等待审批")
-        self.approval_panel.pack(fill="x", padx=12, pady=(4, 0), before=self.composer_separator)
+        self.approval_panel.pack(fill="x", padx=12, pady=(4, 0), before=self.composer_anchor)
         if self.approval_key_bindings is None:
             self.approval_key_bindings = (
                 self.root.bind_all("<KeyPress-Return>", self.approval_enter, add="+"),
@@ -467,7 +740,7 @@ class App:
                 self.root.bind_all("<KeyPress-Escape>", self.approval_escape, add="+"),
                 self.root.bind_all("<KeyRelease-Escape>", self.approval_enter_released, add="+"),
             )
-        self.root.after_idle(lambda ticket_id=ticket["id"]: self.focus_approval(ticket_id))
+        self.schedule("approval_focus", 0, lambda ticket_id=ticket["id"]: self.focus_approval(ticket_id))
 
     def focus_approval(self, ticket_id):
         ticket = self.active_approval
@@ -565,39 +838,80 @@ class App:
     def list_widget(self, parent, height, background="field"):
         result = tk.Listbox(parent, height=height, activestyle="none", borderwidth=0,
                             font=(FONT, 10), highlightthickness=0, exportselection=False)
-        return self.skin(result, background, "text", selectbackground="soft", selectforeground="heading")
+        return self.skin(result, background, "text", selectbackground="selection", selectforeground="heading")
 
     def scroll_list(self, parent, height, background="field"):
         holder = self.frame(parent, background)
         listing = self.list_widget(holder, height, background)
-        scroll = ttk.Scrollbar(holder, command=listing.yview)
-        scroll.pack(side="right", fill="y")
-        listing.configure(yscrollcommand=scroll.set)
         listing.pack(side="left", fill="both", expand=True)
+        self.overlay_scrollbar(holder, listing)
         return holder, listing
+
+    def overlay_scrollbar(self, parent, target, orient="vertical"):
+        scrollbar = OverlayScrollbar(self, parent, target, orient=orient)
+        self.overlay_scrollbars.append(scrollbar)
+        return scrollbar
+
+    def _dispatch_overlay_hide(self, token):
+        scrollbar = self.overlay_hide_targets.pop(token, None)
+        if scrollbar is not None:
+            scrollbar._hide()
+
+    def apply_titlebar_to_mapped_window(self, event):
+        try:
+            window = event.widget
+            if isinstance(window, (tk.Tk, tk.Toplevel)) and window.winfo_exists():
+                self.schedule_titlebar(window)
+                if window is self.root and self.current_page == "workspace":
+                    self.schedule_workspace_layout(650)
+        except tk.TclError:
+            pass
+
+    def schedule_titlebar(self, window):
+        key = str(window)
+        previous = self.titlebar_after.pop(key, None)
+        if previous:
+            try:
+                previous[0].after_cancel(previous[1])
+            except tk.TclError:
+                pass
+
+        def apply():
+            self.titlebar_after.pop(key, None)
+            try:
+                if window.winfo_exists():
+                    apply_windows_titlebar(window, self.colors)
+            except tk.TclError:
+                pass
+
+        try:
+            self.titlebar_after[key] = (window, window.after_idle(apply))
+        except tk.TclError:
+            pass
 
     def build(self):
         self.skin(self.root, "bg", None)
-        bar = self.frame(self.root)
+        bar = self.frame(self.root, "header")
         bar.pack(fill="x")
-        self.label(bar, "CCSLab Labcoding", size=15, bold=True).pack(side="left", padx=(17, 19), pady=13)
-        self.workspace_button = self.button(bar, "工作台", lambda: self.show_page("workspace"), "Nav.TButton")
+        self.label(bar, "CCSLab Labcoding", bg="header", size=14, bold=True).pack(
+            side="left", padx=(16, 16), pady=10)
+        self.workspace_button = self.button(bar, "工作台", lambda: self.show_page("workspace"), "Header.Nav.TButton")
         self.workspace_button.pack(side="left", padx=(0, 4))
         footer = self.frame(self.root)
         footer.pack(side="bottom", fill="x")
         self.settings_button = self.button(footer, "设置", lambda: self.show_page("settings"), "Nav.TButton")
         self.settings_button.configure(compound="right", width=0)
-        self.settings_button.pack(side="left", padx=(13, 12), pady=8)
+        self.settings_button.pack(side="left", padx=(12, 10), pady=7)
         self.settings_icon_palette = None
         self.quota_label = self.label(footer, variable=self.quota_text, color="heading", size=9)
-        self.admin_button = self.button(bar, "管理控制台", lambda: self.show_page("admin"), "Nav.TButton")
-        self.connection_button = self.button(bar, "登录 / 注册", self.account_action, "Nav.TButton")
+        self.admin_button = self.button(bar, "管理控制台", lambda: self.show_page("admin"), "Header.Nav.TButton")
+        self.connection_button = self.button(bar, "登录 / 注册", self.account_action, "Header.Nav.TButton")
         self.connection_button.pack(side="right", padx=(7, 15))
-        self.role_button = self.button(bar, "切换角色", self.change_role, "Nav.TButton")
+        self.role_button = self.button(bar, "切换角色", self.change_role, "Header.Nav.TButton")
         theme_gap = round((72 / 2.54) * float(self.root.tk.call("tk", "scaling")))
-        identity = self.frame(bar)
+        identity = self.frame(bar, "header")
         identity.pack(side="right", padx=(6, 4))
-        self.theme_control = self.frame(identity)
+        self.theme_control = self.frame(identity, "header")
         self.theme_control.pack(side="left")
         self.theme_label = self.button(self.theme_control, "更换主题色", self.cycle_theme,
                                        "HeaderTheme.TButton")
@@ -605,55 +919,84 @@ class App:
         self.theme_label.configure(cursor="hand2")
         self.theme_icon = ActionIcon(self, self.theme_control, "sun", self.cycle_theme)
         self.theme_icon.pack(side="left")
-        self.status_label = self.label(identity, variable=self.status, muted=True)
+        self.status_label = self.label(identity, variable=self.status, muted=True, bg="header")
         self.status_label.pack(side="left", padx=(theme_gap, 0))
-        ttk.Separator(self.root).pack(fill="x")
-
         self.page_host = self.frame(self.root, "bg")
         self.page_host.pack(fill="both", expand=True)
-        panes = self.workspace_view = tk.PanedWindow(self.page_host, orient="horizontal", bd=0, sashwidth=6, sashpad=0)
+        panes = self.workspace_view = tk.PanedWindow(
+            self.page_host, orient="horizontal", bd=0, sashwidth=1, sashpad=0,
+            showhandle=False, opaqueresize=True,
+        )
+        self._workspace_width = 0
+        self.workspace_layout_attempts = 0
+        self.root.bind("<Configure>", self.on_root_configure, add="+")
         self.current_page = None
         self.page_panel = None
         self.page_controller = None
         self.settings_admin = False
         self.skin(panes, "bg", None)
-        side = self.frame(panes, "side")
+        side = self.workspace_side = self.frame(panes, "side")
         center = self.frame(panes)
-        right = self.results_pane = self.frame(panes)
-        panes.add(side, width=421, minsize=182, stretch="never")
-        panes.add(center, minsize=365, stretch="always")
+        right = self.results_pane = self.frame(panes, "side")
+        panes.add(side, width=296, minsize=160, stretch="always")
+        panes.add(center, minsize=320, stretch="always")
         if self.results_visible:
-            panes.add(right, width=372, minsize=278, stretch="never")
-        project_head = self.frame(side, "side")
-        project_head.pack(fill="x", padx=14, pady=(15, 1))
-        self.label(project_head, "项目", bg="side", size=13, bold=True).pack(side="left")
-        project_actions = self.frame(side, "side")
-        project_actions.pack(fill="x", padx=12, pady=(10, 9))
+            panes.add(right, width=300, minsize=205, stretch="always")
+        self.project_group = self.frame(side, "sidebar_card", highlightthickness=1,
+                                        highlightbackground="sidebar_card_line", highlightcolor="focus")
+        self.project_group.pack(fill="x", padx=8, pady=(8, 6))
+        project_head = self.frame(self.project_group, "sidebar_card")
+        project_head.pack(fill="x", padx=10, pady=(9, 3))
+        self.label(project_head, "项目", bg="sidebar_card", size=12, bold=True).pack(side="left")
+        project_actions = self.frame(self.project_group, "sidebar_card")
+        project_actions.pack(fill="x", padx=8, pady=(3, 5))
+        project_actions.columnconfigure(0, weight=1, uniform="project-buttons")
+        project_actions.columnconfigure(1, weight=1, uniform="project-buttons")
         self.new_project_button = self.button(project_actions, "＋ 新建项目", self.new_project)
-        self.new_project_button.pack(side="left", fill="x", expand=True, padx=(0, 4))
+        self.new_project_button.grid(row=0, column=0, sticky="ew", padx=(0, 4))
         self.open_button = self.button(project_actions, "打开", self.choose_project)
-        self.open_button.pack(side="right")
-        recent_head = self.frame(side, "side")
-        recent_head.pack(fill="x", padx=13, pady=(6, 5))
-        self.label(recent_head, "最近项目", bold=True, bg="side", muted=True).pack(side="left")
-        self.remove_recent_button = self.button(recent_head, "删除", self.remove_recent)
-        self.remove_recent_button.pack(side="right")
-        recent_panel, self.recent_list = self.scroll_list(side, 5, "side")
-        recent_panel.pack(fill="x", padx=12)
+        self.open_button.grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        recent_head = self.frame(self.project_group, "sidebar_card")
+        recent_head.pack(fill="x", padx=8, pady=(3, 4))
+        recent_head.columnconfigure(0, weight=1, uniform="project-buttons")
+        recent_head.columnconfigure(1, weight=1, uniform="project-buttons")
+        self.label(recent_head, "最近项目", bold=True, bg="sidebar_card", muted=True).grid(
+            row=0, column=0, sticky="w")
+        self.remove_recent_button = self.button(recent_head, "删除", self.remove_recent, "Danger.TButton")
+        self.remove_recent_button.grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        scale = float(self.root.tk.call("tk", "scaling"))
+        # Keep the previous 3cm gain and add another 3cm, scaled in physical units.
+        extra_pixels = round((6 * 72 / 2.54) * scale)
+        row_height = tkfont.Font(root=self.root, font=(FONT, 10)).metrics("linespace") + 2
+        self.recent_base_rows = 5
+        self.recent_extra_rows = max(1, round(extra_pixels / max(1, row_height)))
+        self.recent_row_height = row_height
+        recent_panel, self.recent_list = self.scroll_list(
+            self.project_group, self.recent_base_rows + self.recent_extra_rows, "sidebar_card")
+        recent_panel.pack(fill="x", padx=8, pady=(0, 8))
+        side.bind("<Configure>", self.resize_project_list, add="+")
         self.recent_list.bind("<Double-Button-1>", self.open_recent)
         self.recent_list.bind("<Return>", self.open_recent)
         self.recent_list.bind("<<ListboxSelect>>", lambda _event: self.update_delete_actions())
-        self.new_button = self.button(side, "新建会话", self.new_session)
-        self.new_button.pack(fill="x", padx=13, pady=(16, 8))
-        self.label(side, "搜索会话", bold=True, bg="side", muted=True).pack(fill="x", padx=13, pady=(4, 5))
-        ttk.Entry(side, textvariable=self.session_search).pack(fill="x", padx=13, pady=(0, 6))
-        session_head = self.frame(side, "side")
-        session_head.pack(fill="x", padx=13, pady=(4, 5))
-        self.label(session_head, "历史会话", bold=True, bg="side", muted=True).pack(side="left")
-        self.delete_session_button = self.button(session_head, "删除", self.delete_session)
-        self.delete_session_button.pack(side="right")
-        session_panel, self.session_list = self.scroll_list(side, 7, "side")
-        session_panel.pack(fill="both", expand=True, padx=12, pady=(0, 13))
+        self.session_group = self.frame(side, "sidebar_card", highlightthickness=1,
+                                        highlightbackground="sidebar_card_line", highlightcolor="focus")
+        self.session_group.pack(fill="both", expand=True, padx=8, pady=(6, 8))
+        self.new_button = self.button(self.session_group, "新建会话", self.new_session)
+        self.new_button.pack(fill="x", padx=8, pady=(8, 5))
+        self.label(self.session_group, "搜索会话", bold=True, bg="sidebar_card", muted=True).pack(
+            fill="x", padx=8, pady=(3, 4))
+        ttk.Entry(self.session_group, textvariable=self.session_search).pack(
+            fill="x", padx=8, pady=(0, 6))
+        session_head = self.frame(self.session_group, "sidebar_card")
+        session_head.pack(fill="x", padx=8, pady=(2, 4))
+        session_head.columnconfigure(0, weight=1, uniform="project-buttons")
+        session_head.columnconfigure(1, weight=1, uniform="project-buttons")
+        self.label(session_head, "历史会话", bold=True, bg="sidebar_card", muted=True).grid(
+            row=0, column=0, sticky="w")
+        self.delete_session_button = self.button(session_head, "删除", self.delete_session, "Danger.TButton")
+        self.delete_session_button.grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        session_panel, self.session_list = self.scroll_list(self.session_group, 7, "sidebar_card")
+        session_panel.pack(fill="both", expand=True, padx=8, pady=(0, 8))
         self.session_list.bind("<<ListboxSelect>>", self.select_session)
         self.session_list.bind("<Button-3>", self.show_session_menu)
         self.session_list.bind("<F2>", lambda _event: self.rename_session())
@@ -695,13 +1038,12 @@ class App:
             self.update_banner, "\u6253\u5f00\u5b89\u88c5\u5305\u6240\u5728\u6587\u4ef6\u5939", self.open_update_folder)
         self.update_open_folder_button.pack(side="right", padx=4, pady=5)
         self.update_banner.pack_forget()
-        ttk.Separator(center).pack(fill="x", padx=16)
         conversation, self.chat = self.text_panel(center, height=1, background="panel", text_size=11)
         conversation.pack(fill="both", expand=True, padx=10)
         self.show_welcome()
         self.build_approval_panel(center)
-        self.composer_separator = ttk.Separator(center)
-        self.composer_separator.pack(fill="x", padx=16, pady=(6, 0))
+        self.composer_anchor = self.frame(center, "bg", height=1)
+        self.composer_anchor.pack(fill="x", padx=14)
         self.label(center, "输入开发任务", bold=True).pack(fill="x", padx=16, pady=(10, 5))
         composer, self.input = self.text_panel(center, editable=True, height=4)
         self.quota_banner = self.label(self.input, "", color="remove", bg="field")
@@ -714,7 +1056,7 @@ class App:
         actions.pack(fill="x", padx=14, pady=(7, 12))
         self.send_button = self.button(actions, "发送任务", self.submit, "Accent.TButton")
         self.send_button.pack(side="right")
-        self.stop_button = self.button(actions, "停止", self.stop)
+        self.stop_button = self.button(actions, "停止", self.stop, "Danger.TButton")
         self.stop_button.pack(side="right", padx=8)
         self.mode_picker = ttk.Combobox(actions, textvariable=self.mode, values=("执行", "方案"),
                                         state="readonly", width=6)
@@ -723,25 +1065,26 @@ class App:
         self.label(actions, variable=self.mode_hint, muted=True).pack(side="left", padx=(8, 0))
         self.mode.trace_add("write", self.mode_changed)
 
-        rs = self.frame(right)
+        rs = self.frame(right, "side")
         rs.pack(fill="x", padx=13, pady=(12, 7))
-        self.label(rs, "项目结果", size=13, bold=True).pack(side="left")
-        self.refresh_button = self.button(rs, "刷新", self.refresh_changes)
+        self.label(rs, "项目结果", size=13, bold=True, bg="side").pack(side="left")
+        self.refresh_button = self.button(rs, "刷新", self.refresh_changes, "Side.TButton")
         self.refresh_button.pack(side="right")
-        self.label(right, variable=self.branch, muted=True).pack(fill="x", padx=13, pady=(0, 8))
+        self.label(right, variable=self.branch, muted=True, bg="side").pack(
+            fill="x", padx=13, pady=(0, 8))
         tabs = self.result_tabs = ttk.Notebook(right)
         tabs.pack(fill="both", expand=True, padx=13, pady=(0, 13))
-        changes_tab = self.frame(tabs)
-        tools_tab = self.frame(tabs)
+        changes_tab = self.frame(tabs, "result_panel")
+        tools_tab = self.frame(tabs, "result_panel")
         tabs.add(changes_tab, text="文件变更")
         tabs.add(tools_tab, text="执行记录")
         tabs.select(tools_tab)
-        search = self.frame(changes_tab)
+        search = self.frame(changes_tab, "result_panel")
         search.pack(fill="x", pady=(7, 0))
-        self.label(search, "筛选", muted=True, size=9).pack(side="left", padx=(0, 6))
+        self.label(search, "筛选", muted=True, size=9, bg="result_panel").pack(side="left", padx=(0, 6))
         ttk.Entry(search, textvariable=self.change_filter).pack(side="left", fill="x", expand=True)
         self.change_filter.trace_add("write", lambda *_args: self.render_change_list())
-        changes_panel, self.change_list = self.scroll_list(changes_tab, 7)
+        changes_panel, self.change_list = self.scroll_list(changes_tab, 7, "result_panel")
         changes_panel.pack(fill="x", pady=(7, 5))
         self.change_list.bind("<<ListboxSelect>>", self.select_change)
         self.label(changes_tab, variable=self.result_status, muted=True).pack(fill="x", pady=(2, 5))
@@ -789,6 +1132,8 @@ class App:
         if page == "workspace":
             self.page_panel = self.workspace_view
             self.workspace_view.pack(fill="both", expand=True)
+            self._workspace_width = 0
+            self.schedule_workspace_layout(250)
             if self.update_candidate:
                 self.update_banner.pack(fill="x", padx=18, pady=(0, 8), before=self.context_meter.panel)
         else:
@@ -825,45 +1170,228 @@ class App:
     def set_results_visible(self, visible):
         if visible != self.results_visible:
             if visible:
-                self.workspace_view.add(self.results_pane, width=372, minsize=278, stretch="never")
+                self.workspace_view.add(self.results_pane, width=300, minsize=205, stretch="always")
             else:
                 self.workspace_view.forget(self.results_pane)
             self.results_visible = visible
         self.results_button.configure(text="隐藏结果" if visible else "显示结果")
+        self._workspace_width = 0
+        self.schedule_workspace_layout(180)
+
+    def on_root_configure(self, event):
+        if event.widget is self.root and self.current_page == "workspace":
+            self.schedule_workspace_layout(650)
+
+    def schedule_workspace_layout(self, delay=180):
+        if not hasattr(self, "root") or not hasattr(self, "timers"):
+            return
+        self.workspace_layout_attempts = 0
+        self.schedule("resize_workspace", delay, self._layout_workspace_panes)
+
+    def _layout_workspace_panes(self):
+        if self.closing or self.current_page != "workspace":
+            return
+        try:
+            self.root.update_idletasks()
+            self._workspace_width = 0
+            self.resize_workspace()
+            self.root.update_idletasks()
+            width = self.workspace_view.winfo_width()
+            target_sashes = self.workspace_sash_positions(width)
+            actual_sashes = tuple(self.workspace_view.sash_coord(index)[0]
+                                  for index in range(len(target_sashes)))
+            if any(abs(actual - target) > 2
+                   for actual, target in zip(actual_sashes, target_sashes)):
+                self.workspace_layout_attempts += 1
+                if self.workspace_layout_attempts < 8:
+                    self.schedule("resize_workspace", 180, self._layout_workspace_panes)
+                else:
+                    self.workspace_layout_attempts = 0
+            else:
+                self.workspace_layout_attempts = 0
+        except tk.TclError:
+            pass
+
+    def workspace_sash_positions(self, width):
+        if self.results_visible:
+            side = min(320, max(176, int(width * 0.25)))
+            right = min(336, max(205, int(width * 0.25)))
+            if width - side - right < 320:
+                side = max(160, width - right - 320)
+            if width - side - right < 320:
+                right = max(190, width - side - 320)
+            return side, width - right
+        return (min(340, max(176, int(width * 0.30))),)
+
+    def resize_project_list(self, _event=None):
+        if not hasattr(self, "recent_list") or not self.recent_list.winfo_exists():
+            return
+        scale = float(self.root.tk.call("tk", "scaling"))
+        desired = self.recent_base_rows + self.recent_extra_rows
+        side_height = self.workspace_side.winfo_height()
+        fixed_project = max(0, self.project_group.winfo_reqheight() - self.recent_list.winfo_reqheight())
+        session_minimum = round(132 * scale)
+        remaining = side_height - fixed_project - session_minimum - round(26 * scale)
+        available_rows = max(2, remaining // max(1, self.recent_row_height))
+        target = min(desired, available_rows)
+        if int(self.recent_list.cget("height")) != target:
+            self.recent_list.configure(height=target)
+
+    def resize_workspace(self, _event=None):
+        """Keep the three panes usable in compact windows without constraining large ones."""
+        try:
+            width = self.workspace_view.winfo_width()
+        except (AttributeError, tk.TclError):
+            return
+        if width < 400 or width == self._workspace_width:
+            return
+        self._workspace_width = width
+        sashes = self.workspace_sash_positions(width)
+        self.workspace_view.paneconfigure(self.workspace_side, width=sashes[0])
+        if self.results_visible:
+            self.workspace_view.paneconfigure(self.results_pane, width=width - sashes[1])
+        self.workspace_view.update_idletasks()
+        for index, position in enumerate(sashes):
+            self.workspace_view.sash_place(index, position, 0)
+        self.schedule("resize_workspace_idle", 0, self.workspace_view.update_idletasks)
 
     def apply_theme(self):
         c = self.colors = THEMES[theme_key(self.theme.get())][1]
+        self.root.configure(background=c["bg"])
         self.style.configure(".", background=c["panel"], foreground=c["text"], font=(FONT, 10))
-        self.style.configure("TButton", padding=(10, 6), background=c["field"],
-                             bordercolor=c["border"], focusthickness=1)
-        self.style.map("TButton", background=[("active", c["border"])],
-                       foreground=[("disabled", c["muted"])])
-        self.style.configure("Accent.TButton", background=c["accent"], foreground=c["ink"])
+        self.style.configure("TButton", padding=(9, 5), background=c["panel"],
+                             bordercolor=c["line"], borderwidth=0, relief="flat",
+                             focusthickness=2, focuscolor=c["focus"])
+        self.style.map("TButton", background=[("disabled", c["panel"]),
+                                               ("pressed", c["active"]), ("active", c["hover"])],
+                       foreground=[("disabled", c["muted"]), ("active", c["text"])],
+                       bordercolor=[("focus", c["focus"])], relief=[("pressed", "flat")])
+        self.style.configure("Side.TButton", padding=(9, 5), background=c["side"],
+                             foreground=c["muted"], borderwidth=0, relief="flat",
+                             focusthickness=2, focuscolor=c["focus"])
+        self.style.map("Side.TButton", background=[("disabled", c["side"]),
+                                                      ("pressed", c["active"]), ("active", c["hover"])],
+                       foreground=[("disabled", c["muted"]), ("active", c["text"])])
+        self.style.configure("Accent.TButton", background=c["accent"], foreground=c["ink"],
+                             bordercolor=c["accent"], borderwidth=0, relief="flat",
+                             padding=(11, 5), focusthickness=2, focuscolor=c["focus"])
         self.style.map("Accent.TButton",
-                       background=[("disabled", c["field"]), ("active", c["accent"])],
-                       foreground=[("disabled", c["muted"]), ("active", c["ink"])])
+                       background=[("disabled", c["field"]), ("pressed", c["active"]),
+                                   ("active", c["accent"])],
+                       foreground=[("disabled", c["muted"]), ("active", c["ink"])],
+                       bordercolor=[("focus", c["focus"])])
+        self.style.configure("Danger.TButton", padding=(8, 5), background=c["danger_bg"],
+                             foreground=c["danger"], bordercolor=c["danger_bg"],
+                             borderwidth=0, relief="flat", focusthickness=2, focuscolor=c["focus"])
+        self.style.map("Danger.TButton", background=[("disabled", c["panel"]),
+                                                       ("pressed", c["remove_bg"]),
+                                                       ("active", c["remove_bg"])],
+                       foreground=[("disabled", c["muted"]), ("active", c["danger"])],
+                       bordercolor=[("focus", c["focus"])])
         self.style.configure("Nav.TButton", anchor="w", relief="flat", background=c["panel"],
-                             foreground=c["muted"], borderwidth=0, padding=(11, 7))
-        self.style.map("Nav.TButton", background=[("active", c["field"])],
+                             foreground=c["muted"], borderwidth=0, padding=(9, 5), focusthickness=2,
+                             focuscolor=c["focus"])
+        self.style.map("Nav.TButton", background=[("pressed", c["active"]), ("active", c["hover"])],
                        foreground=[("active", c["text"]), ("disabled", c["muted"])])
-        self.style.configure("Selected.Nav.TButton", background=c["soft"], foreground=c["heading"],
+        self.style.configure("Header.Nav.TButton", anchor="w", relief="flat", background=c["header"],
+                             foreground=c["muted"], borderwidth=0, padding=(9, 5),
+                             focusthickness=2, focuscolor=c["focus"])
+        self.style.map("Header.Nav.TButton",
+                       background=[("pressed", c["active"]), ("active", c["hover"])],
+                       foreground=[("active", c["text"]), ("disabled", c["muted"])])
+        self.style.configure("Selected.Nav.TButton", background=c["selection"], foreground=c["heading"],
                              font=(FONT, 10, "bold"))
-        self.style.map("Selected.Nav.TButton", background=[("active", c["soft"])],
+        self.style.map("Selected.Nav.TButton", background=[("pressed", c["active"]),
+                                                           ("active", c["selection"])],
                        foreground=[("active", c["heading"])])
         self.style.configure("HeaderTheme.TButton", anchor="w", relief="flat", borderwidth=0,
-                             background=c["panel"], foreground=c["muted"], padding=(0, 3))
-        self.style.map("HeaderTheme.TButton", background=[("active", c["panel"])],
+                             background=c["header"], foreground=c["muted"], padding=(0, 3),
+                             focusthickness=2, focuscolor=c["focus"])
+        self.style.map("HeaderTheme.TButton", background=[("active", c["hover"])],
                        foreground=[("active", c["heading"])])
-        self.style.configure("TNotebook", borderwidth=0)
-        self.style.configure("TNotebook.Tab", padding=(8, 6))
-        self.style.map("TNotebook.Tab", background=[("selected", c["field"])])
-        self.style.configure("TEntry", fieldbackground=c["field"], foreground=c["text"],
-                             insertcolor=c["text"], padding=6)
-        self.style.configure("TCombobox", foreground=c["text"], padding=(6, 4),
-                             arrowcolor=c["heading"], bordercolor=c["border"])
-        self.style.map("TCombobox", fieldbackground=[("readonly", c["soft"])],
-                       selectbackground=[("readonly", c["soft"])],
+        self.style.configure("TNotebook", borderwidth=0, bordercolor=c["line"],
+                             lightcolor=c["side"], darkcolor=c["side"],
+                             background=c["side"], tabmargins=(2, 4, 2, 0), relief="flat")
+        # Clam's client element draws a box even with borderwidth=0.
+        self.style.layout("TNotebook", [("Notebook.padding", {"sticky": "nswe"})])
+        # Clam's Notebook.tab ignores borderwidth and still draws its own outline.
+        # Draw text and spacing only; keyboard focus uses an underline, not a box.
+        self.style.layout("TNotebook.Tab", [("Notebook.padding", {
+            "sticky": "nswe", "children": [("Notebook.label", {"sticky": "nswe"})],
+        })])
+        self.style.configure("TNotebook.Tab", padding=(9, 5), font=(FONT, 10),
+                             background=c["side"], foreground=c["muted"])
+        self.style.map("TNotebook.Tab",
+                       foreground=[("disabled", c["muted"]), ("selected", c["heading"]),
+                                   ("active", c["text"])],
+                       font=[("focus", (FONT, 10, "underline"))])
+        self.style.configure("TEntry", fieldbackground=c["input"], foreground=c["text"],
+                             insertcolor=c["text"], padding=(7, 5), bordercolor=c["line"],
+                             lightcolor=c["input"], darkcolor=c["input"], borderwidth=1,
+                             focusthickness=1, focuscolor=c["focus"])
+        self.style.map("TEntry", fieldbackground=[("disabled", c["panel"])],
+                       foreground=[("disabled", c["muted"])],
+                       bordercolor=[("focus", c["focus"])])
+        self.style.configure("TCombobox", fieldbackground=c["input"], foreground=c["text"],
+                             padding=(7, 4), arrowcolor=c["muted"], bordercolor=c["line"],
+                             lightcolor=c["input"], darkcolor=c["input"], borderwidth=1,
+                             focusthickness=1, focuscolor=c["focus"])
+        self.style.map("TCombobox", fieldbackground=[("readonly", c["field"]), ("disabled", c["panel"])],
+                       foreground=[("disabled", c["muted"])],
+                       selectbackground=[("readonly", c["selection"])],
                        selectforeground=[("readonly", c["heading"])])
+        self.style.configure("TSpinbox", fieldbackground=c["input"], foreground=c["text"],
+                             arrowcolor=c["muted"], bordercolor=c["line"], padding=(7, 4),
+                             focusthickness=1, focuscolor=c["focus"])
+        self.style.configure("TCheckbutton", background=c["panel"], foreground=c["text"],
+                             focuscolor=c["focus"], padding=(2, 3),
+                             indicatorbackground=c["input"], indicatorforeground=c["text"],
+                             upperbordercolor=c["line"], lowerbordercolor=c["line"])
+        self.style.map("TCheckbutton", background=[("active", c["panel"])],
+                       foreground=[("disabled", c["muted"])],
+                       indicatorbackground=[("selected", c["accent"]), ("active", c["hover"])],
+                       indicatorforeground=[("selected", c["ink"])])
+        self.style.configure("TRadiobutton", background=c["panel"], foreground=c["text"],
+                             focuscolor=c["focus"], padding=(2, 3),
+                             indicatorbackground=c["input"], indicatorforeground=c["text"],
+                             upperbordercolor=c["line"], lowerbordercolor=c["line"])
+        self.style.map("TRadiobutton", background=[("active", c["panel"])],
+                       foreground=[("disabled", c["muted"])],
+                       indicatorbackground=[("selected", c["accent"]), ("active", c["hover"])],
+                       indicatorforeground=[("selected", c["ink"])])
+        self.style.configure("TSeparator", background=c["separator"])
+        self.style.configure("TPanedwindow", background=c["bg"])
+        try:
+            self.workspace_view.configure(background=c["line"], sashwidth=1, sashrelief="flat")
+        except tk.TclError:
+            pass
+        self.style.configure("Treeview", background=c["field"], fieldbackground=c["field"],
+                             foreground=c["text"], borderwidth=0, bordercolor=c["line"],
+                             lightcolor=c["field"], darkcolor=c["field"], focuscolor=c["line"],
+                             relief="flat", rowheight=25)
+        self.style.layout("Treeview", [("Treeview.treearea", {"sticky": "nswe"})])
+        self.style.map("Treeview", background=[("selected", c["selection"])],
+                       foreground=[("selected", c["heading"])])
+        self.style.configure("Treeview.Heading", background=c["panel"], foreground=c["muted"],
+                             padding=(7, 4), borderwidth=0, relief="flat")
+        self.style.map("Treeview.Heading", background=[("active", c["hover"])])
+        for orientation, direction, arrows in (
+            ("Vertical", "ns", ("uparrow", "downarrow")),
+            ("Horizontal", "we", ("leftarrow", "rightarrow")),
+        ):
+            self.style.layout(f"{orientation}.TScrollbar", [
+                (f"{orientation}.Scrollbar.trough", {
+                    "sticky": direction,
+                    "children": [(f"{orientation}.Scrollbar.thumb", {"sticky": "nswe"})],
+                }),
+            ])
+        for style in ("Vertical.TScrollbar", "Horizontal.TScrollbar"):
+            self.style.configure(style, width=8, background=c["scrollbar"],
+                                 troughcolor=c["scroll_track"], bordercolor=c["scroll_track"],
+                                 lightcolor=c["scrollbar"], darkcolor=c["scrollbar"],
+                                 gripcount=0, arrowsize=0, borderwidth=0, relief="flat")
+            self.style.map(style, background=[("pressed", c["focus"]),
+                                              ("active", c["scrollbar_hover"])])
         for option, color in (("background", "field"), ("foreground", "text"),
                               ("selectBackground", "accent"), ("selectForeground", "ink")):
             self.root.option_add(f"*TCombobox*Listbox.{option}", c[color])
@@ -876,11 +1404,21 @@ class App:
                 widget.configure(**colors)
                 active_widgets.append((widget, bg, fg, extra))
         self.themed = active_widgets
+        active_scrollbars = []
+        for scrollbar in self.overlay_scrollbars:
+            if not scrollbar.closed:
+                try:
+                    if scrollbar.parent.winfo_exists():
+                        scrollbar.theme(c)
+                        active_scrollbars.append(scrollbar)
+                except tk.TclError:
+                    scrollbar.close()
+        self.overlay_scrollbars = active_scrollbars
         for tag in ("muted", "accent", "heading", "add", "remove"):
             self.chat.tag_configure(tag, foreground=c[tag])
         self.chat.tag_configure("speaker", foreground=c["heading"], font=(FONT, 10, "bold"),
                                 spacing1=13, spacing3=4)
-        self.chat.tag_configure("user", background=c["soft"], lmargin1=12, lmargin2=12,
+        self.chat.tag_configure("user", background=c["user_message"], lmargin1=12, lmargin2=12,
                                 rmargin=12, spacing1=4, spacing3=5)
         self.chat.tag_configure("welcome", foreground=c["text"], font=(FONT, 17, "bold"), spacing3=10)
         zoom = 2 if self.chat_size.get() == "大" else 0
@@ -891,6 +1429,12 @@ class App:
         self.context_meter.theme(c)
         self.update_settings_icon()
         self.theme_icon.theme(c)
+        try:
+            for window in (self.root, *(item for item in self.root.winfo_children()
+                                        if isinstance(item, tk.Toplevel))):
+                self.schedule_titlebar(window)
+        except tk.TclError:
+            pass
 
     def update_settings_icon(self):
         if not hasattr(self, "colors"):
@@ -2959,6 +3503,15 @@ class App:
         for timer in self.timers.values():
             self.root.after_cancel(timer)
         self.timers.clear()
+        for window, timer in self.titlebar_after.values():
+            try:
+                window.after_cancel(timer)
+            except tk.TclError:
+                pass
+        self.titlebar_after.clear()
+        for scrollbar in tuple(self.overlay_scrollbars):
+            scrollbar.close()
+        self.overlay_scrollbars.clear()
         if self.approval_restore_after:
             self.root.after_cancel(self.approval_restore_after)
             self.approval_restore_after = None

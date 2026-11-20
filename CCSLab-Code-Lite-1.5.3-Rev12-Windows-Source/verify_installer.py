@@ -68,6 +68,40 @@ class InstallerTransactions(unittest.TestCase):
         if result.returncode:
             raise RuntimeError(result.stdout+result.stderr)
 
+        journal_source = cls.base/"JournalProbe.cs"
+        journal_source.write_text('''using System; using System.IO; using System.Reflection;
+class JournalProbe {
+    static int Main(string[] a) {
+        var flags = BindingFlags.NonPublic | BindingFlags.Static;
+        var setup = Assembly.LoadFrom(a[0]).GetType("Setup", true);
+        try {
+            if (a[1] == "write") {
+                setup.GetMethod("WriteTransaction", flags).Invoke(null,
+                    new object[] { a[2], a[3], a[4], "committed" });
+            } else {
+                int attempts = 0;
+                int code = Int32.Parse(a[2]);
+                Action action = delegate {
+                    attempts++;
+                    if (attempts < 3) throw new IOException("injected", unchecked((int)0x80070000) | code);
+                };
+                setup.GetMethod("RetryFileOperation", flags).Invoke(null, new object[] { action });
+                Console.WriteLine(attempts);
+            }
+            return 0;
+        } catch (TargetInvocationException error) {
+            Console.WriteLine(error.InnerException.HResult.ToString("X8"));
+            return 1;
+        }
+    }
+}''', encoding="utf-8")
+        cls.journal_probe = cls.base/"JournalProbe.exe"
+        result = subprocess.run([str(compiler), "/nologo", "/target:exe",
+            "/out:"+str(cls.journal_probe), str(journal_source)], capture_output=True,
+            text=True, creationflags=subprocess.CREATE_NO_WINDOW)
+        if result.returncode:
+            raise RuntimeError(result.stdout+result.stderr)
+
     def setUp(self):
         self.case = self.base/self._testMethodName
         self.case.mkdir()
@@ -86,7 +120,7 @@ class InstallerTransactions(unittest.TestCase):
     def run_install(self, version="new", point=None, expected=0):
         with self.start(version, point) as process:
             self.assertEqual(process.wait(timeout=55), expected,
-                (Path(str(self.destination)+".error.txt").read_text(errors="replace")
+                (Path(str(self.destination)+".error.txt").read_text(encoding="utf-8-sig", errors="replace")
                  if Path(str(self.destination)+".error.txt").exists() else "no installer diagnostic"))
 
     def installed(self, version):
@@ -178,17 +212,52 @@ class InstallerTransactions(unittest.TestCase):
         self.run_install()
         self.installed("new")
 
-    def locked_handle(self):
+    def locked_handle(self, path=None):
         api = ctypes.WinDLL("kernel32", use_last_error=True)
         api.CreateFileW.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32,
             ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p]
         api.CreateFileW.restype = ctypes.c_void_p
         api.CloseHandle.argtypes = [ctypes.c_void_p]
-        handle = api.CreateFileW(str(self.destination/"CCSLab Code Lite.exe"), 0x80000000,
+        handle = api.CreateFileW(str(path or self.destination/"CCSLab Code Lite.exe"), 0x80000000,
                                  1, None, 3, 0, None)  # Read sharing, no delete sharing.
         if handle == ctypes.c_void_p(-1).value:
             raise ctypes.WinError(ctypes.get_last_error())
         return api, handle
+
+    def test_journal_replacement_retries_real_windows_file_lock(self):
+        journal = self.case/"journal.transaction"
+        journal.write_text("previous journal", encoding="utf-8")
+        api, handle = self.locked_handle(journal)
+        try:
+            with subprocess.Popen([str(self.journal_probe), str(self.installers["new"]),
+                    "write", str(journal), str(self.destination), str(self.case/"stage")],
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    creationflags=subprocess.CREATE_NO_WINDOW) as process:
+                time.sleep(.6)
+                self.assertIsNone(process.poll(), "journal replacement did not wait for the native lock")
+                self.assertEqual(journal.read_text(encoding="utf-8"), "previous journal")
+                api.CloseHandle(handle)
+                handle = None
+                output, _ = process.communicate(timeout=8)
+                self.assertEqual(process.returncode, 0, output)
+        finally:
+            if handle is not None:
+                api.CloseHandle(handle)
+        self.assertEqual(journal.read_text(encoding="utf-8").splitlines(),
+                         [str(self.destination), str(self.case/"stage"), "committed"])
+        self.assertFalse(Path(str(journal)+".tmp").exists())
+
+    def test_replace_error_1175_retries_but_partial_rename_errors_fail_closed(self):
+        for code, expected in ((1175, 0), (1176, 1), (1177, 1)):
+            with self.subTest(code=code):
+                result = subprocess.run([str(self.journal_probe), str(self.installers["new"]),
+                    "retry", str(code)], capture_output=True, text=True,
+                    creationflags=subprocess.CREATE_NO_WINDOW, timeout=5)
+                self.assertEqual(result.returncode, expected, result.stdout)
+                if code == 1175:
+                    self.assertEqual(result.stdout.strip(), "3")
+                else:
+                    self.assertEqual(result.stdout.strip(), f"{0x80070000 | code:08X}")
 
     def test_transient_file_lock_retries_then_upgrades(self):
         self.run_install("old")
