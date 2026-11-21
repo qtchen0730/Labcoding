@@ -2,7 +2,9 @@ param(
     [string]$Output = (Join-Path (Split-Path (Split-Path $PSScriptRoot)) '.work\releases\CCSLab-Labcoding-Test-Setup-x64.exe'),
     [string]$Python = 'python',
     [string]$PyInstallerPath = '',
-    [string]$BuildRoot = (Join-Path (Split-Path (Split-Path $PSScriptRoot)) ('.work\build\test-' + (Get-Date -Format 'yyyyMMdd-HHmmss')))
+    [string]$BuildRoot = (Join-Path (Split-Path (Split-Path $PSScriptRoot)) ('.work\build\test-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))),
+    [ValidateSet('All', 'Portable', 'Installer')][string]$Stage = 'All',
+    [string]$PortableOutput = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -16,20 +18,52 @@ if ($VersionInfo.version -notmatch '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:
 }
 $VersionedTestOutput = [System.IO.Path]::GetFullPath((Join-Path $LocalWork `
     ('releases\CCSLab-Labcoding-' + $VersionInfo.version + '-Setup-x64.exe')))
-if (Test-Path -LiteralPath $BuildRoot) { throw "Build directory already exists; refusing to overwrite: $BuildRoot" }
+if ($Stage -eq 'Installer') {
+    if (!(Test-Path -LiteralPath (Join-Path $BuildRoot 'portable-source.json'))) {
+        throw 'Installer stage requires a completed Portable build in the same BuildRoot.'
+    }
+} elseif (Test-Path -LiteralPath $BuildRoot) { throw "Build directory already exists; refusing to overwrite: $BuildRoot" }
 if ($Output -ne $FixedTestOutput -and $Output -ne $VersionedTestOutput) {
     throw "Output must be the fixed test installer or the versioned installer for $($VersionInfo.version): $Output"
 }
 if ((Test-Path -LiteralPath $Output) -and $Output -ne $FixedTestOutput) {
     throw "Refusing to overwrite a versioned installer: $Output"
 }
-$BuildRoot = (New-Item -ItemType Directory -Path $BuildRoot).FullName
+if ($Stage -ne 'Installer') { $BuildRoot = (New-Item -ItemType Directory -Path $BuildRoot).FullName }
 $env:PYTHONPYCACHEPREFIX = (New-Item -ItemType Directory -Force -Path (Join-Path $BuildRoot 'pycache')).FullName
 $env:PYINSTALLER_CONFIG_DIR = (New-Item -ItemType Directory -Force -Path (Join-Path $BuildRoot 'pyinstaller-cache')).FullName
 $env:TEMP = $env:TMP = (New-Item -ItemType Directory -Force -Path (Join-Path $BuildRoot 'tmp')).FullName
 $Product = 'CCSLab Labcoding'
 $Source = Join-Path (Split-Path $PSScriptRoot) 'app'
 $Compiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+$Dist = Join-Path $BuildRoot 'dist'
+$Frozen = Join-Path $Dist $Product
+$Assets = Join-Path $BuildRoot 'assets'
+$Icon = Join-Path $Assets 'app.ico'
+
+function Get-BuildHashes([string]$Directory) {
+    $Hashes = @{}
+    Get-ChildItem -LiteralPath $Directory -Recurse -File | ForEach-Object {
+        $Hashes[$_.FullName.Substring($Directory.Length + 1)] = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash
+    }
+    return $Hashes
+}
+
+function Confirm-BuildHashes($Expected, [string]$Directory) {
+    $Actual = Get-BuildHashes $Directory
+    $Properties = @($Expected.PSObject.Properties)
+    if ($Actual.Count -ne $Properties.Count) { throw "Build file list changed: $Directory" }
+    foreach ($Entry in $Properties) {
+        if ($Actual[$Entry.Name] -ne $Entry.Value) { throw "Build input changed: $($Entry.Name)" }
+    }
+}
+
+if ($Stage -eq 'Installer') {
+    $Snapshot = Get-Content -LiteralPath (Join-Path $BuildRoot 'portable-source.json') -Raw -Encoding utf8 | ConvertFrom-Json
+    Confirm-BuildHashes $Snapshot.App $Source
+    Confirm-BuildHashes $Snapshot.Packaging $PSScriptRoot
+    Confirm-BuildHashes $Snapshot.Frozen $Frozen
+}
 
 function Confirm-NativeSuccess([string]$Operation) {
     if ($LASTEXITCODE -ne 0) {
@@ -53,7 +87,7 @@ if ((Get-FileHash -LiteralPath $OpenCode -Algorithm SHA256).Hash -ne $OpenCodeHa
     throw 'The supplied OpenCode.exe is not the pinned Windows x64 baseline distribution.'
 }
 
-$Dist = Join-Path $BuildRoot 'dist'
+if ($Stage -ne 'Installer') {
 $Assets = (New-Item -ItemType Directory -Force -Path (Join-Path $BuildRoot 'assets')).FullName
 $Icon = Join-Path $Assets 'app.ico'
 $IconPng = Join-Path $Assets 'app.png'
@@ -96,6 +130,30 @@ foreach ($Name in @('LICENSE.txt', 'LICENSE_PYTHON.txt')) {
         break
     }
 }
+}
+
+if ($Stage -eq 'Portable') {
+    $Releases = [System.IO.Path]::GetFullPath((Join-Path $LocalWork 'releases'))
+    $Portable = if ($PortableOutput) { [System.IO.Path]::GetFullPath($PortableOutput) }
+                else { Join-Path $Releases 'CCSLab-Labcoding-Recovery-Test-Portable-x64' }
+    if (!$Portable.StartsWith($Releases + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Portable output must be a test folder within .work/releases.'
+    }
+    if (Test-Path -LiteralPath $Portable) { throw "Portable test folder already exists: $Portable" }
+    Copy-Item -LiteralPath $Frozen -Destination $Portable -Recurse
+    @'
+@echo off
+start "" "%~dp0CCSLab Labcoding.exe" --data-dir "%~dp0test-data"
+'@ | Set-Content -LiteralPath (Join-Path $Portable 'Start-Isolated.cmd') -Encoding ascii
+    & $Python (Join-Path $PSScriptRoot 'Create-Payload.py') $Portable ($Portable + '.zip')
+    Confirm-NativeSuccess 'Compressing portable test application'
+    @{ App = (Get-BuildHashes $Source); Packaging = (Get-BuildHashes $PSScriptRoot);
+       Frozen = (Get-BuildHashes $Frozen) } | ConvertTo-Json -Depth 4 |
+        Set-Content -LiteralPath (Join-Path $BuildRoot 'portable-source.json') -Encoding utf8
+    Write-Output "Portable test EXE: $(Join-Path $Portable ($Product + '.exe'))"
+    Get-FileHash -LiteralPath ($Portable + '.zip') -Algorithm SHA256
+    return
+}
 
 $SetupSource = Join-Path $PSScriptRoot 'Setup.cs'
 $Uninstaller = Join-Path $Frozen 'Uninstall.exe'
@@ -108,6 +166,9 @@ $CompilerOptions = @(
     '/r:System.Windows.Forms.dll', '/r:System.IO.Compression.dll'
 )
 $AssemblyInfo = Join-Path $BuildRoot 'AssemblyVersion.cs'
+$versionCore = $VersionInfo.version.Split('-')[0].Split('.')
+$fileVersion = "{0}.{1}.{2}.{3}" -f [int]$versionCore[0], [int]$versionCore[1], [int]$versionCore[2], [int]$VersionInfo.release_sequence
+$productVersion = $VersionInfo.version
 @"
 using System.Reflection;
 [assembly: AssemblyVersion("$fileVersion")]

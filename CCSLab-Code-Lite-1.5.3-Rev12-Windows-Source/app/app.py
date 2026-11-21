@@ -9,6 +9,8 @@ from datetime import datetime
 import hashlib
 import json
 import os
+import sys
+import traceback
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Event, Lock, Thread
@@ -50,6 +52,10 @@ from approval_policy import SessionGrants, session_scope, replacement_details_co
 
 FONT = "Microsoft YaHei UI"
 APP_VERSION_INFO = read_version_info()
+WORKER_TIMEOUT = 90
+SHUTDOWN_TIMEOUT = 8
+IDENTITY_TRANSITION_TIMEOUT = 15
+POLL_TIMEOUT = 45
 
 
 def _colorref(value):
@@ -95,12 +101,14 @@ def apply_windows_titlebar(window, colors):
 class OverlayScrollbar:
     """A narrow, auto-hiding Canvas thumb layered over an existing y/x view."""
 
-    def __init__(self, app, parent, target, orient="vertical", width=7):
+    def __init__(self, app, parent, target, orient="vertical", width=7, *,
+                 always_visible=False, show_on_hover=True, opacity=1.0):
         self.app = app
         self.parent = parent
         self.target = target
         self.orient = orient
         self.width = width
+        self.always_visible, self.show_on_hover, self.opacity = always_visible, show_on_hover, opacity
         self.colors = app.colors
         self.first = 0.0
         self.last = 1.0
@@ -141,13 +149,13 @@ class OverlayScrollbar:
         self.colors = colors
         try:
             self.canvas.configure(background=self.parent.cget("background"))
-            self.canvas.itemconfigure(self.thumb, fill=colors["scrollbar_thumb"])
+            self.canvas.itemconfigure(self.thumb, fill=self._thumb_color())
             self._draw()
         except tk.TclError:
             self.close()
 
     def _place(self):
-        if self.closed or self.canvas.winfo_ismapped():
+        if self.closed:
             return
         if self.orient == "vertical":
             self.canvas.place(relx=1.0, x=-self.width, y=2, relheight=1.0,
@@ -165,13 +173,13 @@ class OverlayScrollbar:
             indicators = getattr(self.app, "session_indicators", None)
             if indicators and self.target is indicators.listing:
                 indicators.draw()
-            if self.last - self.first >= .999:
+            if self.last - self.first >= .999 and not self.always_visible:
                 self._cancel_hide()
                 self.canvas.place_forget()
                 return
             self._place()
             self._draw()
-            if not self.hovered and not self.dragging:
+            if not self.dragging and (not self.hovered or not self.show_on_hover):
                 self._schedule_hide()
         except (tk.TclError, TypeError, ValueError):
             self.close()
@@ -198,13 +206,21 @@ class OverlayScrollbar:
             self.canvas.coords(self.thumb, self.thumb_start, 1,
                                self.thumb_start + self.thumb_size, self.width - 1)
 
+    def _thumb_color(self, hover=False):
+        foreground = self.canvas.winfo_rgb(self.colors["scrollbar_hover" if hover else "scrollbar_thumb"])
+        background = self.canvas.winfo_rgb(self.canvas.cget("background"))
+        return "#" + "".join(f"{round((a*self.opacity+b*(1-self.opacity))/257):02x}"
+                              for a, b in zip(foreground, background))
+
     def _enter(self, _event=None):
         self.hovered = True
-        self._cancel_hide()
-        if self.last - self.first < .999:
+        if self.show_on_hover:
+            self._cancel_hide()
+        if (self.always_visible or self.last - self.first < .999) and (
+                self.show_on_hover or self.canvas.winfo_ismapped()):
             self._place()
             self._draw()
-            self.canvas.itemconfigure(self.thumb, fill=self.colors["scrollbar_hover"])
+            self.canvas.itemconfigure(self.thumb, fill=self._thumb_color(True))
 
     def _leave(self, _event=None):
         self.hovered = False
@@ -213,6 +229,8 @@ class OverlayScrollbar:
 
     def _schedule_hide(self):
         self._cancel_hide()
+        if self.always_visible:
+            return
         try:
             self.app.overlay_hide_serial += 1
             token = str(self.app.overlay_hide_serial)
@@ -236,7 +254,8 @@ class OverlayScrollbar:
 
     def _hide(self):
         self._cancel_hide()
-        if not self.hovered and not self.dragging and not self.closed:
+        if (not self.always_visible and (not self.hovered or not self.show_on_hover)
+                and not self.dragging and not self.closed):
             try:
                 self.canvas.place_forget()
             except tk.TclError:
@@ -248,7 +267,7 @@ class OverlayScrollbar:
             self._move_to(coordinate - self.thumb_size / 2)
         self.dragging = True
         self.drag_offset = coordinate - self.thumb_start
-        self.canvas.itemconfigure(self.thumb, fill=self.colors["scrollbar_hover"])
+        self.canvas.itemconfigure(self.thumb, fill=self._thumb_color(True))
 
     def _drag(self, event):
         if not self.dragging:
@@ -269,9 +288,10 @@ class OverlayScrollbar:
     def _release(self, _event):
         self.dragging = False
         if self.hovered:
-            self.canvas.itemconfigure(self.thumb, fill=self.colors["scrollbar_hover"])
+            self.canvas.itemconfigure(self.thumb, fill=self._thumb_color(True))
         else:
-            self.canvas.itemconfigure(self.thumb, fill=self.colors["scrollbar_thumb"])
+            self.canvas.itemconfigure(self.thumb, fill=self._thumb_color())
+        if not self.hovered or not self.show_on_hover:
             self._schedule_hide()
 
     def _wheel(self, event):
@@ -428,6 +448,9 @@ class App:
         self.task_stats = {}
         self.task_stats_polling = False
         self.project_contexts = {}
+        self.collapsed_projects = set()
+        self.search_collapsed_projects = set()
+        self.tree_search_query = ""
         self.dirty_contexts = {}
         self.identity_transition = False
         self.shutdown_waiting = False
@@ -439,10 +462,13 @@ class App:
         self.active_approval_scope = None
         self.timers = {}
         self.busy = ""
+        self.worker_job = None
+        self.shutdown_deadline = None
         self.running = False  # Selected-session presentation only; TaskScheduler owns execution state.
         self.closing = False
         self.stop_requested = Event()
         self.live_text = False
+        self.reply_copy_icons = []
         self.live_markdown = ""
         self.render_later = None
         self.status = tk.StringVar(value="请登录")
@@ -660,6 +686,7 @@ class App:
                 self.cancel_approval_ticket(ticket)
                 return
             self.approval_queue.append(ticket)
+            self.notify_approval(ticket)
             self.refresh_task_sidebar()
             self.session_indicators.draw()
             self.show_next_approval()
@@ -669,7 +696,19 @@ class App:
             self.cancel_approval_ticket(ticket)
             return
         self.approval_queue.append(ticket)
+        self.notify_approval(ticket)
         self.show_next_approval()
+
+    def notify_approval(self, ticket):
+        if ticket.get("sound_notified"):
+            return
+        ticket["sound_notified"] = True
+        try:
+            import winsound
+            # MessageBeep queues the Windows sound without waiting for playback.
+            winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+        except (ImportError, RuntimeError) as error:
+            self.record_client_state("approval_sound_unavailable", error=error)
 
     @staticmethod
     def approval_has_operation_detail(request):
@@ -883,15 +922,17 @@ class App:
                             font=(FONT, 10), highlightthickness=0, exportselection=False)
         return self.skin(result, background, "text", selectbackground="selection", selectforeground="heading")
 
-    def scroll_list(self, parent, height, background="field"):
+    def scroll_list(self, parent, height, background="field", *, horizontal=False):
         holder = self.frame(parent, background)
         listing = self.list_widget(holder, height, background)
-        listing.pack(side="left", fill="both", expand=True)
-        self.overlay_scrollbar(holder, listing)
+        listing.pack(side="left", fill="both", expand=True, pady=(0, 9) if horizontal else 0)
+        self.overlay_scrollbar(holder, listing, show_on_hover=not horizontal, opacity=.55 if horizontal else 1)
+        if horizontal:
+            self.overlay_scrollbar(holder, listing, orient="horizontal", always_visible=True, opacity=.55)
         return holder, listing
 
-    def overlay_scrollbar(self, parent, target, orient="vertical"):
-        scrollbar = OverlayScrollbar(self, parent, target, orient=orient)
+    def overlay_scrollbar(self, parent, target, orient="vertical", **options):
+        scrollbar = OverlayScrollbar(self, parent, target, orient=orient, **options)
         self.overlay_scrollbars.append(scrollbar)
         return scrollbar
 
@@ -967,9 +1008,16 @@ class App:
         self.page_host = self.frame(self.root, "bg")
         self.page_host.pack(fill="both", expand=True)
         panes = self.workspace_view = tk.PanedWindow(
-            self.page_host, orient="horizontal", bd=0, sashwidth=1, sashpad=0,
-            showhandle=False, opaqueresize=True,
+            self.page_host, orient="horizontal", bd=0, sashwidth=1, sashpad=4,
+            sashcursor="sb_h_double_arrow", showhandle=False, opaqueresize=True,
         )
+        self.workspace_sizes = {name: value for name in ("left", "right")
+                                if type(value := self.prefs.get(f"workspace_{name}_width")) is int
+                                and 160 <= value <= 10000}
+        self.workspace_dragging = False
+        self.task_resize_start = None
+        panes.bind("<ButtonPress-1>", self.begin_workspace_resize, add="+")
+        panes.bind("<ButtonRelease-1>", self.end_workspace_resize, add="+")
         self._workspace_width = 0
         self.workspace_layout_attempts = 0
         self.root.bind("<Configure>", self.on_root_configure, add="+")
@@ -989,7 +1037,7 @@ class App:
                                         highlightbackground="sidebar_card_line", highlightcolor="focus")
         side.rowconfigure(0, weight=1)
         side.columnconfigure(0, weight=1)
-        self.project_group.grid(row=0, column=0, sticky="nsew", padx=8, pady=(8, 6))
+        self.project_group.grid(row=0, column=0, sticky="nsew", padx=8, pady=(8, 0))
         project_head = self.frame(self.project_group, "sidebar_card")
         project_head.pack(fill="x", padx=10, pady=(9, 3))
         self.label(project_head, "项目", bg="sidebar_card", size=12, bold=True).pack(side="left")
@@ -1015,16 +1063,20 @@ class App:
         self.project_search_entry.pack(fill="x", padx=8, pady=(0, 6), before=recent_head)
         tree_panel = self.frame(self.project_group, "sidebar_card")
         tree_panel.pack(fill="both", expand=True, padx=8, pady=(0, 8))
-        self.project_tree = ttk.Treeview(tree_panel, columns=("action",), show="tree", selectmode="browse", height=8)
+        self.project_tree = ttk.Treeview(tree_panel, columns=("action",), show="tree", selectmode="browse", height=8,
+                                        style="Projects.Treeview")
         self.project_tree.column("#0", width=170, minwidth=60, stretch=True)
         self.project_tree.column("action", width=38, minwidth=38, stretch=False, anchor="center")
-        self.project_tree.pack(fill="both", expand=True)
+        self.project_tree.pack(fill="both", expand=True, padx=(0, 8), pady=(0, 9))
         self.overlay_scrollbar(tree_panel, self.project_tree)
+        self.overlay_scrollbar(tree_panel, self.project_tree, orient="horizontal", always_visible=True, opacity=.55)
         self.tree_rows = {}
         self.project_tree.bind("<<TreeviewSelect>>", self.select_project_row)
         self.project_tree.bind("<Button-1>", self.click_project_row, add="+")
         self.project_tree.bind("<Button-3>", self.show_session_menu)
         self.project_tree.bind("<F2>", lambda _event: self.rename_session())
+        self.project_tree.bind("<Double-Button-1>", lambda _event: "break")
+        self.project_tree.bind("<Left>", lambda _event: "break")
         self.session_menu = self.skin(tk.Menu(self.root, tearoff=False, font=(FONT, 10)),
                                       "panel", "text", activebackground="soft", activeforeground="heading",
                                       disabledforeground="muted")
@@ -1033,14 +1085,28 @@ class App:
         self.session_search.trace_add("write", lambda *_args: self.render_session_list())
         self.session_group = self.frame(side, "sidebar_card", highlightthickness=1,
                                         highlightbackground="sidebar_card_line", highlightcolor="focus")
-        self.session_group.grid(row=1, column=0, sticky="ew", padx=8, pady=(6, 8))
+        self.session_group.grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 8))
+        self.task_resize_handle = self.frame(side, "side", height=12, cursor="sb_v_double_arrow")
+        self.task_resize_handle.grid(row=1, column=0, sticky="ew", padx=8)
+        task_resize_line = self.frame(self.task_resize_handle, "line", height=1, cursor="sb_v_double_arrow")
+        task_resize_line.place(relx=0, rely=.5, relwidth=1, height=1)
+        for grip in (self.task_resize_handle, task_resize_line, self.session_group):
+            grip.bind("<ButtonPress-1>", self.begin_task_resize)
+            grip.bind("<B1-Motion>", self.drag_task_resize)
+            grip.bind("<ButtonRelease-1>", self.end_task_resize)
         self.label(self.session_group, "任务执行统计", bg="sidebar_card", size=12, bold=True).pack(
             fill="x", padx=10, pady=(9, 5))
         self.task_stats_text = tk.StringVar(value="服务器执行中：—\n剩余槽位：—\n本用户执行中：—")
         self.label(self.session_group, variable=self.task_stats_text, bg="sidebar_card").pack(
             fill="x", padx=10, pady=(0, 6))
-        task_panel, self.running_task_list = self.scroll_list(self.session_group, 2, "sidebar_card")
-        task_panel.pack(fill="x", padx=8, pady=(0, 6))
+        task_panel, self.running_task_list = self.scroll_list(self.session_group, 2, "sidebar_card", horizontal=True)
+        self.task_panel_height = self.running_task_list.winfo_reqheight() + 9 + round(self.root.winfo_fpixels("2c"))
+        saved_height = self.prefs.get("task_panel_height")
+        if type(saved_height) is int and 20 <= saved_height <= 10000:
+            self.task_panel_height = saved_height
+        task_panel.configure(height=self.task_panel_height)
+        task_panel.pack_propagate(False)
+        task_panel.pack(fill="both", expand=True, padx=8, pady=(0, 6))
         self.running_task_list.bind("<<ListboxSelect>>", self.select_running_task)
         self.running_task_rows = []
         notice_panel, self.approval_notices = self.text_panel(self.session_group, height=2,
@@ -1239,12 +1305,14 @@ class App:
         self.schedule("resize_workspace", delay, self._layout_workspace_panes)
 
     def _layout_workspace_panes(self):
-        if self.closing or self.current_page != "workspace":
+        if (self.closing or self.current_page != "workspace"
+                or self.workspace_dragging or self.task_resize_start is not None):
             return
         try:
             self.root.update_idletasks()
             self._workspace_width = 0
             self.resize_workspace()
+            self.resize_task_sidebar()
             self.root.update_idletasks()
             width = self.workspace_view.winfo_width()
             target_sashes = self.workspace_sash_positions(width)
@@ -1262,16 +1330,85 @@ class App:
         except tk.TclError:
             pass
 
-    def workspace_sash_positions(self, width):
+    def task_sidebar_height_bounds(self):
+        panel = self.running_task_list.master
+        natural = self.running_task_list.winfo_reqheight() + 9
+        project_header = self.project_group.winfo_reqheight() - self.project_tree.winfo_reqheight()
+        stats_header = self.session_group.winfo_reqheight() - panel.winfo_reqheight()
+        row_height = int(self.style.lookup('Treeview', 'rowheight') or 25)
+        available = self.workspace_side.winfo_height() - project_header - stats_header - 28 - row_height
+        return natural, max(natural, available)
+
+    def resize_task_sidebar(self):
+        panel = self.running_task_list.master
+        natural, available = self.task_sidebar_height_bounds()
+        height = max(natural, min(self.task_panel_height, available))
+        if int(panel.cget('height')) != height:
+            panel.configure(height=height)
+
+    def begin_workspace_resize(self, event):
+        if self.workspace_view.identify(event.x, event.y):
+            self.workspace_dragging = True
+
+    def end_workspace_resize(self, _event):
+        if self.workspace_dragging:
+            self.workspace_dragging = False
+            self.schedule("save_workspace_sizes", 0, self.remember_workspace_sizes)
+
+    def remember_workspace_sizes(self):
+        self.workspace_view.update_idletasks()
+        self.workspace_sizes["left"] = self.workspace_side.winfo_width()
         if self.results_visible:
-            side = min(320, max(176, int(width * 0.25)))
-            right = min(336, max(205, int(width * 0.25)))
-            if width - side - right < 320:
-                side = max(160, width - right - 320)
-            if width - side - right < 320:
-                right = max(190, width - side - 320)
-            return side, width - right
-        return (min(340, max(176, int(width * 0.30))),)
+            self.workspace_sizes["right"] = self.results_pane.winfo_width()
+        self.save_workspace_sizes()
+        self.schedule_workspace_layout(0)
+
+    def begin_task_resize(self, event):
+        if self.closing or (event.widget is self.session_group and event.y > 3):
+            return
+        self.task_resize_start = event.y_root, self.running_task_list.master.winfo_height()
+        self.task_resize_handle.grab_set()
+        return "break"
+
+    def drag_task_resize(self, event):
+        if self.task_resize_start is None:
+            return
+        origin, height = self.task_resize_start
+        minimum, maximum = self.task_sidebar_height_bounds()
+        self.task_panel_height = max(minimum, min(maximum, height + origin - event.y_root))
+        self.resize_task_sidebar()
+        return "break"
+
+    def end_task_resize(self, event):
+        if self.task_resize_start is None:
+            return
+        self.drag_task_resize(event)
+        self.task_resize_start = None
+        self.task_resize_handle.grab_release()
+        self.save_workspace_sizes()
+        self.schedule_workspace_layout(0)
+        return "break"
+
+    def save_workspace_sizes(self):
+        self.prefs.update({f"workspace_{name}_width": value for name, value in self.workspace_sizes.items()})
+        self.prefs["task_panel_height"] = self.task_panel_height
+        try:
+            self.save_prefs()
+        except OSError as error:
+            self.show_error("布局保存失败", error)
+
+    def workspace_sash_positions(self, width):
+        pad = int(self.workspace_view.cget("sashpad"))
+        sash = int(self.workspace_view.cget("sashwidth"))
+        gap = pad * 2 + sash
+        if self.results_visible:
+            side = self.workspace_sizes.get("left", min(320, max(176, int(width * 0.25))))
+            right = self.workspace_sizes.get("right", min(336, max(205, int(width * 0.25))))
+            side = max(160, min(side, width - 205 - 320 - gap * 2))
+            right = max(205, min(right, width - side - 320 - gap * 2))
+            return side + pad, width - right - pad - sash
+        side = self.workspace_sizes.get("left", min(340, max(176, int(width * 0.30))))
+        return (max(160, min(side, width - 320 - gap)) + pad,)
 
     def resize_workspace(self, _event=None):
         """Keep the three panes usable in compact windows without constraining large ones."""
@@ -1283,9 +1420,11 @@ class App:
             return
         self._workspace_width = width
         sashes = self.workspace_sash_positions(width)
-        self.workspace_view.paneconfigure(self.workspace_side, width=sashes[0])
+        pad = int(self.workspace_view.cget("sashpad"))
+        sash = int(self.workspace_view.cget("sashwidth"))
+        self.workspace_view.paneconfigure(self.workspace_side, width=sashes[0] - pad)
         if self.results_visible:
-            self.workspace_view.paneconfigure(self.results_pane, width=width - sashes[1])
+            self.workspace_view.paneconfigure(self.results_pane, width=width - sashes[1] - pad - sash)
         self.workspace_view.update_idletasks()
         for index, position in enumerate(sashes):
             self.workspace_view.sash_place(index, position, 0)
@@ -1406,6 +1545,10 @@ class App:
                              lightcolor=c["field"], darkcolor=c["field"], focuscolor=c["line"],
                              relief="flat", rowheight=25)
         self.style.layout("Treeview", [("Treeview.treearea", {"sticky": "nswe"})])
+        self.style.layout("Projects.Treeview.Item", [("Treeitem.padding", {
+            "sticky": "nswe", "children": [("Treeitem.image", {"side": "left", "sticky": ""}),
+                                             ("Treeitem.text", {"side": "left", "sticky": ""})],
+        })])
         self.style.map("Treeview", background=[("selected", c["selection"])],
                        foreground=[("selected", c["heading"])])
         self.style.configure("Treeview.Heading", background=c["panel"], foreground=c["muted"],
@@ -1465,6 +1608,8 @@ class App:
         self.context_meter.theme(c)
         self.update_settings_icon()
         self.theme_icon.theme(c)
+        for icon in self.reply_copy_icons:
+            icon.theme(c)
         if hasattr(self, "session_indicators"):
             self.session_indicators.draw()
         try:
@@ -1538,33 +1683,118 @@ class App:
             if not self.closing:
                 self.schedule("pump", 28, self.pump)
 
-    def worker(self, caption, fn, on_done, on_error=None):
+    def record_client_state(self, event, job=None, error=None):
+        """Bounded diagnostics: state and stack locations only, never values or exception messages."""
+        row = {"time": datetime.now().astimezone().isoformat(timespec="seconds"), "event": event,
+               "busy": self.busy, "closing": self.closing, "online": self.account_online,
+               "engine_ready": self.engine is not None, "identity_transition": self.identity_transition,
+               "active_tasks": len(self.tasks.active()), "account_polling": bool(self.account_polling),
+               "task_stats_polling": bool(self.task_stats_polling)}
+        if error:
+            row["error_type"] = type(error).__name__
+        stack = traceback.extract_tb(error.__traceback__) if error else []
+        if job:
+            row.update(operation=job["caption"], elapsed=round(monotonic() - job["started"], 3))
+            frame = sys._current_frames().get(job["thread"].ident)
+            if frame:
+                stack = traceback.extract_stack(frame)
+        if stack:
+            row["stack"] = [{"file": Path(item.filename).name, "line": item.lineno, "function": item.name}
+                            for item in stack]
+        try:
+            path = self.data_root / "client-diagnostics.jsonl"
+            if path.exists() and path.stat().st_size > 1_000_000:
+                path.replace(path.with_suffix(".previous.jsonl"))
+            with path.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(row, ensure_ascii=False) + "\n")
+        except OSError:
+            pass
+
+    def abandon_worker(self):
+        job, self.worker_job = self.worker_job, None
+        self.busy = ""
+        timer = self.timers.pop("worker_deadline", None)
+        if timer:
+            self.root.after_cancel(timer)
+        if job:
+            with job["lock"]:
+                job["abandoned"] = True
+                result, job["result"] = job["result"], None
+            if result and not result[1] and job["discard"]:
+                job["discard"](result[0])
+
+    def worker(self, caption, fn, on_done, on_error=None, *, timeout=None, discard=None):
         if self.busy or self.closing:
             return
+        job = {"caption": caption, "started": monotonic(), "lock": Lock(), "abandoned": False,
+               "result": None, "discard": discard, "generation": self.account_generation}
+        self.worker_job = job
         self.busy = caption
-        self.update_actions()
 
-        def finish(result, failed=False):
+        def finish():
+            if self.worker_job is not job:
+                return
+            with job["lock"]:
+                result, failed = job["result"]
+                job["result"] = None
+            self.worker_job = None
             self.busy = ""
+            timer = self.timers.pop("worker_deadline", None)
+            if timer:
+                self.root.after_cancel(timer)
             self.update_actions()
-            if failed:
-                if on_error:
-                    on_error(result)
+            if self.closing or job["generation"] != self.account_generation:
+                if not failed and discard:
+                    discard(result)
+                return
+            try:
+                if failed:
+                    self.record_client_state("worker_failed", job, result)
+                    if on_error:
+                        on_error(result)
+                    else:
+                        self.show_error(caption, result)
                 else:
-                    self.show_error(caption, result)
-            else:
-                on_done(result)
-            self.update_actions()
+                    on_done(result)
+            finally:
+                self.update_actions()
+
+        def expired():
+            if self.worker_job is not job:
+                return
+            self.record_client_state("worker_timeout", job)
+            self.abandon_worker()
+            try:
+                error = TimeoutError("操作等待超时，结果尚未确认。请刷新状态后重试；正在执行的任务不会被标记完成。")
+                if on_error:
+                    on_error(error)
+                else:
+                    self.status.set(caption + "等待超时，请重试；详情见 client-diagnostics.jsonl")
+            finally:
+                self.update_actions()
 
         def run():
             try:
-                result = fn()
+                result, failed = fn(), False
             except Exception as error:
-                self.events.put(lambda error=error: finish(error, True))
-            else:
-                self.events.put(lambda: finish(result))
+                result, failed = error, True
+            with job["lock"]:
+                abandoned = job["abandoned"]
+                if not abandoned:
+                    job["result"] = result, failed
+                    self.events.put(finish)
+            if abandoned and not failed and discard:
+                discard(result)
 
-        Thread(target=run, daemon=True).start()
+        job["thread"] = Thread(target=run, daemon=True, name="labcoding-worker")
+        try:
+            self.update_actions()
+            self.schedule("worker_deadline", max(1, int(1000 * (WORKER_TIMEOUT if timeout is None else timeout))), expired)
+            job["thread"].start()
+        except Exception as error:
+            with job["lock"]:
+                job["result"] = error, True
+            finish()
 
     def show_error(self, title, error):
         message = str(error).replace(self.token, "••••") if self.token else str(error)
@@ -1886,9 +2116,17 @@ class App:
         for task in active:
             self.cancel_task(task)
         self.status.set("正在取消后台任务，等待身份切换…")
+        deadline = monotonic() + IDENTITY_TRANSITION_TIMEOUT
         def wait():
             self.pump_tasks()
             if self.tasks.active():
+                if monotonic() >= deadline:
+                    self.identity_transition = False
+                    self.tasks.accepting = not self.closing
+                    self.status.set("任务尚未停止，身份未切换；请稍后重试或关闭应用。")
+                    self.record_client_state("identity_transition_timeout")
+                    self.update_actions()
+                    return
                 self.schedule("identity_transition", 100, wait)
                 return
             self.identity_transition = False
@@ -2251,10 +2489,13 @@ class App:
         if target != ("user" if self.is_admin else "admin"):
             return
         client = self.account_client
+        operation_client = copy(client)
         self.account_generation += 1
         self.account_polling = False
 
         def done(user):
+            client.token = operation_client.token
+            client.clear_open_webui_access()
             self.token = client.token
             self.session_grants.clear()
             for task in self.tasks.tasks.values():
@@ -2277,7 +2518,7 @@ class App:
             self.show_error("切换角色失败", error)
             self.poll_account()
 
-        self.worker("切换登录角色", lambda: client.switch_role(target, authorization_code), done, failed)
+        self.worker("切换登录角色", lambda: operation_client.switch_role(target, authorization_code), done, failed)
 
     def require_account_login(self, message):
         self.cancel_saved_login()
@@ -2313,12 +2554,12 @@ class App:
         with self.gateway_client_lock:
             cached = self.gateway_transport
             if cached and cached[0] == scope:
-                return cached[1]
+                return copy(cached[1])  # Share the transport, not mutable login credentials.
             server, proxy_mode = scope
             client = AccountClient(server, mode=proxy_mode)
             if scope == self.account_connection:
                 self.gateway_transport = scope, client
-            return client
+            return copy(client)
 
     def save_account_connection(self, server, proxy_mode, *, manual=True):
         if self.account_client or self.busy or self.closing:
@@ -2440,9 +2681,12 @@ class App:
         if not hasattr(self, "project_tree"):
             return
         query = self.session_search.get().strip().casefold()
-        opened = {self.tree_rows[key][0] for key in self.project_tree.get_children()
-                  if key in self.tree_rows and self.project_tree.item(key, "open")}
+        if query != self.tree_search_query:
+            self.tree_search_query = query
+            self.search_collapsed_projects.clear()
+        collapsed = self.search_collapsed_projects if query else self.collapsed_projects
         scroll = self.project_tree.yview()[0]
+        horizontal = self.project_tree.xview()[0]
         self.project_tree.delete(*self.project_tree.get_children())
         self.tree_rows.clear()
         for path in self.recents:
@@ -2461,7 +2705,7 @@ class App:
             if query and query not in name.casefold() and not matches:
                 continue
             parent = self.project_tree.insert("", "end", text="📁 " + name, values=("＋",),
-                                              open=bool(query) or path in opened or path == self.project)
+                                              open=(str(self.state), canonical(path)) not in collapsed)
             self.tree_rows[parent] = (path, None)
             for item in (matches if query and query not in name.casefold() else known.values()):
                 child = self.project_tree.insert(parent, "end", text=item["title"])
@@ -2470,15 +2714,18 @@ class App:
                     self.project_tree.selection_set(child)
             if path == self.project and not self.session:
                 self.project_tree.selection_set(parent)
+        font = tkfont.Font(root=self.root, font=(FONT, 10))
+        width = max((font.measure(self.project_tree.item(key, "text")) + (60 if row[1] else 30)
+                     for key, row in self.tree_rows.items()), default=170)
+        self.project_tree.column("#0", width=max(170, width), minwidth=max(170, width))
         self.project_tree.yview_moveto(scroll)
+        self.project_tree.xview_moveto(horizontal)
         self.update_delete_actions()
         if hasattr(self, "session_indicators"):
             self.session_indicators.draw()
 
     def select_project_row(self, _event=None):
         row = self.selected_tree_row()
-        if row and not row[1] and canonical(row[0]) != canonical(self.project):
-            self.navigate_session(row[0])
         if row and row[1] and (row[0], row[1]) != (self.project, self.session):
             self.navigate_session(*row)
         self.update_delete_actions()
@@ -2489,13 +2736,35 @@ class App:
         if row and not row[1] and self.project_tree.identify_column(event.x) == "#1":
             self.navigate_session(row[0], create=True)
             return "break"
+        if row and not row[1]:
+            expanded = not self.project_tree.item(key, "open")
+            collapsed = self.search_collapsed_projects if self.session_search.get().strip() else self.collapsed_projects
+            scope = str(self.state), canonical(row[0])
+            collapsed.discard(scope) if expanded else collapsed.add(scope)
+            self.project_tree.item(key, open=expanded)
+            self.project_tree.focus(key)
+            self.project_tree.selection_set(key)
+            self.update_delete_actions()
+            self.session_indicators.draw()
+            return "break"
 
     def navigate_session(self, path, session=None, *, create=False):
-        if self.busy or self.closing or not self.can_open_project:
+        if self.closing or not self.can_open_project:
             return
+        if self.busy:
+            if self.busy not in {"读取项目", "启动本地 OpenCode", "读取会话"}:
+                return
+            if canonical(path) != canonical(self.project) or self.busy == "读取会话":
+                self.abandon_worker()
+        timer = self.timers.pop("navigate_session", None)
+        if timer:
+            self.root.after_cancel(timer)
         self.show_page("workspace")
         if canonical(path) != canonical(self.project):
-            self.open_project(path)
+            self.open_project(path, session_id=session)
+        elif session:
+            self.open_session(session)
+        if create:
             owner = str(self.state)
             def ready():
                 if self.closing or str(self.state) != owner or canonical(self.project) != canonical(path):
@@ -2503,12 +2772,8 @@ class App:
                 if self.busy:
                     self.schedule("navigate_session", 50, ready)
                 elif self.engine:
-                    self.new_session() if create else self.open_session(session) if session else None
+                    self.new_session()
             ready()
-        elif create:
-            self.new_session()
-        elif session:
-            self.open_session(session)
 
     def select_running_task(self, _event=None):
         selected = self.running_task_list.curselection()
@@ -2535,9 +2800,12 @@ class App:
                   f"{task.context.titles.get(task.session_id) or task.context.history.get(task.session_id, {}).get('title', '新会话')}"
                   for task in rows]
         if labels != list(self.running_task_list.get(0, "end")):
+            top, left = self.running_task_list.yview()[0], self.running_task_list.xview()[0]
             self.running_task_list.delete(0, "end")
             for label in labels:
                 self.running_task_list.insert("end", label)
+            self.running_task_list.yview_moveto(top)
+            self.running_task_list.xview_moveto(left)
         self.running_task_rows = rows
         pending = self.pending_approval_tasks()
         if [task.task_id for task in pending] != self.approval_notice_rows:
@@ -2556,6 +2824,7 @@ class App:
                 self.approval_notice_panel.pack(fill="x", padx=8, pady=(0, 8))
             else:
                 self.approval_notice_panel.pack_forget()
+            self.schedule_workspace_layout(0)
 
     def poll_task_stats(self):
         if self.closing:
@@ -2564,21 +2833,34 @@ class App:
         client, generation = self.account_client, self.account_generation
         if not client or not self.account_online or self.connection_mode != "account" or self.task_stats_polling:
             return
-        self.task_stats_polling = True
+        ticket = self.task_stats_polling = object()
+        def done(result, error=None):
+            if self.task_stats_polling is not ticket:
+                return
+            self.task_stats_polling = False
+            timer = self.timers.pop("task_stats_deadline", None)
+            if timer:
+                self.root.after_cancel(timer)
+            if not self.closing and generation == self.account_generation and client is self.account_client:
+                if error:
+                    self.record_client_state("task_stats_failed", error=error)
+                self.task_stats = result
+                self.refresh_task_sidebar()
+                if self.current_page == "admin" and self.page_controller:
+                    self.page_controller.update_task_counts(result)
         def read():
             try:
                 result = client.request("GET", "/api/tasks")
-            except AccountError:
-                result = {}
-            def done():
-                self.task_stats_polling = False
-                if not self.closing and generation == self.account_generation and client is self.account_client:
-                    self.task_stats = result
-                    self.refresh_task_sidebar()
-                    if self.current_page == "admin" and self.page_controller:
-                        self.page_controller.update_task_counts(result)
-            self.events.put(done)
-        Thread(target=read, daemon=True).start()
+            except Exception as error:
+                self.events.put(lambda error=error: done({}, error))
+            else:
+                self.events.put(lambda: done(result))
+        self.schedule("task_stats_deadline", max(1, int(POLL_TIMEOUT * 1000)),
+                      lambda: done({}, TimeoutError()))
+        try:
+            Thread(target=read, daemon=True).start()
+        except Exception as error:
+            done({}, error)
 
     def remove_recent(self):
         row = self.selected_tree_row()
@@ -3005,15 +3287,20 @@ class App:
                 # Expired administrator sessions resume as ordinary users; authorization
                 # codes are never stored or replayed for privilege elevation.
                 user = client.login(record["username"], record["password"])
-            self.saved_login.save(client.base, record["username"], record["password"], client.token)
-            return client, user
+            return client, user, record
 
         def done(result):
             if page.container.winfo_exists():
                 page.set_busy(False)
                 page.feedback.set("")
             if result and connection == self.account_connection and not self.account_client:
-                self.signed_in(*result)
+                client, user, record = result
+                try:
+                    self.saved_login.save(client.base, record["username"], record["password"], client.token)
+                except OSError as error:
+                    failed(error)
+                    return
+                self.signed_in(client, user)
 
         def failed(error):
             if page.container.winfo_exists():
@@ -3073,6 +3360,7 @@ class App:
         self.active_approval_scope = None
         self.account_generation += 1
         self.account_polling = False
+        self.task_stats_polling = False
         if self.account_client:
             self.account_client.clear_open_webui_access()
             if forget_session:
@@ -3177,7 +3465,7 @@ class App:
         direct = self.connection_mode == "direct"
         if direct and self.busy and not self.running:
             return
-        self.account_polling = True
+        ticket = self.account_polling = object()
         generation = self.account_generation
         client_user_id = (self.account or {}).get("id")
         client_role = (self.account or {}).get("role")
@@ -3185,9 +3473,17 @@ class App:
         refresh_model = monotonic() - self.model_checked > 12 or not self.model_checked
 
         def done(user, model, error):
-            if generation != self.account_generation or self.closing:
+            if (self.account_polling is not ticket or generation != self.account_generation
+                    or client is not self.account_client or self.closing):
                 return
             self.account_polling = False
+            timer = self.timers.pop("account_poll_deadline", None)
+            if timer:
+                self.root.after_cancel(timer)
+            if error:
+                self.record_client_state("account_poll_failed", error=error)
+                if not isinstance(error, AccountError):
+                    error = AccountError("账号状态读取失败或超时，请稍后重试。")
             if direct:
                 if error:
                     if user is None and error.status in {401, 403}:
@@ -3238,14 +3534,14 @@ class App:
         def request():
             try:
                 user = client.me()
-            except AccountError as error:
+            except Exception as error:
                 self.events.put(lambda error=error: done(None, None, error))
                 return
             if direct:
                 if check_grant and user["status"] == "active" and user["role"] == "admin":
                     try:
                         client.check_open_webui_access()
-                    except AccountError as error:
+                    except Exception as error:
                         self.events.put(lambda error=error: done(user, None, error))
                         return
                 self.events.put(lambda: done(user, None, None))
@@ -3254,11 +3550,16 @@ class App:
             if user["status"] == "active" and (refresh_model or not self.model_info):
                 try:
                     model = client.model()
-                except AccountError:
-                    pass
+                except Exception as error:
+                    self.events.put(lambda error=error: self.record_client_state("model_poll_failed", error=error))
             self.events.put(lambda: done(user, model, None))
 
-        Thread(target=request, daemon=True).start()
+        self.schedule("account_poll_deadline", max(1, int(POLL_TIMEOUT * 1000)),
+                      lambda: done(None, None, TimeoutError()))
+        try:
+            Thread(target=request, daemon=True).start()
+        except Exception as error:
+            done(None, None, error)
 
     def update_model(self, model):
         self.model_info = model
@@ -3279,7 +3580,7 @@ class App:
         if not self.busy and not self.closing and self.can_open_project:
             show_new_project(self)
 
-    def open_project(self, path):
+    def open_project(self, path, *, session_id=None):
         if self.busy or self.closing or not self.can_open_project:
             return
         candidate = Path(path)
@@ -3303,11 +3604,13 @@ class App:
         self.save_draft()
         self.session = None
         self.engine, old_engine = None, self.engine
+        self.retire_engine(old_engine)
         self.project = path
         name = Path(path).name
         self.project_label.set(name if len(name) <= 28 else name[:27] + "…")
         self.branch.set("正在读取项目…")
-        write_json(self.state / "recents.json", [path, *[p for p in self.recents if p != path]][:15])
+        recents = self.recents if path in self.recents else [path, *self.recents]
+        write_json(self.state / "recents.json", recents[:15])
         self.refresh_recents()
         self.history_path = self.state / (hashlib.sha256(os.path.normcase(path).encode()).hexdigest() + ".json")
         context = self.project_contexts.get((str(self.state), canonical(path)))
@@ -3320,7 +3623,7 @@ class App:
                 self.save_context_later(context)
         else:
             self.history, self.session_titles = context.history, context.titles
-        self.update_sessions([])
+        self.update_sessions(context.sessions)
         self.session_search.set("")
         self.changes = None
         self.change_rows = []
@@ -3331,12 +3634,13 @@ class App:
         self.reset_conversation()
         self.bind_task_view()
         self.restore_draft()
-        self.append(self.chat, path + "\n", "heading")
+        if session_id:
+            self.open_session(session_id)
+        else:
+            self.append(self.chat, path + "\n", "heading")
         generation = self.account_generation
 
         def work():
-            if old_engine:
-                old_engine.close()
             changes = context.changes or Changes(path)
             return changes, changes.status()
 
@@ -3345,7 +3649,8 @@ class App:
                 return
             self.changes, status = result
             context.changes = self.changes
-            self.show_changes(status)
+            if not self.history.get(self.session, {}).get("changes"):
+                self.show_changes(status)
             if self.can_use_agent:
                 self.start_engine(path)
             else:
@@ -3370,8 +3675,10 @@ class App:
             self.engine, sessions = result
             self.engine_limits = limits
             self.update_sessions(sessions)
+            if self.session and not self.history.get(self.session):
+                self.open_session(self.session)
 
-        self.worker("启动本地 OpenCode", work, done)
+        self.worker("启动本地 OpenCode", work, done, discard=lambda result: self.retire_engine(result[0]))
 
     @staticmethod
     def model_limits(meta):
@@ -3539,6 +3846,9 @@ class App:
         self.worker("新建会话", engine.new_session, created)
 
     def open_session(self, session_id):
+        scope = str(self.state), canonical(self.project)
+        self.collapsed_projects.discard(scope)
+        self.search_collapsed_projects.discard(scope)
         self.park_approvals()
         self.reset_task_history_browse()
         self.session_grants.clear()
@@ -3552,7 +3862,12 @@ class App:
         if local:
             for event in local.get("events", []):
                 self.render_event(event)
-            self.end_reply()
+            task = self.current_task()
+            if not task or task.status not in ACTIVE:
+                self.end_reply()
+            elif self.render_later is not None:
+                self.root.after_cancel(self.render_later)
+                self.draw_reply()
             saved = local.get("changes")
             if saved:
                 self.show_changes((saved["branch"], [Change(**row) for row in saved["files"]]))
@@ -3849,11 +4164,33 @@ class App:
             self.draw_reply()
         if self.live_text:
             self.chat.mark_unset("reply_start")
+            if self.live_markdown.strip():
+                follow = self.chat.yview()[1] >= .98
+                text = self.live_markdown
+                icon = ActionIcon(self, self.chat, "copy", lambda text=text: self.copy_reply(text))
+                icon.theme(self.colors)
+                self.chat.configure(state="normal")
+                self.chat.insert("end-1c", "\n" if self.chat.get("end-2c", "end-1c") != "\n" else "")
+                self.chat.window_create("end-1c", window=icon, align="center", pady=2)
+                self.chat.insert("end-1c", "\n")
+                self.chat.configure(state="disabled")
+                self.reply_copy_icons.append(icon)
+                if follow:
+                    self.chat.see("end")
         self.live_text = False
         self.live_markdown = ""
 
+    def copy_reply(self, text):
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+
     def reset_conversation(self):
         self.end_reply()
+        for icon in self.reply_copy_icons:
+            icon.destroy()
+        icons = set(self.reply_copy_icons)
+        self.themed = [row for row in self.themed if row[0] not in icons]
+        self.reply_copy_icons.clear()
         self.clear_text(self.chat)
         self.activity.clear()
         self.context_meter.reset()
@@ -3976,18 +4313,22 @@ class App:
         window.grab_set()
 
     def close(self):
-        if self.tasks.active():
-            if not self.shutdown_waiting:
+        if self.shutdown_deadline is None:
+            if self.tasks.active():
                 if not messagebox.askyesno("关闭应用", f"停止 {len(self.tasks.active())} 个后台/排队任务并退出？",
                                           parent=self.root, default=messagebox.NO):
                     return
                 self.shutdown_waiting = True
-                self.closing = True
-                self.tasks.accepting = False
-                self.cancel_all_approvals()
-                for task in self.tasks.active():
-                    self.cancel_task(task)
-                self.update_actions()
+            elif self.running and not messagebox.askyesno("关闭应用", "停止当前任务并退出？", parent=self.root):
+                return
+            self.shutdown_deadline = monotonic() + SHUTDOWN_TIMEOUT
+            self.closing = True
+            self.tasks.accepting = False
+            self.cancel_all_approvals()
+            for task in self.tasks.active():
+                self.cancel_task(task)
+            self.update_actions()
+        if self.tasks.active() or self.busy:
             self.pump_tasks()
             # Normal pump stops rescheduling during shutdown; metadata callbacks must still drain.
             for _ in range(200):
@@ -3995,18 +4336,17 @@ class App:
                     action = self.events.get_nowait()
                 except Empty:
                     break
-                action()
+                try:
+                    action()
+                except Exception as error:
+                    self.record_client_state("shutdown_callback_failed", error=error)
             self.status.set("正在取消任务并保存记录，等待模型与工具结束…")
-            if self.tasks.active():
-                self.root.after(100, self.close)
+            if (self.tasks.active() or self.busy) and monotonic() < self.shutdown_deadline:
+                self.schedule("close", 100, self.close)
                 return
-        if self.busy and not self.running:
-            if self.closing:
-                self.pump()
-            self.schedule("close", 200, self.close)
-            return
-        if self.running and not self.shutdown_waiting and not messagebox.askyesno("关闭应用", "停止当前任务并退出？", parent=self.root):
-            return
+            if self.tasks.active() or self.busy:
+                self.record_client_state("shutdown_timeout", self.worker_job)
+        self.abandon_worker()
         self.closing = True
         self.tasks.accepting = False
         self.cancel_all_approvals()

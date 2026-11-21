@@ -10,6 +10,7 @@ from http.server import ThreadingHTTPServer
 from time import monotonic, sleep
 import tkinter as tk
 import unittest
+from unittest.mock import patch
 
 from verify_support import TEST_ROOT
 from verify_tls import tls_files
@@ -159,6 +160,22 @@ print('Saved login restored across processes')
         self.assertFalse(self.store.path.exists())
         self.assertTrue(app.saved_login_suppressed)
         self.assertNotIn('saved_login',app.timers)
+
+    def test_timed_out_restore_cannot_recreate_credentials_after_consent_removed(self):
+        app = self.open_gui()
+        self.server.delay = .25
+        with patch('app.WORKER_TIMEOUT', .1):
+            app.restore_saved_login()
+            self.wait(lambda: not app.busy)
+        app.page_controller.remember_checkbox.invoke()
+        self.assertFalse(self.store.path.exists())
+        deadline = monotonic() + 1.2
+        while monotonic() < deadline:
+            self.root.update()
+            sleep(.01)
+        self.assertFalse(self.store.path.exists())
+        self.assertIsNone(app.account)
+        self.assertTrue(app.saved_login_suppressed)
 
     def test_busy_startup_defers_saved_login_instead_of_losing_it(self):
         app=self.open_gui()

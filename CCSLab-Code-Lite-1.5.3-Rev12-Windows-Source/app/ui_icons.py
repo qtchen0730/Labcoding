@@ -55,9 +55,14 @@ class ActionIcon(tk.Canvas):
         return "break"
 
     def theme(self, colors):
+        self.configure(background=colors["panel"], highlightbackground=colors["panel"],
+                       highlightcolor=colors["accent"])
         self.delete("all")
         color = colors["heading"]
-        if self.kind == "sun":
+        if self.kind == "copy":
+            self.create_rectangle(7, 6, 17, 18, outline=color, width=1.4)
+            self.create_rectangle(11, 10, 21, 22, outline=color, fill=colors["panel"], width=1.4)
+        elif self.kind == "sun":
             self.create_oval(9, 9, 19, 19, outline=color, width=2)
             for n in range(8):
                 angle = n * pi / 4

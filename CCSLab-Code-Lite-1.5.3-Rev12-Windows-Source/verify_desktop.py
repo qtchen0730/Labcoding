@@ -282,8 +282,10 @@ def register_accounts(root, gui, server, tls, login_password):
         page.password.set(login_password)
         page.action.invoke()
         wait(root, lambda: gui.account_pending and not gui.busy)
-        assert gui.account_client is transport
-    print("PASS settings save-and-test, full diagnostics, safe report copy, and registration/login on one HTTPS client")
+        # Authentication attempts share routes/TLS, while late attempts cannot replace another session's credentials.
+        assert gui.account_client.transport is transport.transport
+        assert not transport.token
+    print("PASS settings save-and-test, full diagnostics, safe report copy, and registration/login on one HTTPS transport")
 
 
 def main():

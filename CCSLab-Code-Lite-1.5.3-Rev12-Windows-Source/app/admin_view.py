@@ -327,7 +327,12 @@ class AdminPage:
 
     def call(self, caption, method, path, body, done, *, timeout=10, error_text=None):
         app = self.app
-        if app.busy or not self.owns_session():
+        if app.closing or not self.owns_session():
+            return
+        if app.busy:
+            if method == "GET":
+                app.schedule(f"admin_read:{id(self)}:{path}", 100,
+                             lambda: self.call(caption, method, path, body, done, timeout=timeout, error_text=error_text))
             return
         if path in {"/api/admin/model/preview", "/api/admin/model/apply"} and app.tasks.active():
             self.notice.set("请先结束客户端后台任务，再调整模型配置。")
@@ -347,7 +352,8 @@ class AdminPage:
                 else:
                     self.notice.set(str(error)[:110])
 
-        app.worker(caption, lambda: self.client.request(method, path, body, timeout=timeout), complete, failed)
+        app.worker(caption, lambda: self.client.request(method, path, body, timeout=timeout), complete, failed,
+                   timeout=timeout + 30)
 
     def refresh_users(self):
         def draw(reply):

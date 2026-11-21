@@ -15,7 +15,9 @@ class SessionIndicators:
         self.task_canvas = app.skin(tk.Canvas(app.running_task_list.master, width=30, height=1,
                                              borderwidth=0, highlightthickness=0, takefocus=False),
                                     "sidebar_card", None)
-        self.task_canvas.pack(side="right", fill="y", before=app.running_task_list)
+        self.task_canvas.pack(side="right", fill="y", before=app.running_task_list, padx=(0, 8), pady=(0, 9))
+        self.task_canvas.bind("<MouseWheel>", lambda event: app.running_task_list.event_generate(
+            "<MouseWheel>", delta=event.delta))
         self.canvas.bind("<Button-1>", self.click)
         self.task_canvas.bind("<Button-1>", self.click_task)
         self.phase, self.timer, self.closed = 0, None, False
@@ -90,6 +92,9 @@ class SessionIndicators:
                 if bounds:
                     animate |= self.indicator(self.task_canvas, bounds[1], bounds[3], task.metadata(),
                                               task.task_id in pending)
+        for bar in self.app.overlay_scrollbars:
+            if bar.target in (self.listing, self.app.running_task_list) and bar.canvas.winfo_ismapped():
+                bar.canvas.tk.call("raise", bar.canvas._w)
         if animate and self.timer is None:
             self.timer = self.app.root.after(80, self._tick)
         elif not animate:
