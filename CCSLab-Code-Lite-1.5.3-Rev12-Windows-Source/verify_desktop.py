@@ -52,6 +52,8 @@ class DialogControlFixture(ModelControl):
 
     def status(self):
         model = super().status()
+        # This fixture replaces preview/apply; it never installs a Linux host policy or restarts services.
+        model.update(control_available=True, detail="隔离控制替身，不执行真实服务操作。")
         if self.applied_profile:
             model.update(total_context=self.applied_profile[0], slots=self.applied_profile[1])
         return model

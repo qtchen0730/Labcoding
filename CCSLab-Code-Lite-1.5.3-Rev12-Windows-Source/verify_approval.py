@@ -22,7 +22,7 @@ from app import App
 from verify_support import TEST_ROOT
 
 
-ACCOUNT = {"id": 17, "username": "alice"}
+ACCOUNT = {"id": 17, "username": "alice", "status": "active"}
 PROJECT = str(Path.cwd())
 SESSION = "ses_approval_test"
 def replacement_request(old="old", new="new", path="src/app.py"):
@@ -165,6 +165,7 @@ class ApprovalPolicyTests(unittest.TestCase):
         app.show_next_approval = lambda: None
         app.restore_approval_focus = lambda: None
         app.schedule = lambda *_args: None
+        app.session_indicators = SimpleNamespace(draw=lambda: None)
         app.finish_approval(True, ticket_id="stale")
         self.assertFalse(current["completed"].is_set())
         app.finish_approval(True, ticket_id="current")
@@ -201,6 +202,7 @@ class ApprovalWidgetTests(unittest.TestCase):
         self.root.update()
         self.app.page_panel.pack_forget()
         self.app.workspace_view.pack(fill="both", expand=True)
+        self.app.current_page = "workspace"
         self.app.account = ACCOUNT
         self.app.project = PROJECT
         self.app.session = SESSION
@@ -453,6 +455,8 @@ class ApprovalWidgetTests(unittest.TestCase):
         def run(_session, _prompt, _on_event, approve, **_kwargs):
             decisions.append(approve(WRITE))
         self.app.engine = SimpleNamespace(run=run, close=lambda: None)
+        self.app.create_task_engine = lambda *_: self.app.engine
+        self.app.history_path = self.app.state / "isolated-history.json"
         self.app.run_task("isolated task lifecycle fixture")
         deadline = time.monotonic() + 3
         while self.app.active_approval is None and time.monotonic() < deadline:

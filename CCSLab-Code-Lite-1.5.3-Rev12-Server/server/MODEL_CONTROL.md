@@ -4,6 +4,10 @@
 
 ## 固定行为与限制
 
+任务并发由配套客户端和 Gateway 的全局任务槽位接口统一控制。沿用 `python -m server` 的单 worker 入口；不要用多个独立 Gateway worker/副本管理同一个模型池，因为任务租约保存在当前 Gateway 进程内。槽位数来自实际模型状态，项目和账号没有额外上限。任务在工具调用和等待审批期间继续占槽；原生标题/摘要请求共用所属任务槽位，依次转发。旧客户端的独立模型请求也会占用槽位。
+
+客户端通过 `/api/tasks/{task_id}/acquire` 获取槽位、每 10 秒向 `/heartbeat` 续期、结束后 DELETE 释放；45 秒无心跳且没有在途模型请求时回收。运行中的转发结束前不复用槽位。Gateway 重启后原租约失效，客户端停止相关任务；不自动重放。`GET /api/tasks` 返回服务器任务总数、空槽和当前用户任务数；管理员另有各用户计数。`GET /api/model` 含空槽数，`GET /api/admin/users` 的每个用户含 `running_tasks`。两端需配套更新，旧 Gateway 不支持全局调度。独立 Open WebUI 直连不经过此 Gateway，统计显示不可用。
+
 - Gateway API 继续提供状态、预览、确认应用；预览确认票据绑定管理员、一次性使用且 90 秒过期。应用前等待推理结束，记录 SQLite 审计结果。
 - 请求只接受 `total_context`（32768、65536、131072、262144 之一）和 `slots`（1–10）。客户端不能指定路径、命令或服务名。
 - root helper 只管理 `/etc/ccslab/model-context.env` 和 `ccslab-llm.service`。环境文件只写 `LLAMA_ARG_CTX_SIZE` 和 `LLAMA_ARG_N_PARALLEL`。应用后核对新 PID、`/health`、`/slots` 和每槽 `n_ctx`；失败则恢复原文件并重启，恢复未验证时留下 pending 标记并阻止后续模型请求。

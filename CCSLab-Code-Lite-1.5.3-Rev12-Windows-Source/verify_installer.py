@@ -55,6 +55,15 @@ class InstallerTransactions(unittest.TestCase):
         if result.returncode:
             raise RuntimeError(result.stdout+result.stderr)
         cls.versioned_setup = versioned_setup
+        running_source = cls.base / "RunningFixture.cs"
+        running_source.write_text('class RunningFixture { static void Main() { System.Threading.Thread.Sleep(30000); } }',
+                                  encoding="utf-8")
+        cls.running_fixture = cls.base / "running-fixture.exe"
+        result = subprocess.run([str(compiler), "/nologo", "/target:winexe", "/out:" + str(cls.running_fixture),
+                                 str(running_source)], capture_output=True, text=True,
+                                creationflags=subprocess.CREATE_NO_WINDOW)
+        if result.returncode:
+            raise RuntimeError(result.stdout + result.stderr)
         probe_source = cls.base/"ReadInstallerVersion.cs"
         probe_source.write_text(
             'using System; using System.Reflection; '
@@ -160,6 +169,24 @@ class JournalProbe {
             with self.subTest(point=point):
                 self.run_install(point="throw:"+point, expected=1)
                 self.installed("old")
+        self.run_install()
+        self.installed("new")
+
+    def test_running_target_is_refused_and_upgrade_works_after_exit(self):
+        self.run_install("old")
+        executable = self.destination / "CCSLab Code Lite.exe"
+        executable.write_bytes(self.running_fixture.read_bytes())
+        with subprocess.Popen([str(executable)], creationflags=subprocess.CREATE_NO_WINDOW) as process:
+            try:
+                self.assertIsNone(process.poll())
+                self.run_install(expected=1)
+                diagnostic = Path(str(self.destination) + ".error.txt").read_text(encoding="utf-8-sig")
+                self.assertIn("请先退出", diagnostic)
+                self.assertIsNone(process.poll())
+            finally:
+                process.terminate()
+                process.wait(timeout=10)
+        executable.write_bytes(b"old")
         self.run_install()
         self.installed("new")
 

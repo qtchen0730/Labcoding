@@ -126,6 +126,20 @@ def _gateway_error(status, *, edge_code, cloudflare, detail):
 
 
 class AccountClient:
+    def acquire_task(self, task_id):
+        try:
+            return self.request("POST", f"/api/tasks/{task_id}/acquire")["acquired"] is True
+        except AccountError as error:
+            if error.status in {404, 405}:
+                raise error.with_message("请先更新配套 Gateway，才能使用全局任务槽位。") from None
+            raise
+
+    def heartbeat_task(self, task_id):
+        self.request("POST", f"/api/tasks/{task_id}/heartbeat")
+
+    def release_task(self, task_id):
+        self.request("DELETE", f"/api/tasks/{task_id}")
+
     def __init__(self, server, *, tls=None, mode="auto", proxy_mode=None):
         self.base = normalize_server(server)
         url = urlsplit(self.base)

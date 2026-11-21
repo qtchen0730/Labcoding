@@ -8,8 +8,10 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import hmac
 import json
+import os
 from pathlib import Path
 import secrets
+import socket
 import ssl
 import threading
 import uuid
@@ -35,11 +37,15 @@ def usage_numbers(usage):
 
 
 class ContextGuard:
-    def __init__(self, base, token, limits, callback, log_path, *, ca_bundle=None, proxy_url=None):
+    def __init__(self, base, token, limits, callback, log_path, *, ca_bundle=None, proxy_url=None, task_id=None):
+        self.task_id = task_id
         self.base, self.token, self.limits = base.rstrip("/"), token, limits
         self.callback, self.log_path = callback, Path(log_path)
         self.secret = secrets.token_urlsafe(32)
         self.lock = threading.Lock()
+        self.request_lock = threading.Lock()
+        self.requests = {}
+        self.closed = threading.Event()
         self.budget_rejections = 0
         tls = ssl.create_default_context()
         if ca_bundle:
@@ -68,7 +74,30 @@ class ContextGuard:
             stream.write(json.dumps({"time": datetime.now(timezone.utc).isoformat(), **reading}) + "\n")
 
     def close(self):
+        self.closed.set()
+        with self.request_lock:
+            requests = list(self.requests.items())
+        for _done, response in requests:
+            if response is not None:
+                # urllib3 is pinned at 2.8.0. Its captured socket remains available
+                # even for HTTP/1.0 responses whose connection.sock is already None.
+                shutdown = response._sock_shutdown
+                try:
+                    response.shutdown()  # Interrupt a read1 waiting for the next upstream token.
+                except (OSError, ValueError, RuntimeError):
+                    pass  # The handler may have already released this response.
+                if os.name == "nt" and shutdown is not None:
+                    # Windows' pending select/recv is not woken by shutdown alone;
+                    # makefile also delays socket.close until that read returns.
+                    # Detach then close the OS handle so the reader can unwind safely.
+                    handle = shutdown.__self__.detach()
+                    if handle != -1:
+                        socket.close(handle)
         self.server.shutdown()
+        # Before headers arrive urllib3's connect/read deadlines still apply. This runs on
+        # the task worker, so UI stays responsive and the task remains cancelling until drained.
+        for done, _response in requests:
+            done.wait()
         self.server.server_close()
         self.pool.clear()
 
@@ -130,15 +159,30 @@ class _Handler(BaseHTTPRequestHandler):
             return
         response = None
         started = False
+        done = threading.Event()
+        with guard.request_lock:
+            cancelled = guard.closed.is_set()
+            if not cancelled:
+                guard.requests[done] = None
+        if cancelled:
+            self.reply(503, {"error": {"message": "Local model bridge is closing"}})
+            return
         try:
             reading["stage"] = "gateway"
             headers = {"Content-Type": "application/json", "Accept": "text/event-stream, application/json",
                        "X-Request-ID": reading["request_id"]}
             if guard.token:
                 headers["Authorization"] = "Bearer " + guard.token
+            if guard.task_id:
+                headers["X-CCSLab-Task"] = guard.task_id
             response = guard.pool.request("POST", guard.base + "/chat/completions", headers=headers,
                                           body=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
                                           preload_content=False, redirect=False)
+            with guard.request_lock:
+                guard.requests[done] = response
+                cancelled = guard.closed.is_set()
+            if cancelled:
+                return
             reading["http_status"] = response.status
             if response.status >= 400:
                 body = response.read(65536)
@@ -191,7 +235,8 @@ class _Handler(BaseHTTPRequestHandler):
                             pass
                 if len(pending) > 1024 * 1024:
                     pending = b""  # parser only; the complete bytes were forwarded
-            reading["state"] = "request_failed" if stream_error else "request_complete"
+            reading["state"] = ("request_cancelled" if guard.closed.is_set() else
+                                "request_failed" if stream_error else "request_complete")
             if payload.get("tools") and not stream_error:
                 guard.budget_rejections = 0
             guard.publish(reading)
@@ -203,7 +248,14 @@ class _Handler(BaseHTTPRequestHandler):
                     "proxy" if isinstance(error, urllib3.exceptions.ProxyError) else "network")
                 self.reply(502, {"error": {"message": f"Model {kind} connection failed."}})
         finally:
-            if response is not None:
-                response.close()
-                response.release_conn()
-            guard.save(reading)
+            try:
+                if response is not None:
+                    response.close()
+                    response.release_conn()
+                if guard.closed.is_set():
+                    reading.update(state="request_cancelled", stage="cancelled")
+                guard.save(reading)
+            finally:
+                with guard.request_lock:
+                    guard.requests.pop(done, None)
+                done.set()

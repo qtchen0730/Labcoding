@@ -2,6 +2,7 @@
 
 import argparse
 from collections import deque
+from copy import copy
 import ctypes
 from ctypes import wintypes
 from datetime import datetime
@@ -21,7 +22,9 @@ from update_system import (
     UpdateError, UpdateNetworkError, UpdateService, UpdateTrustError,
 )
 
-from changes import Changes
+from changes import Change, Changes
+from tasks import ACTIVE, EXECUTING, ProjectContext, SessionTask, TaskScheduler, canonical
+from session_indicators import SessionIndicators
 from account_client import (
     ACCOUNT_STATUS, DEFAULT_SERVER, LEGACY_DEFAULT_SERVER, PASSWORD_RANGE,
     AccountClient, AccountError, normalize_server, preferred_account_server, valid_account_password,
@@ -159,6 +162,9 @@ class OverlayScrollbar:
             return
         try:
             self.first, self.last = float(first), float(last)
+            indicators = getattr(self.app, "session_indicators", None)
+            if indicators and self.target is indicators.listing:
+                indicators.draw()
             if self.last - self.first >= .999:
                 self._cancel_hide()
                 self.canvas.place_forget()
@@ -418,6 +424,13 @@ class App:
         self.session_titles = {}
         self.drafts = {}
         self.events = Queue()
+        self.tasks = TaskScheduler()
+        self.task_stats = {}
+        self.task_stats_polling = False
+        self.project_contexts = {}
+        self.dirty_contexts = {}
+        self.identity_transition = False
+        self.shutdown_waiting = False
         self.approval_queue = deque()
         self.active_approval = None
         self.approval_tickets = {}
@@ -426,7 +439,7 @@ class App:
         self.active_approval_scope = None
         self.timers = {}
         self.busy = ""
-        self.running = False
+        self.running = False  # Selected-session presentation only; TaskScheduler owns execution state.
         self.closing = False
         self.stop_requested = Event()
         self.live_text = False
@@ -490,6 +503,7 @@ class App:
         self.schedule("pump", 30, self.pump)
         self.schedule("timer", 200, self.update_timer)
         if not smoke:
+            self.schedule("task_stats", 100, self.poll_task_stats)
             self.schedule("legacy", 100, self.remove_legacy_key)
             self.schedule("connection", 3500, self.monitor_account)
             self.schedule("gateway_check", 100, self.check_account_connection)
@@ -640,6 +654,16 @@ class App:
         self.approval_key_bindings = None
 
     def enqueue_approval(self, ticket):
+        if ticket.get("task_id"):
+            task = self.tasks.tasks.get(ticket["task_id"])
+            if (not task or task.cancel.is_set() or self.closing or ticket["completed"].is_set()):
+                self.cancel_approval_ticket(ticket)
+                return
+            self.approval_queue.append(ticket)
+            self.refresh_task_sidebar()
+            self.session_indicators.draw()
+            self.show_next_approval()
+            return
         if (ticket["completed"].is_set() or self.closing or self.stop_requested.is_set()
                 or ticket["scope"] != self.active_approval_scope):
             self.cancel_approval_ticket(ticket)
@@ -663,11 +687,21 @@ class App:
         if self.approval_action_locked:
             self.schedule("approval_next", 250, self.show_next_approval)
             return
-        while self.approval_queue:
+        for _ in range(len(self.approval_queue)):
+            if self.active_approval:
+                break
             ticket = self.approval_queue.popleft()
             if ticket["completed"].is_set():
                 continue
-            if ticket["scope"] != self.active_approval_scope:
+            if ticket.get("task_id"):
+                task = self.tasks.tasks.get(ticket["task_id"])
+                if not task or task.cancel.is_set():
+                    self.cancel_approval_ticket(ticket)
+                    continue
+                if not self.task_is_current(task) or self.current_page != "workspace":
+                    self.approval_queue.append(ticket)
+                    continue
+            elif ticket["scope"] != self.active_approval_scope:
                 self.cancel_approval_ticket(ticket)
                 continue
             self.active_approval = ticket
@@ -704,7 +738,8 @@ class App:
         has_operation_detail = self.approval_has_operation_detail(request)
         if not has_operation_detail:
             details = ["无法获取完整操作详情"]
-        preview = self.redact("\n\n".join(details))
+        task = self.tasks.tasks.get(ticket.get("task_id")) if getattr(self, "tasks", None) else None
+        preview = (task.redact if task else self.redact)("\n\n".join(details))
         self.approval_detail.configure(state="normal")
         self.approval_detail.delete("1.0", "end")
         self.approval_detail.insert("1.0", preview)
@@ -731,6 +766,8 @@ class App:
         self.approval_reject_button.configure(state="disabled" if self.approval_action_locked else "normal",
                                                command=lambda ticket_id=ticket["id"]:
                                                self.finish_approval(False, ticket_id=ticket_id))
+        self.refresh_task_sidebar()
+        self.session_indicators.draw()
         self.task_state.set("等待审批")
         self.approval_panel.pack(fill="x", padx=12, pady=(4, 0), before=self.composer_anchor)
         if self.approval_key_bindings is None:
@@ -751,6 +788,10 @@ class App:
 
     def finish_approval(self, allow=False, *, session=False, ticket_id=None):
         ticket = self.active_approval
+        if ticket and ticket.get("task_id"):
+            task = self.tasks.tasks.get(ticket["task_id"])
+            if not task or not self.task_is_current(task) or self.current_page != "workspace":
+                return
         if (not ticket or self.approval_action_locked
                 or (ticket_id is not None and ticket["id"] != ticket_id)
                 or (allow and not self.approval_has_operation_detail(ticket["request"]))):
@@ -764,6 +805,8 @@ class App:
             ticket["completed"].set()
         with self.approval_lock:
             self.approval_tickets.pop(ticket["id"], None)
+        self.refresh_task_sidebar()
+        self.session_indicators.draw()
         self.approval_action_locked = True
         self.schedule("approval_unlock", 250, self.unlock_approval_controls)
         self.active_approval = None
@@ -944,7 +987,9 @@ class App:
             panes.add(right, width=300, minsize=205, stretch="always")
         self.project_group = self.frame(side, "sidebar_card", highlightthickness=1,
                                         highlightbackground="sidebar_card_line", highlightcolor="focus")
-        self.project_group.pack(fill="x", padx=8, pady=(8, 6))
+        side.rowconfigure(0, weight=1)
+        side.columnconfigure(0, weight=1)
+        self.project_group.grid(row=0, column=0, sticky="nsew", padx=8, pady=(8, 6))
         project_head = self.frame(self.project_group, "sidebar_card")
         project_head.pack(fill="x", padx=10, pady=(9, 3))
         self.label(project_head, "项目", bg="sidebar_card", size=12, bold=True).pack(side="left")
@@ -954,7 +999,7 @@ class App:
         project_actions.columnconfigure(1, weight=1, uniform="project-buttons")
         self.new_project_button = self.button(project_actions, "＋ 新建项目", self.new_project)
         self.new_project_button.grid(row=0, column=0, sticky="ew", padx=(0, 4))
-        self.open_button = self.button(project_actions, "打开", self.choose_project)
+        self.open_button = self.button(project_actions, "打开项目", self.choose_project)
         self.open_button.grid(row=0, column=1, sticky="ew", padx=(4, 0))
         recent_head = self.frame(self.project_group, "sidebar_card")
         recent_head.pack(fill="x", padx=8, pady=(3, 4))
@@ -964,47 +1009,47 @@ class App:
             row=0, column=0, sticky="w")
         self.remove_recent_button = self.button(recent_head, "删除", self.remove_recent, "Danger.TButton")
         self.remove_recent_button.grid(row=0, column=1, sticky="ew", padx=(4, 0))
-        scale = float(self.root.tk.call("tk", "scaling"))
-        # Keep the previous 3cm gain and add another 3cm, scaled in physical units.
-        extra_pixels = round((6 * 72 / 2.54) * scale)
-        row_height = tkfont.Font(root=self.root, font=(FONT, 10)).metrics("linespace") + 2
-        self.recent_base_rows = 5
-        self.recent_extra_rows = max(1, round(extra_pixels / max(1, row_height)))
-        self.recent_row_height = row_height
-        recent_panel, self.recent_list = self.scroll_list(
-            self.project_group, self.recent_base_rows + self.recent_extra_rows, "sidebar_card")
-        recent_panel.pack(fill="x", padx=8, pady=(0, 8))
-        side.bind("<Configure>", self.resize_project_list, add="+")
-        self.recent_list.bind("<Double-Button-1>", self.open_recent)
-        self.recent_list.bind("<Return>", self.open_recent)
-        self.recent_list.bind("<<ListboxSelect>>", lambda _event: self.update_delete_actions())
-        self.session_group = self.frame(side, "sidebar_card", highlightthickness=1,
-                                        highlightbackground="sidebar_card_line", highlightcolor="focus")
-        self.session_group.pack(fill="both", expand=True, padx=8, pady=(6, 8))
-        self.new_button = self.button(self.session_group, "新建会话", self.new_session)
-        self.new_button.pack(fill="x", padx=8, pady=(8, 5))
-        self.label(self.session_group, "搜索会话", bold=True, bg="sidebar_card", muted=True).pack(
-            fill="x", padx=8, pady=(3, 4))
-        ttk.Entry(self.session_group, textvariable=self.session_search).pack(
-            fill="x", padx=8, pady=(0, 6))
-        session_head = self.frame(self.session_group, "sidebar_card")
-        session_head.pack(fill="x", padx=8, pady=(2, 4))
-        session_head.columnconfigure(0, weight=1, uniform="project-buttons")
-        session_head.columnconfigure(1, weight=1, uniform="project-buttons")
-        self.label(session_head, "历史会话", bold=True, bg="sidebar_card", muted=True).grid(
-            row=0, column=0, sticky="w")
-        self.delete_session_button = self.button(session_head, "删除", self.delete_session, "Danger.TButton")
-        self.delete_session_button.grid(row=0, column=1, sticky="ew", padx=(4, 0))
-        session_panel, self.session_list = self.scroll_list(self.session_group, 7, "sidebar_card")
-        session_panel.pack(fill="both", expand=True, padx=8, pady=(0, 8))
-        self.session_list.bind("<<ListboxSelect>>", self.select_session)
-        self.session_list.bind("<Button-3>", self.show_session_menu)
-        self.session_list.bind("<F2>", lambda _event: self.rename_session())
+        self.label(self.project_group, "搜索项目或会话", bg="sidebar_card", muted=True).pack(
+            fill="x", padx=8, pady=(3, 4), before=recent_head)
+        self.project_search_entry = ttk.Entry(self.project_group, textvariable=self.session_search)
+        self.project_search_entry.pack(fill="x", padx=8, pady=(0, 6), before=recent_head)
+        tree_panel = self.frame(self.project_group, "sidebar_card")
+        tree_panel.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        self.project_tree = ttk.Treeview(tree_panel, columns=("action",), show="tree", selectmode="browse", height=8)
+        self.project_tree.column("#0", width=170, minwidth=60, stretch=True)
+        self.project_tree.column("action", width=38, minwidth=38, stretch=False, anchor="center")
+        self.project_tree.pack(fill="both", expand=True)
+        self.overlay_scrollbar(tree_panel, self.project_tree)
+        self.tree_rows = {}
+        self.project_tree.bind("<<TreeviewSelect>>", self.select_project_row)
+        self.project_tree.bind("<Button-1>", self.click_project_row, add="+")
+        self.project_tree.bind("<Button-3>", self.show_session_menu)
+        self.project_tree.bind("<F2>", lambda _event: self.rename_session())
         self.session_menu = self.skin(tk.Menu(self.root, tearoff=False, font=(FONT, 10)),
                                       "panel", "text", activebackground="soft", activeforeground="heading",
                                       disabledforeground="muted")
         self.session_menu.add_command(label="重命名")
+        self.session_menu.add_command(label="删除会话", command=self.delete_session)
         self.session_search.trace_add("write", lambda *_args: self.render_session_list())
+        self.session_group = self.frame(side, "sidebar_card", highlightthickness=1,
+                                        highlightbackground="sidebar_card_line", highlightcolor="focus")
+        self.session_group.grid(row=1, column=0, sticky="ew", padx=8, pady=(6, 8))
+        self.label(self.session_group, "任务执行统计", bg="sidebar_card", size=12, bold=True).pack(
+            fill="x", padx=10, pady=(9, 5))
+        self.task_stats_text = tk.StringVar(value="服务器执行中：—\n剩余槽位：—\n本用户执行中：—")
+        self.label(self.session_group, variable=self.task_stats_text, bg="sidebar_card").pack(
+            fill="x", padx=10, pady=(0, 6))
+        task_panel, self.running_task_list = self.scroll_list(self.session_group, 2, "sidebar_card")
+        task_panel.pack(fill="x", padx=8, pady=(0, 6))
+        self.running_task_list.bind("<<ListboxSelect>>", self.select_running_task)
+        self.running_task_rows = []
+        notice_panel, self.approval_notices = self.text_panel(self.session_group, height=2,
+                                                             wrap="none", background="sidebar_card", text_size=9)
+        notice_panel.pack(fill="x", padx=8, pady=(0, 8))
+        self.approval_notice_panel = notice_panel
+        notice_panel.pack_forget()
+        self.approval_notice_rows = []
+        self.session_indicators = SessionIndicators(self, tree_panel, self.project_tree)
         self.refresh_recents()
 
         conversation_head = self.frame(center)
@@ -1103,7 +1148,7 @@ class App:
         self.root.bind("<Control-comma>", lambda _event: self.show_page("settings"))
 
     def show_page(self, page, *, force=False, section="general"):
-        if self.closing or not force and self.busy:
+        if self.closing:
             return
         if page == "workspace" and not (self.can_open_project or self.account_pending):
             page = "direct" if self.connection_mode == "direct" else ("status" if self.account else "access")
@@ -1111,6 +1156,8 @@ class App:
             return
         if page == self.current_page and not (force and page == "direct"):
             return
+        if self.current_page == "workspace" and page != "workspace":
+            self.park_approvals()
         if self.page_panel is self.workspace_view:
             self.workspace_view.pack_forget()
         elif self.page_panel is not None:
@@ -1152,6 +1199,9 @@ class App:
                 self.build_account_status(self.page_panel)
         self.apply_theme()
         self.update_actions()
+
+        if page == "workspace":
+            self.show_next_approval()
 
     def build_account_status(self, parent):
         body = self.frame(parent, "field")
@@ -1222,20 +1272,6 @@ class App:
                 right = max(190, width - side - 320)
             return side, width - right
         return (min(340, max(176, int(width * 0.30))),)
-
-    def resize_project_list(self, _event=None):
-        if not hasattr(self, "recent_list") or not self.recent_list.winfo_exists():
-            return
-        scale = float(self.root.tk.call("tk", "scaling"))
-        desired = self.recent_base_rows + self.recent_extra_rows
-        side_height = self.workspace_side.winfo_height()
-        fixed_project = max(0, self.project_group.winfo_reqheight() - self.recent_list.winfo_reqheight())
-        session_minimum = round(132 * scale)
-        remaining = side_height - fixed_project - session_minimum - round(26 * scale)
-        available_rows = max(2, remaining // max(1, self.recent_row_height))
-        target = min(desired, available_rows)
-        if int(self.recent_list.cget("height")) != target:
-            self.recent_list.configure(height=target)
 
     def resize_workspace(self, _event=None):
         """Keep the three panes usable in compact windows without constraining large ones."""
@@ -1429,6 +1465,8 @@ class App:
         self.context_meter.theme(c)
         self.update_settings_icon()
         self.theme_icon.theme(c)
+        if hasattr(self, "session_indicators"):
+            self.session_indicators.draw()
         try:
             for window in (self.root, *(item for item in self.root.winfo_children()
                                         if isinstance(item, tk.Toplevel))):
@@ -1495,6 +1533,7 @@ class App:
                 except Empty:
                     break
                 action()
+            self.pump_tasks()
         finally:
             if not self.closing:
                 self.schedule("pump", 28, self.pump)
@@ -1531,16 +1570,351 @@ class App:
         message = str(error).replace(self.token, "••••") if self.token else str(error)
         messagebox.showerror(title, message[:6500], parent=self.root)
 
+    def project_context(self):
+        if not self.project:
+            return None
+        key = str(self.state), canonical(self.project)
+        context = self.project_contexts.get(key)
+        if context is None:
+            path = self.history_path or self.state / (hashlib.sha256(key[1].encode()).hexdigest() + ".json")
+            context = ProjectContext(key[0], self.project, path, self.history, self.session_titles,
+                                     list(self.sessions), self.changes)
+            self.project_contexts[key] = context
+        return context
+
+    def current_task(self):
+        scheduler = getattr(self, "tasks", None)
+        return scheduler.selected(str(self.state), self.project, self.session) if scheduler else None
+
+    def session_task_state(self, session):
+        task = self.tasks.selected(str(self.state), self.project, session)
+        if task:
+            return task.metadata()
+        return self.history.get(session, {}).get("task", {"status": "idle"})
+
+    def task_is_current(self, task):
+        return task.key == (str(self.state), canonical(self.project), self.session)
+
+    def save_context_later(self, context):
+        self.dirty_contexts[context.key] = context
+        if not self.closing:
+            self.schedule("task_history", 400, self.flush_contexts)
+
+    def flush_contexts(self):
+        for key, context in tuple(self.dirty_contexts.items()):
+            try:
+                write_json(context.history_path, context.history)
+            except OSError as error:
+                self.status.set(f"历史保存失败 · {error.strerror}")
+            else:
+                self.dirty_contexts.pop(key, None)
+
+    def task_changed(self, task):
+        record = task.context.history[task.session_id]
+        metadata = task.metadata()
+        record["task"] = metadata
+        summaries = record.setdefault("tasks", [])
+        previous = next((index for index, item in enumerate(summaries)
+                         if item.get("task_id") == task.task_id), None)
+        if previous is None:
+            summaries.append(metadata)
+        else:
+            summaries[previous] = metadata
+        self.save_context_later(task.context)
+        if self.task_is_current(task):
+            self.bind_task_view()
+        self.render_project_tree()
+        self.refresh_task_sidebar()
+        self.session_indicators.draw()
+        self.schedule("task_stats", 100, self.poll_task_stats)
+
+    def bind_task_view(self):
+        task = self.current_task()
+        self.running = bool(task and task.status in ACTIVE)
+        self.stop_requested = task.cancel if task else Event()
+        self.active_approval_scope = task.scope if self.running else None
+        self.session_grants = task.grants if task else SessionGrants()
+        self.task_started = task.started_mono if task and task.status in EXECUTING else None
+        state = task.metadata() if task else self.history.get(self.session, {}).get("task", {})
+        labels = {"queued": "等待服务器空余槽位",
+                  "running": "方案分析中" if task and task.read_only else "任务执行中",
+                  "cancelling": "正在取消 · 等待模型与工具结束",
+                  "completed": "方案已生成" if state.get("mode") == "方案" else "任务已完成",
+                  "failed": "任务失败" if not state.get("interrupted") else "任务已中断",
+                  "cancelled": "已取消"}
+        self.task_state.set(labels.get(state.get("status"), ""))
+        if state.get("started_at"):
+            seconds = max(0, int((state.get("ended_at") or time()) - state["started_at"]))
+            self.task_elapsed.set(f"{seconds // 60:02d}:{seconds % 60:02d}")
+        else:
+            self.task_elapsed.set("")
+        if not self.running:
+            self.input.configure(state="normal")
+        self.update_session_grant_ui()
+        self.show_next_approval()
+        self.update_actions()
+
+    def park_approvals(self):
+        # Changing the viewed session revokes grants as before, but keeps pending requests alive.
+        self.session_grants.clear()
+        if self.active_approval:
+            self.approval_queue.appendleft(self.active_approval)
+            self.active_approval = None
+        self.approval_panel.pack_forget()
+        self.active_approval_scope = None
+        self.clear_approval_key_bindings_if_idle()
+
+    def approve_task(self, task, request):
+        if task.cancel.is_set():
+            return False
+        if task.grants.allows(task.scope, request):
+            return True
+        ticket = {"id": uuid4().hex, "request": dict(request), "scope": task.scope,
+                  "task_id": task.task_id, "owner": task.context.owner,
+                  "result": {"allow": False}, "completed": Event(), "guard": Lock()}
+        with self.approval_lock:
+            self.approval_tickets[ticket["id"]] = ticket
+        self.events.put(lambda: self.enqueue_approval(ticket))
+        while not ticket["completed"].wait(.1):
+            if task.cancel.is_set() or self.closing:
+                self.events.put(lambda: self.cancel_approval_ticket(ticket))
+                return False
+        return ticket["result"]["allow"]
+
+    def execute_task(self, task):
+        """Background-only: every credential, project, callback and native job is captured."""
+        engine = None
+        heartbeat_done = Event()
+        heartbeat = None
+        try:
+            model = task.model
+            if task.client:
+                if task.direct:
+                    task.client.check_open_webui_access()
+                else:
+                    self.require_active(task.client, check_quota=True)
+                    while not task.cancel.is_set():
+                        if task.client.acquire_task(task.task_id):
+                            task.admitted = True
+                            task.events.put({"type": "_admitted"})
+                            break
+                        task.cancel.wait(1)
+                    if task.cancel.is_set():
+                        return
+                    def keep_slot():
+                        while not heartbeat_done.wait(10):
+                            try:
+                                task.client.heartbeat_task(task.task_id)
+                            except AccountError as error:
+                                task.events.put({"type": "error", "text": "任务槽位续期失败：" + str(error)})
+                                self.events.put(lambda: self.cancel_task(task))
+                                return
+                    heartbeat = Thread(target=keep_slot, daemon=True, name="labcoding-slot-heartbeat")
+                    heartbeat.start()
+                    try:
+                        model = task.client.model()
+                    except AccountError as error:
+                        if error.status in {401, 403}:
+                            raise
+            if task.cancel.is_set():
+                return
+            task.model = model
+            task.events.put({"type": "_model", "model": model})
+            engine = task.engine = self.create_task_engine(task, self.model_limits(model))
+            if task.cancel.is_set():
+                return
+            authorize = ((task.client.check_open_webui_access if task.direct else
+                          lambda: self.require_active(task.client)) if task.client else None)
+            engine.run(task.session_id, task.prompt,
+                       lambda event: task.events.put(task.redact(event)),
+                       lambda request: self.approve_task(task, request),
+                       strict=task.strict, read_only=task.read_only, authorize=authorize,
+                       cancel_event=task.cancel)
+            if task.context.changes and not task.cancel.is_set():
+                task.result = task.context.changes.status()
+        except AccountError:
+            task.auth_failure = True
+            raise
+        finally:
+            try:
+                if engine is not None:
+                    engine.close()
+            finally:
+                task.engine = None
+                heartbeat_done.set()
+                if heartbeat:
+                    heartbeat.join(11)
+                if task.admitted:
+                    try:
+                        task.client.release_task(task.task_id)
+                    except AccountError as error:
+                        task.events.put({"type": "info", "text": "槽位释放未确认，服务器将自动回收：" + str(error)})
+
+    @staticmethod
+    def create_task_engine(task, limits):
+        from engine import Engine
+        proxy = task.client.engine_proxy_url() if task.client and not task.direct else None
+        engine = Engine(Path(task.context.owner), task.api_base, task.token,
+                        limits=limits, ca_bundle=task.ca_path, proxy_url=proxy,
+                        task_id=task.task_id if task.admitted else None)
+        try:
+            engine.open_project(task.context.project)
+            return engine
+        except Exception:
+            engine.close()
+            raise
+
+    def track_task(self, task, event):
+        event = task.redact(event)
+        if event.get("type") == "_admitted":
+            if not task.cancel.is_set():
+                task.status = "running"
+                task.started_at, task.started_mono = time(), monotonic()
+                self.task_changed(task)
+            return
+        if event.get("type") == "_model":
+            if self.task_is_current(task):
+                self.update_model(event["model"])
+            return
+        if event.get("type") == "_finished":
+            self.tasks.finish(task, event.get("error", ""))
+            if task.error:
+                self.track_task(task, {"type": "error", "text": task.error})
+            label = {"completed": "方案已生成" if task.read_only else "任务已完成",
+                     "failed": "任务失败", "cancelled": "已停止"}[task.status]
+            self.track_task(task, {"type": "info", "text": label})
+            if task.result:
+                branch, files = task.result
+                task.context.history[task.session_id]["changes"] = {
+                    "branch": branch, "files": [vars(item) for item in files]}
+                self.track_task(task, {"type": "tool", "name": "任务结束时的项目状态", "status": "completed",
+                                       "output": "\n".join([branch, *(f"{item.status}  {item.path}" for item in files[:200])])})
+                if self.task_is_current(task):
+                    self.show_changes(task.result)
+            self.task_changed(task)
+            if task.direct and task.context.owner == str(self.state) and self.connection_mode == "direct":
+                if task.auth_failure and task.error:
+                    self.direct_grant_failed(AccountError(task.error, event.get("status_code", 0)))
+                    return
+                if task.status == "completed":
+                    self.direct_state("已连接")
+            if (task.error and task.direct and task.context.owner == str(self.state)
+                    and self.connection_mode == "direct"):
+                status = event.get("status_code", 0)
+                if status in {401, 403}:
+                    self.direct_ready = False
+                    self.direct_state("需要重新登录" if status == 401 else "无模型调用权限")
+                elif status == 429:
+                    self.direct_state("请求限流")
+                elif status in {500, 502, 503, 504}:
+                    self.direct_state("服务暂不可用")
+                elif event.get("category") == "network":
+                    self.direct_state("连接超时或断开")
+                self.direct_feedback.set(task.error)
+                self.update_actions()
+            if task.context.owner == str(self.state) and not self.closing:
+                self.poll_account()
+            return
+        record = task.context.history[task.session_id]
+        items = record.setdefault("events", [])
+        event.update(task_id=task.task_id, session_id=task.session_id)
+        if (event.get("type") == "delta" and items and items[-1].get("type") == "delta"
+                and items[-1].get("task_id") == task.task_id):
+            items[-1]["text"] += event.get("text", "")
+        else:
+            items.append(dict(event))
+        if self.task_is_current(task) and not self.closing:
+            self.render_event(event)
+        self.save_context_later(task.context)
+
+    def pump_tasks(self):
+        for task in tuple(self.tasks.tasks.values()):
+            pending_text = []
+            for _ in range(96):
+                try:
+                    event = task.events.get_nowait()
+                except Empty:
+                    break
+                if event.get("type") == "delta":
+                    pending_text.append(event.get("text", ""))
+                    continue
+                if pending_text:
+                    self.track_task(task, {"type": "delta", "text": "".join(pending_text)})
+                    pending_text.clear()
+                self.track_task(task, event)
+            if pending_text:
+                self.track_task(task, {"type": "delta", "text": "".join(pending_text)})
+            if task.status not in ACTIVE and task.ended_at and time() - task.ended_at > 3 and task.events.empty():
+                self.tasks.tasks.pop(task.task_id, None)
+                if self.tasks.sessions.get(task.key) is task:
+                    self.tasks.sessions.pop(task.key, None)
+        if not self.closing:
+            for task in self.tasks.start_pending(self.execute_task):
+                self.task_changed(task)
+
+    def cancel_task(self, task):
+        if not self.tasks.cancel_task(task):
+            return
+        with self.approval_lock:
+            tickets = [ticket for ticket in self.approval_tickets.values()
+                       if ticket.get("task_id") == task.task_id]
+        for ticket in tickets:
+            self.cancel_approval_ticket(ticket)
+        if task.status == "cancelled":
+            self.track_task(task, {"type": "info", "text": "已取消排队"})
+        elif task.engine:
+            engine = task.engine
+            def abort():
+                try:
+                    engine.stop(task.session_id)
+                except Exception as error:
+                    task.events.put({"type": "info", "text": "取消请求未确认，等待执行线程结束：" + task.redact(str(error))})
+            Thread(target=abort, daemon=True).start()
+        self.task_changed(task)
+
+    def confirm_task_transition(self, label, resume):
+        active = self.tasks.active()
+        if not active:
+            return False
+        if self.identity_transition:
+            return True
+        if not messagebox.askyesno(label, f"{label}会使任务凭据失效。取消 {len(active)} 个后台/排队任务后继续？",
+                                  parent=self.root, default=messagebox.NO):
+            return True
+        self.identity_transition = True
+        self.tasks.accepting = False
+        for task in active:
+            self.cancel_task(task)
+        self.status.set("正在取消后台任务，等待身份切换…")
+        def wait():
+            self.pump_tasks()
+            if self.tasks.active():
+                self.schedule("identity_transition", 100, wait)
+                return
+            self.identity_transition = False
+            self.tasks.accepting = not self.closing
+            if not self.closing:
+                resume()
+        self.schedule("identity_transition", 100, wait)
+        self.update_actions()
+        return True
+
+    @staticmethod
+    def retire_engine(engine):
+        if engine:
+            Thread(target=engine.close, daemon=True, name="labcoding-engine-close").start()
+
     def update_actions(self):
-        free = not self.busy and not self.running and not self.closing
+        free = not self.busy and not self.closing
+        task = self.current_task()
+        session_free = not (task and task.status in ACTIVE) and not self.identity_transition
         local = free and self.can_open_project
         for button, active in (
             (self.open_button, local), (self.new_project_button, local), (self.connection_button, free),
-            (self.admin_button, free and self.is_admin),
+            (self.admin_button, not self.closing and self.is_admin),
             (self.role_button, free and self.can_switch_role),
-            (self.settings_button, free), (self.workspace_button, free),
-            (self.new_button, free and self.engine and self.can_use_agent),
-            (self.send_button, free and self.engine and self.can_use_agent),
+            (self.settings_button, not self.closing), (self.workspace_button, not self.closing),
+            (self.send_button, free and session_free and self.engine and self.can_use_agent),
             (self.stop_button, self.running and not self.stop_requested.is_set()),
             (self.refresh_button, free and self.changes),
             (self.diff_copy, bool(self.diff_text)), (self.diff_expand, bool(self.diff_text)),
@@ -1575,6 +1949,8 @@ class App:
         elif self.quota_locked and not self.account_pending:
             self.input.configure(state="normal")
         self.quota_locked = bool(message)
+        if task:
+            self.input.configure(state="disabled" if not session_free or message or self.account_pending else "normal")
         if message:
             self.quota_banner.configure(text=message)
             self.quota_banner.place(relx=0.5, rely=0.5, anchor="center")
@@ -1857,7 +2233,9 @@ class App:
                     and self.account_client.open_webui_expires_at > time())
 
     def change_role(self):
-        if not self.can_switch_role or self.busy or self.running:
+        if not self.can_switch_role or self.busy:
+            return
+        if self.confirm_task_transition("切换登录角色", self.change_role):
             return
         target = "user" if self.is_admin else "admin"
         if target == "user":
@@ -1866,7 +2244,9 @@ class App:
             prompt_role_switch(self, target, lambda code: self.switch_role(target, code))
 
     def switch_role(self, target, authorization_code):
-        if not self.can_switch_role or self.busy or self.running or self.closing:
+        if not self.can_switch_role or self.busy or self.closing:
+            return
+        if self.confirm_task_transition("切换登录角色", lambda: self.switch_role(target, authorization_code)):
             return
         if target != ("user" if self.is_admin else "admin"):
             return
@@ -1876,13 +2256,16 @@ class App:
 
         def done(user):
             self.token = client.token
+            self.session_grants.clear()
+            for task in self.tasks.tasks.values():
+                task.grants.clear()
             self.account, self.account_online = user, True
             try:
                 self.saved_login.update_session(client.base, client.token)
             except (OSError, ValueError):
                 self.status.set("角色已切换，保存的登录未能更新")
             if self.engine:
-                self.engine.close()
+                self.retire_engine(self.engine)
                 self.engine = None
             self.engine_limits = None
             self.account_state_changed()
@@ -2042,29 +2425,172 @@ class App:
     def refresh_recents(self):
         recent_path = self.state / "recents.json"
         self.recents = read_json(recent_path, []) if self.can_open_project else []
-        self.recent_list.delete(0, "end")
-        for path in self.recents:
-            self.recent_list.insert("end", Path(path).name)
-        self.update_delete_actions()
+        self.render_project_tree()
+
+    def selected_tree_row(self):
+        selected = self.project_tree.selection()
+        return self.tree_rows.get(selected[0]) if selected else None
 
     def update_delete_actions(self):
-        free = not self.busy and not self.running and not self.closing and self.can_open_project
-        self.remove_recent_button.configure(
-            state="normal" if free and self.recent_list.curselection() else "disabled")
-        self.delete_session_button.configure(
-            state="normal" if free and self.engine and self.session_list.curselection() else "disabled")
+        free = not self.busy and not self.closing and self.can_open_project
+        row = self.selected_tree_row()
+        self.remove_recent_button.configure(state="normal" if free and row and not row[1] else "disabled")
+
+    def render_project_tree(self):
+        if not hasattr(self, "project_tree"):
+            return
+        query = self.session_search.get().strip().casefold()
+        opened = {self.tree_rows[key][0] for key in self.project_tree.get_children()
+                  if key in self.tree_rows and self.project_tree.item(key, "open")}
+        scroll = self.project_tree.yview()[0]
+        self.project_tree.delete(*self.project_tree.get_children())
+        self.tree_rows.clear()
+        for path in self.recents:
+            context = self.project_contexts.get((str(self.state), canonical(path)))
+            history_path = self.state / (hashlib.sha256(os.path.normcase(path).encode()).hexdigest() + ".json")
+            history = context.history if context else read_json(history_path, {})
+            titles = context.titles if context else read_json(history_path.with_suffix(".titles.json"), {})
+            known = {item["id"]: dict(item) for item in context.sessions} if context else {}
+            for key, record in history.items():
+                if isinstance(record, dict):
+                    known.setdefault(key, {"id": key, "title": record.get("title", "新会话")})
+            for key, item in known.items():
+                item["title"] = titles.get(key) or item.get("title") or "新会话"
+            name = Path(path).name
+            matches = [item for item in known.values() if query in item["title"].casefold()]
+            if query and query not in name.casefold() and not matches:
+                continue
+            parent = self.project_tree.insert("", "end", text="📁 " + name, values=("＋",),
+                                              open=bool(query) or path in opened or path == self.project)
+            self.tree_rows[parent] = (path, None)
+            for item in (matches if query and query not in name.casefold() else known.values()):
+                child = self.project_tree.insert(parent, "end", text=item["title"])
+                self.tree_rows[child] = (path, item["id"])
+                if (path, item["id"]) == (self.project, self.session):
+                    self.project_tree.selection_set(child)
+            if path == self.project and not self.session:
+                self.project_tree.selection_set(parent)
+        self.project_tree.yview_moveto(scroll)
+        self.update_delete_actions()
+        if hasattr(self, "session_indicators"):
+            self.session_indicators.draw()
+
+    def select_project_row(self, _event=None):
+        row = self.selected_tree_row()
+        if row and not row[1] and canonical(row[0]) != canonical(self.project):
+            self.navigate_session(row[0])
+        if row and row[1] and (row[0], row[1]) != (self.project, self.session):
+            self.navigate_session(*row)
+        self.update_delete_actions()
+
+    def click_project_row(self, event):
+        key = self.project_tree.identify_row(event.y)
+        row = self.tree_rows.get(key)
+        if row and not row[1] and self.project_tree.identify_column(event.x) == "#1":
+            self.navigate_session(row[0], create=True)
+            return "break"
+
+    def navigate_session(self, path, session=None, *, create=False):
+        if self.busy or self.closing or not self.can_open_project:
+            return
+        self.show_page("workspace")
+        if canonical(path) != canonical(self.project):
+            self.open_project(path)
+            owner = str(self.state)
+            def ready():
+                if self.closing or str(self.state) != owner or canonical(self.project) != canonical(path):
+                    return
+                if self.busy:
+                    self.schedule("navigate_session", 50, ready)
+                elif self.engine:
+                    self.new_session() if create else self.open_session(session) if session else None
+            ready()
+        elif create:
+            self.new_session()
+        elif session:
+            self.open_session(session)
+
+    def select_running_task(self, _event=None):
+        selected = self.running_task_list.curselection()
+        if selected and selected[0] < len(self.running_task_rows):
+            task = self.running_task_rows[selected[0]]
+            self.navigate_session(task.context.project, task.session_id)
+
+    def pending_approval_tasks(self):
+        with self.approval_lock:
+            ids = {ticket.get("task_id") for ticket in self.approval_tickets.values()
+                   if not ticket["completed"].is_set()}
+        return [task for task in self.tasks.active() if task.task_id in ids and task.context.owner == str(self.state)]
+
+    def refresh_task_sidebar(self):
+        if not hasattr(self, "running_task_list"):
+            return
+        stats = self.task_stats
+        show = lambda key: str(stats[key]) if type(stats.get(key)) is int else "—"
+        self.task_stats_text.set(f"服务器执行中：{show('running_tasks')}\n剩余槽位：{show('available_slots')}\n"
+                                 f"本用户执行中：{show('user_running_tasks')}")
+        rows = [task for task in self.tasks.active() if task.context.owner == str(self.state)
+                and task.status in EXECUTING]
+        labels = [f"{Path(task.context.project).name} · "
+                  f"{task.context.titles.get(task.session_id) or task.context.history.get(task.session_id, {}).get('title', '新会话')}"
+                  for task in rows]
+        if labels != list(self.running_task_list.get(0, "end")):
+            self.running_task_list.delete(0, "end")
+            for label in labels:
+                self.running_task_list.insert("end", label)
+        self.running_task_rows = rows
+        pending = self.pending_approval_tasks()
+        if [task.task_id for task in pending] != self.approval_notice_rows:
+            self.approval_notice_rows = [task.task_id for task in pending]
+            self.approval_notices.configure(state="normal")
+            self.approval_notices.delete("1.0", "end")
+            for task in pending:
+                tag = "approval-" + task.task_id
+                title = task.context.titles.get(task.session_id) or task.context.history.get(task.session_id, {}).get("title", "新会话")
+                self.approval_notices.insert("end", f"{Path(task.context.project).name} 需要审批！{title}\n", tag)
+                self.approval_notices.tag_configure(tag, foreground=self.colors["remove"])
+                self.approval_notices.tag_bind(tag, "<Button-1>",
+                    lambda _event, task=task: self.navigate_session(task.context.project, task.session_id))
+            self.approval_notices.configure(state="disabled", height=min(2, max(1, len(pending))))
+            if pending:
+                self.approval_notice_panel.pack(fill="x", padx=8, pady=(0, 8))
+            else:
+                self.approval_notice_panel.pack_forget()
+
+    def poll_task_stats(self):
+        if self.closing:
+            return
+        self.schedule("task_stats", 2000, self.poll_task_stats)
+        client, generation = self.account_client, self.account_generation
+        if not client or not self.account_online or self.connection_mode != "account" or self.task_stats_polling:
+            return
+        self.task_stats_polling = True
+        def read():
+            try:
+                result = client.request("GET", "/api/tasks")
+            except AccountError:
+                result = {}
+            def done():
+                self.task_stats_polling = False
+                if not self.closing and generation == self.account_generation and client is self.account_client:
+                    self.task_stats = result
+                    self.refresh_task_sidebar()
+                    if self.current_page == "admin" and self.page_controller:
+                        self.page_controller.update_task_counts(result)
+            self.events.put(done)
+        Thread(target=read, daemon=True).start()
 
     def remove_recent(self):
-        selected = self.recent_list.curselection()
-        if self.busy or self.running or self.closing or not self.can_open_project or not selected:
+        row = self.selected_tree_row()
+        if self.busy or self.closing or not self.can_open_project or not row or row[1]:
             return
-        path = self.recents[selected[0]]
+        path = row[0]
         state = self.state
         if not messagebox.askyesno(
                 "删除最近项目记录", f"从最近项目中移除以下记录？\n\n{path}\n\n项目文件和历史会话将保留。",
                 parent=self.root, default=messagebox.NO):
             return
-        if state != self.state or self.busy or self.running or self.closing or not self.can_open_project:
+        if state != self.state or self.busy or self.closing or not self.can_open_project:
             return
         try:
             write_json(state / "recents.json", [item for item in self.recents if item != path])
@@ -2080,7 +2606,7 @@ class App:
             self.status.set("旧版本地凭据未能移除")
 
     def account_action(self):
-        if self.busy or self.running or self.closing:
+        if self.busy or self.closing:
             return
         if self.connection_mode == "direct":
             self.show_page("direct")
@@ -2088,6 +2614,8 @@ class App:
         client = self.account_client
         if client is None:
             self.show_page("access")
+            return
+        if self.confirm_task_transition("退出登录", self.account_action):
             return
         self.cancel_saved_login()
         try:
@@ -2111,10 +2639,12 @@ class App:
         self.worker("退出登录", client.logout, done, failed)
 
     def select_connection(self, mode):
-        if mode not in {"direct", "account"} or self.busy or self.running or self.closing:
+        if mode not in {"direct", "account"} or self.busy or self.closing:
             return
         if mode == self.connection_mode:
             self.show_page("direct" if mode == "direct" else ("workspace" if self.account_client else "access"))
+            return
+        if self.confirm_task_transition("更换连接身份", lambda: self.select_connection(mode)):
             return
         if mode == "direct" and not self.has_admin_session:
             if not self.account_client:
@@ -2215,8 +2745,8 @@ class App:
             return
         if self.account_client:
             self.account_client.clear_open_webui_access()
-        if self.running:
-            self.stop()
+        for task in self.tasks.active():
+            self.cancel_task(task)
         if self.busy:
             self.update_actions()
             self.schedule("direct_lock", 100, lambda: self.lock_direct_access(
@@ -2237,7 +2767,7 @@ class App:
 
     def reset_direct_model(self):
         if self.engine:
-            self.engine.close()
+            self.retire_engine(self.engine)
         self.engine = self.engine_limits = None
         self.token = self.api_base = ""
         self.direct_identity = ""
@@ -2303,7 +2833,10 @@ class App:
         return self.data_root / "public-models" / hashlib.sha256(scope.encode("utf-8")).hexdigest()
 
     def check_direct_connection(self, *, address=None, save=False, restore=False, email=None, password=None):
-        if self.connection_mode != "direct" or self.busy or self.running or self.closing:
+        if self.connection_mode != "direct" or self.busy or self.closing:
+            return False
+        if self.confirm_task_transition("更改模型连接", lambda: self.check_direct_connection(
+                address=address, save=save, restore=restore, email=email, password=password)):
             return False
         if not self.direct_unlocked:
             self.direct_feedback.set("请先验证最高权限密码。")
@@ -2533,6 +3066,8 @@ class App:
         return current
 
     def clear_account(self, *, forget_session=True):
+        for task in self.tasks.active():
+            self.cancel_task(task)
         self.cancel_all_approvals()
         self.session_grants.clear()
         self.active_approval_scope = None
@@ -2550,6 +3085,8 @@ class App:
         self.clear_workspace()
 
     def clear_workspace(self):
+        for task in self.tasks.active():
+            self.cancel_task(task)
         self.reset_task_history_browse()
         self.cancel_all_approvals()
         self.session_grants.clear()
@@ -2561,11 +3098,12 @@ class App:
         self.direct_feedback.set("")
         self.model_checked = 0
         self.model_info = {}
+        self.task_stats = {}
         self.context_meter.set_model({})
         self.ca_path = None
         self.save_history()
         if self.engine:
-            self.engine.close()
+            self.retire_engine(self.engine)
         self.engine = None
         self.engine_limits = None
         self.token = self.api_base = ""
@@ -2592,7 +3130,7 @@ class App:
         self.clear_text(self.diff)
         self.reset_conversation()
         self.show_welcome()
-        self.update_actions()
+        self.bind_task_view()
 
     def account_state_changed(self):
         user = self.account
@@ -2641,6 +3179,8 @@ class App:
             return
         self.account_polling = True
         generation = self.account_generation
+        client_user_id = (self.account or {}).get("id")
+        client_role = (self.account or {}).get("role")
         check_grant = direct and self.direct_unlocked
         refresh_model = monotonic() - self.model_checked > 12 or not self.model_checked
 
@@ -2661,8 +3201,8 @@ class App:
                 return
             if error and error.status in {401, 403}:
                 self.account_online = False
-                if self.running:
-                    self.stop()
+                for task in self.tasks.active():
+                    self.cancel_task(task)
                 self.status.set("登录已失效，请退出后重新登录")
                 self.account_title.set("会话已失效")
                 self.account_detail.set("退出后重新登录，即可继续使用。")
@@ -2677,10 +3217,17 @@ class App:
                     self.account_online = False
                     self.account_state_changed()
                 return
+            if client_user_id is not None and user.get("id") != client_user_id:
+                self.require_account_login("登录身份已改变，请重新登录。")
+                return
             changed = user != self.account or not self.account_online
             self.account, self.account_online = user, True
-            if changed and user["status"] != "active" and self.running:
-                self.stop()
+            if changed and (user["status"] != "active" or user.get("id") != client_user_id
+                            or user.get("role") != client_role):
+                for task in self.tasks.active():
+                    self.cancel_task(task)
+                    task.grants.clear()
+                self.session_grants.clear()
             if changed:
                 self.account_state_changed()
             if model is not None:
@@ -2717,25 +3264,23 @@ class App:
         self.model_info = model
         self.model_checked = monotonic()
         self.context_meter.set_model(model, output_limit=self.model_limits(model)[1])
+        if "running_tasks" in model:
+            self.task_stats = model
+            self.refresh_task_sidebar()
 
     def choose_project(self):
-        if self.busy or self.running or self.closing or not self.can_open_project:
+        if self.busy or self.closing or not self.can_open_project:
             return
         path = filedialog.askdirectory(parent=self.root, title="选择项目文件夹", mustexist=True)
         if path:
             self.open_project(path)
 
     def new_project(self):
-        if not self.busy and not self.running and not self.closing and self.can_open_project:
+        if not self.busy and not self.closing and self.can_open_project:
             show_new_project(self)
 
-    def open_recent(self, _event):
-        selected = self.recent_list.curselection()
-        if selected:
-            self.open_project(self.recents[selected[0]])
-
     def open_project(self, path):
-        if self.busy or self.running or self.closing or not self.can_open_project:
+        if self.busy or self.closing or not self.can_open_project:
             return
         candidate = Path(path)
         try:
@@ -2748,7 +3293,7 @@ class App:
         if Path(path) == Path(path).parent:
             self.show_error("打开项目", "请选择项目子文件夹。")
             return
-        self.cancel_all_approvals()
+        self.park_approvals()
         self.reset_task_history_browse()
         self.session_grants.clear()
         self.active_approval_scope = None
@@ -2765,8 +3310,16 @@ class App:
         write_json(self.state / "recents.json", [path, *[p for p in self.recents if p != path]][:15])
         self.refresh_recents()
         self.history_path = self.state / (hashlib.sha256(os.path.normcase(path).encode()).hexdigest() + ".json")
-        self.history = read_json(self.history_path, {})
-        self.load_session_titles()
+        context = self.project_contexts.get((str(self.state), canonical(path)))
+        if context is None:
+            self.history = read_json(self.history_path, {})
+            self.load_session_titles()
+            context = ProjectContext(str(self.state), path, self.history_path, self.history, self.session_titles)
+            self.project_contexts[context.key] = context
+            if context.recover():
+                self.save_context_later(context)
+        else:
+            self.history, self.session_titles = context.history, context.titles
         self.update_sessions([])
         self.session_search.set("")
         self.changes = None
@@ -2776,17 +3329,22 @@ class App:
         self.clear_text(self.diff)
         self.diff_text = ""
         self.reset_conversation()
+        self.bind_task_view()
         self.restore_draft()
         self.append(self.chat, path + "\n", "heading")
+        generation = self.account_generation
 
         def work():
             if old_engine:
                 old_engine.close()
-            changes = Changes(path)
+            changes = context.changes or Changes(path)
             return changes, changes.status()
 
         def done(result):
+            if generation != self.account_generation or context.key != (str(self.state), canonical(self.project)):
+                return
             self.changes, status = result
+            context.changes = self.changes
             self.show_changes(status)
             if self.can_use_agent:
                 self.start_engine(path)
@@ -2798,12 +3356,17 @@ class App:
     def start_engine(self, path):
         limits = self.model_limits(self.model_info)
         client = self.account_client if self.connection_mode == "account" else None
+        owner, generation = self.state, self.account_generation
+        connection = self.api_base, self.token, self.ca_path
 
         def work():
             proxy_url = client.engine_proxy_url() if client else None
-            return self.create_engine(path, limits, proxy_url=proxy_url)
+            return self.create_engine(path, limits, proxy_url=proxy_url, owner=owner, connection=connection)
 
         def done(result):
+            if owner != self.state or generation != self.account_generation or path != self.project:
+                self.retire_engine(result[0])
+                return
             self.engine, sessions = result
             self.engine_limits = limits
             self.update_sessions(sessions)
@@ -2820,10 +3383,10 @@ class App:
         max_output = output if type(output) is int and output > 0 else 4096
         return context, min(max_output, 4096, context // 2)
 
-    def create_engine(self, path, limits, *, proxy_url=None):
+    def create_engine(self, path, limits, *, proxy_url=None, owner=None, connection=None):
         from engine import Engine
-        engine = Engine(self.state, self.api_base, self.token,
-                        limits=limits, ca_bundle=self.ca_path, proxy_url=proxy_url)
+        base, token, ca = connection or (self.api_base, self.token, self.ca_path)
+        engine = Engine(owner or self.state, base, token, limits=limits, ca_bundle=ca, proxy_url=proxy_url)
         try:
             engine.open_project(path)
             return engine, engine.sessions()
@@ -2839,6 +3402,9 @@ class App:
             if key in self.session_titles:
                 row["title"] = self.session_titles[key]
         self.sessions = list(known.values())
+        if self.project:
+            context = self.project_context()
+            context.sessions = self.sessions
         self.render_session_list()
 
     def load_session_titles(self):
@@ -2848,14 +3414,19 @@ class App:
                                if isinstance(saved, dict) else {})
 
     def show_session_menu(self, event):
-        index = self.session_list.nearest(event.y)
-        bounds = self.session_list.bbox(index) if self.visible_sessions else None
-        if not bounds or not bounds[1] <= event.y < bounds[1] + bounds[3]:
+        key = self.project_tree.identify_row(event.y)
+        row = self.tree_rows.get(key)
+        if not row or not row[1]:
             return "break"
-        session_id = self.visible_sessions[index]["id"]
-        enabled = not (self.busy or self.running or self.closing) and self.can_open_project and self.history_path
+        self.project_tree.selection_set(key)
+        if canonical(row[0]) != canonical(self.project):
+            self.navigate_session(*row)
+            return "break"
+        enabled = not (self.busy or self.closing) and self.can_open_project and self.history_path
+        active = self.session_task_state(row[1]).get("status") in ACTIVE
         self.session_menu.entryconfigure(0, state="normal" if enabled else "disabled",
-                                         command=lambda: self.rename_session(session_id))
+                                         command=lambda: self.rename_session(row[1]))
+        self.session_menu.entryconfigure(1, state="normal" if enabled and not active else "disabled")
         try:
             self.session_menu.tk_popup(event.x_root, event.y_root)
         finally:
@@ -2863,13 +3434,13 @@ class App:
         return "break"
 
     def rename_session(self, session_id=None):
-        if self.busy or self.running or self.closing or not self.can_open_project or not self.history_path:
+        if self.busy or self.closing or not self.can_open_project or not self.history_path:
             return
         if session_id is None:
-            selection = self.session_list.curselection()
-            if not selection:
+            row = self.selected_tree_row()
+            if not row or not row[1] or canonical(row[0]) != canonical(self.project):
                 return
-            session_id = self.visible_sessions[selection[0]]["id"]
+            session_id = row[1]
         row = next((row for row in self.sessions if row["id"] == session_id), None)
         if row is None:
             return
@@ -2878,7 +3449,7 @@ class App:
                                        initialvalue=row.get("title") or "新会话", parent=self.root)
         if title is None:
             return
-        if (self.busy or self.running or self.closing or not self.can_open_project
+        if (self.busy or self.closing or not self.can_open_project
                 or project != self.project or history_path != self.history_path
                 or generation != self.account_generation):
             return
@@ -2893,30 +3464,25 @@ class App:
             self.show_error("重命名保存失败，请重试", error)
             return
         self.session_titles = updated
+        self.project_context().titles = updated
         if self.session_search.get().strip().casefold() not in title.casefold():
             self.session_search.set("")
         self.update_sessions(self.sessions)
-        for index, item in enumerate(self.visible_sessions):
-            if item["id"] == session_id:
-                self.session_list.see(index)
-                break
-
     def render_session_list(self):
         query = self.session_search.get().strip().casefold()
         self.visible_sessions = [row for row in self.sessions if query in (row.get("title") or "").casefold()]
-        self.session_list.delete(0, "end")
-        for index, row in enumerate(self.visible_sessions):
-            self.session_list.insert("end", row.get("title") or "新会话")
-            if row["id"] == self.session:
-                self.session_list.selection_set(index)
-        self.update_delete_actions()
+        self.render_project_tree()
 
     def delete_session(self):
-        selected = self.session_list.curselection()
-        if self.busy or self.running or self.closing or not self.can_open_project or not self.engine or not selected:
+        selected = self.selected_tree_row()
+        if (self.busy or self.closing or not self.can_open_project or not self.engine or not selected
+                or not selected[1] or canonical(selected[0]) != canonical(self.project)):
             return
-        row = self.visible_sessions[selected[0]]
-        session_id = row["id"]
+        session_id = selected[1]
+        row = next((row for row in self.sessions if row["id"] == session_id), {"id": session_id})
+        if self.session_task_state(session_id).get("status") in ACTIVE:
+            self.status.set("请先停止该会话的任务，再删除会话。")
+            return
         engine, history, history_path, titles = self.engine, self.history, self.history_path, self.session_titles
         if not messagebox.askyesno(
                 "删除历史会话", f"删除会话“{row.get('title') or '新会话'}”？\n\n"
@@ -2924,7 +3490,8 @@ class App:
                 parent=self.root, default=messagebox.NO):
             return
         if (engine is not self.engine or history is not self.history or self.busy
-                or self.running or self.closing or not self.can_open_project):
+                or self.closing or not self.can_open_project
+                or self.session_task_state(session_id).get("status") in ACTIVE):
             return
 
         def deleted(_result):
@@ -2939,6 +3506,8 @@ class App:
                 return
             history.pop(session_id, None)
             titles.pop(session_id, None)
+            if self.project:
+                self.project_context().titles = titles
             if history is not self.history:
                 return
             self.drafts.pop((self.project, session_id), None)
@@ -2954,28 +3523,23 @@ class App:
         self.worker("删除历史会话", lambda: engine.delete_session(session_id), deleted)
 
     def new_session(self):
-        if not self.engine or not self.can_use_agent or self.busy or self.running or self.closing:
+        if not self.engine or not self.can_use_agent or self.busy or self.closing:
             return
         self.show_page("workspace")
+        engine, context = self.engine, self.project_context()
 
         def created(session_id):
+            if engine is not self.engine or context.key != (str(self.state), canonical(self.project)):
+                return
             self.history[session_id] = {"title": "新会话", "events": []}
             self.session_search.set("")
             self.open_session(session_id)
             self.update_sessions(self.sessions)
 
-        self.worker("新建会话", self.engine.new_session, created)
-
-    def select_session(self, _event):
-        selection = self.session_list.curselection()
-        if not self.busy and not self.running and selection:
-            key = self.visible_sessions[selection[0]]["id"]
-            if key != self.session:
-                self.open_session(key)
-        self.update_delete_actions()
+        self.worker("新建会话", engine.new_session, created)
 
     def open_session(self, session_id):
-        self.cancel_all_approvals()
+        self.park_approvals()
         self.reset_task_history_browse()
         self.session_grants.clear()
         self.active_approval_scope = None
@@ -2989,20 +3553,36 @@ class App:
             for event in local.get("events", []):
                 self.render_event(event)
             self.end_reply()
+            saved = local.get("changes")
+            if saved:
+                self.show_changes((saved["branch"], [Change(**row) for row in saved["files"]]))
         if not local and self.engine:
-            self.worker("读取会话", lambda: self.engine.history(session_id), self.render_history)
+            engine, context = self.engine, self.project_context()
+            self.worker("读取会话", lambda: engine.history(session_id),
+                        lambda messages: self.render_history(messages, context, session_id))
+        self.bind_task_view()
+        self.render_project_tree()
 
-    def render_history(self, messages):
+    def render_history(self, messages, context=None, session_id=None):
+        events = []
         for message in messages:
             info = message.get("info", message)
-            self.end_reply()
+            events.append({"type": "reply_end"})
             for part in message.get("parts", []):
                 if part.get("type") == "text":
                     kind = "user" if info.get("role") == "user" else "delta"
-                    self.render_event({"type": kind, "text": part.get("text", "")})
+                    events.append({"type": kind, "text": part.get("text", "")})
                 if part.get("type") == "tool":
                     state = part.get("state", {})
-                    self.render_event({"type": "tool", "key": part.get("id"), "name": part.get("tool"), **state})
+                    events.append({"type": "tool", "key": part.get("id"), "name": part.get("tool"), **state})
+        if context is not None:
+            title = next((row["title"] for row in context.sessions if row["id"] == session_id), "历史会话")
+            context.history.setdefault(session_id, {"title": title, "events": events})
+            self.save_context_later(context)
+            if context.key != (str(self.state), canonical(self.project)) or session_id != self.session:
+                return
+        for event in events:
+            self.render_event(event)
         self.end_reply()
         self.context_meter.restore(messages)
 
@@ -3101,76 +3681,38 @@ class App:
             self.drafts[key] = draft
         else:
             self.drafts.pop(key, None)
+        if self.project and self.session and self.session in self.history:
+            self.history[self.session]["draft"] = draft
+            self.save_context_later(self.project_context())
 
     def restore_draft(self):
+        previous_state = self.input.cget("state")
+        self.input.configure(state="normal")
         self.input.delete("1.0", "end")
-        draft = self.drafts.get((self.project, self.session))
+        draft = self.drafts.get((self.project, self.session), self.history.get(self.session, {}).get("draft", ""))
         if draft:
             self.input.insert("1.0", draft)
+        self.input.configure(state=previous_state)
 
     def submit(self):
         prompt = self.input.get("1.0", "end-1c").strip()
-        if not prompt or self.busy or self.running or not self.engine or not self.can_use_agent:
+        task = self.current_task()
+        if (not prompt or self.busy or self.closing or self.identity_transition or not self.engine
+                or not self.can_use_agent or task and task.status in ACTIVE):
             return
-        client, engine, session = self.account_client, self.engine, self.session
-        direct = self.connection_mode == "direct"
-        known_model = self.model_info
-        self.input.configure(state="disabled")
-
-        def work():
-            model = known_model
-            if direct:
-                client.check_open_webui_access()
-            elif client:
-                self.require_active(client, check_quota=True)
-                try:
-                    model = client.model()
-                except AccountError as error:
-                    if error.status in {401, 403}:
-                        raise
-            limits = self.model_limits(model)
-            proxy_url = client.engine_proxy_url() if client and not direct else None
-            current = engine
-            sessions = None
-            try:
-                if limits != self.engine_limits or proxy_url != engine.proxy_url:
-                    engine.close()
-                    current, sessions = self.create_engine(self.project, limits, proxy_url=proxy_url)
-                return model, limits, current, sessions, session or current.new_session()
-            except Exception:
-                if current is not engine:
-                    current.close()
-                raise
-
-        def prepared(result):
-            self.input.configure(state="normal")
-            model, limits, self.engine, sessions, session_id = result
-            self.engine_limits = limits
-            if sessions is not None:
-                self.update_sessions(sessions)
-            self.update_model(model)
-            if not self.can_use_agent:
-                self.update_actions()
-                return
-            if not self.session:
-                self.drafts.pop((self.project, None), None)
-                self.session = session_id
-                self.reset_conversation()
-                self.session_search.set("")
+        if len(prompt) > 24000:
+            self.show_error("无法开始任务", "任务不能超过 24,000 个字符。")
+            return
+        if not self.session:
+            engine, project, owner = self.engine, self.project, str(self.state)
+            def created(session):
+                if engine is self.engine and project == self.project and owner == str(self.state):
+                    self.history[session] = {"title": "新会话", "events": []}
+                    self.open_session(session)
+                    self.run_task(prompt)
+            self.worker("准备新会话", engine.new_session, created)
+        else:
             self.run_task(prompt)
-
-        def failed(error):
-            self.input.configure(state="normal")
-            if not engine.process:
-                self.engine = None
-            if isinstance(error, AccountError):
-                if direct:
-                    self.direct_grant_failed(error)
-                    return
-                self.poll_account()
-            self.show_error("无法开始任务", error)
-
-        self.worker("校验身份并准备任务", work, prepared, failed)
 
     @staticmethod
     def require_active(client, *, check_quota=False):
@@ -3183,85 +3725,33 @@ class App:
     def run_task(self, prompt):
         self.reset_task_history_browse()
         session = self.session
-        self.active_approval_scope = self.current_approval_scope()
-        engine = self.engine
-        client = self.account_client
-        direct = self.connection_mode == "direct"
+        if not session or not self.project or self.closing:
+            return
+        current = self.current_task()
+        if current and current.status in ACTIVE:
+            return
+        context = self.project_context()
+        identity = dict(self.account or {"id": self.direct_identity, "role": "admin"})
+        task = SessionTask(context, session, prompt, identity, client=copy(self.account_client),
+                           api_base=self.api_base, token=self.token, ca_path=self.ca_path,
+                           model=dict(self.model_info), mode=self.mode.get(), strict=self.strict.get(),
+                           direct=self.connection_mode == "direct", grants=self.session_grants)
+        try:
+            self.tasks.submit(task)
+        except ValueError as error:
+            self.show_error("无法开始任务", error)
+            return
         self.input.delete("1.0", "end")
         self.drafts.pop((self.project, session), None)
-        self.running = True
-        self.stop_requested.clear()
         self.end_reply()
-        planning = self.mode.get() == "方案"
-        self.task_started = monotonic()
-        self.task_elapsed.set("00:00")
-        self.task_state.set("方案分析中" if planning else "任务执行中")
-        self.update_actions()
         record = self.history.setdefault(session, {"title": "新会话", "events": []})
+        record["draft"] = ""
         if not record["events"] and record.get("title") == "新会话":
             record["title"] = " ".join(prompt.split())[:35]
         self.update_sessions([row for row in self.sessions if row["id"] != session])
-        self.track(record, {"type": "user", "text": prompt, "mode": self.mode.get()})
-        strict = self.strict.get()
-
-        def on_event(event):
-            clean = self.redact(event)
-            self.events.put(lambda: self.track(record, clean))
-            if event.get("type") == "context" and event.get("state") in {"request_complete", "request_failed"}:
-                self.events.put(self.poll_account)
-
-        def work():
-            authorize = None
-            if direct:
-                client.check_open_webui_access()
-                authorize = client.check_open_webui_access
-            elif client:
-                authorize = lambda: self.require_active(client)
-            engine.run(session, prompt, on_event, self.approve, strict=strict, read_only=planning,
-                       authorize=authorize)
-
-        def done(_result, error=False):
-            self.running = False
-            self.poll_account()
-            stopped = self.stop_requested.is_set()
-            status = "已停止" if stopped else ("任务失败" if error else ("方案已生成" if planning else "任务已完成"))
-            self.task_state.set(status)
-            self.task_started = None
-            self.track(record, {"type": "info", "text": status})
-            if self.connection_mode == "direct" and not error and not stopped:
-                self.direct_state("已连接")
-
-            def show_result(result):
-                self.show_changes(result)
-                branch, files = result
-                self.track(record, {"type": "tool", "name": "任务结束时的项目状态", "status": "completed",
-                                    "output": "\n".join([branch, *(f"{item.status}  {item.path}"
-                                                    for item in files[:200])])})
-
-            if self.changes and not planning:
-                self.worker("刷新文件变更", self.changes.status, show_result)
-
-        def failed(error):
-            if direct and isinstance(error, AccountError):
-                done(None, True)
-                self.direct_grant_failed(error)
-                return
-            self.track(record, {"type": "error", "text": self.redact(str(error))})
-            if self.connection_mode == "direct":
-                status = getattr(error, "status", 0)
-                if status in {401, 403}:
-                    self.direct_ready = False
-                    self.direct_state("需要重新登录" if status == 401 else "无模型调用权限")
-                elif status == 429:
-                    self.direct_state("请求限流")
-                elif status in {500, 502, 503, 504}:
-                    self.direct_state("服务暂不可用")
-                elif getattr(error, "category", "") == "network":
-                    self.direct_state("连接超时或断开")
-                self.direct_feedback.set(self.redact(str(error)))
-            done(None, True)
-
-        self.worker("执行任务", work, done, failed)
+        self.track_task(task, {"type": "user", "text": prompt, "mode": self.mode.get()})
+        self.task_changed(task)
+        self.pump_tasks()
 
     def redact(self, value):
         if not self.token:
@@ -3298,11 +3788,14 @@ class App:
                 write_json(self.history_path, self.history)
             except OSError as error:
                 self.status.set(f"历史保存失败 · {error.strerror}")
+        self.flush_contexts()
 
     def render_event(self, event):
         kind = event.get("type")
         value = event.get("text", "")
-        if kind == "delta":
+        if kind == "reply_end":
+            self.end_reply()
+        elif kind == "delta":
             if not value:
                 return
             if not self.live_text:
@@ -3383,25 +3876,17 @@ class App:
         return ticket["result"]["allow"]
 
     def stop(self):
-        if not self.running or self.stop_requested.is_set():
-            return
-        self.stop_requested.set()
-        self.update_cancel.set()
-        self.cancel_all_approvals()
-        self.task_state.set("正在停止")
-        self.update_actions()
-
-        def abort():
-            try:
-                self.engine.stop(self.session)
-            except Exception as error:
-                self.events.put(lambda error=error: self.show_error("停止任务", error))
-
-        Thread(target=abort, daemon=True).start()
+        task = self.current_task()
+        if task:
+            self.cancel_task(task)
 
     def refresh_changes(self):
         if self.changes:
-            self.worker("刷新文件变更", self.changes.status, self.show_changes)
+            changes, owner = self.changes, str(self.state)
+            def done(result):
+                if changes is self.changes and owner == str(self.state):
+                    self.show_changes(result)
+            self.worker("刷新文件变更", changes.status, done)
 
     def show_changes(self, result):
         branch, self.change_rows = result
@@ -3428,11 +3913,14 @@ class App:
 
     def select_change(self, _event):
         selection = self.change_list.curselection()
-        if not selection or self.busy or self.running:
+        if not selection or self.busy:
             return
         change = self.visible_changes[selection[0]]
+        changes, owner = self.changes, str(self.state)
 
         def done(diff):
+            if changes is not self.changes or owner != str(self.state):
+                return
             current = self.change_list.curselection()
             if current != selection or self.visible_changes[current[0]] != change:
                 self.select_change(None)
@@ -3441,7 +3929,7 @@ class App:
             added, removed = self.render_diff(self.diff)
             self.result_status.set(f"+{added} / −{removed}   {change.path}" if added or removed else change.path)
 
-        self.worker("读取差异", lambda: self.changes.diff(change), done)
+        self.worker("读取差异", lambda: changes.diff(change), done)
 
     def render_diff(self, box):
         added, removed = 0, 0
@@ -3488,18 +3976,47 @@ class App:
         window.grab_set()
 
     def close(self):
+        if self.tasks.active():
+            if not self.shutdown_waiting:
+                if not messagebox.askyesno("关闭应用", f"停止 {len(self.tasks.active())} 个后台/排队任务并退出？",
+                                          parent=self.root, default=messagebox.NO):
+                    return
+                self.shutdown_waiting = True
+                self.closing = True
+                self.tasks.accepting = False
+                self.cancel_all_approvals()
+                for task in self.tasks.active():
+                    self.cancel_task(task)
+                self.update_actions()
+            self.pump_tasks()
+            # Normal pump stops rescheduling during shutdown; metadata callbacks must still drain.
+            for _ in range(200):
+                try:
+                    action = self.events.get_nowait()
+                except Empty:
+                    break
+                action()
+            self.status.set("正在取消任务并保存记录，等待模型与工具结束…")
+            if self.tasks.active():
+                self.root.after(100, self.close)
+                return
         if self.busy and not self.running:
+            if self.closing:
+                self.pump()
             self.schedule("close", 200, self.close)
             return
-        if self.running and not messagebox.askyesno("关闭应用", "停止当前任务并退出？", parent=self.root):
+        if self.running and not self.shutdown_waiting and not messagebox.askyesno("关闭应用", "停止当前任务并退出？", parent=self.root):
             return
         self.closing = True
+        self.tasks.accepting = False
         self.cancel_all_approvals()
         self.session_grants.clear()
         self.active_approval_scope = None
         if self.account_client:
             self.account_client.clear_open_webui_access()
         self.end_reply()
+        self.save_draft()
+        self.session_indicators.close()
         for timer in self.timers.values():
             self.root.after_cancel(timer)
         self.timers.clear()
@@ -3518,8 +4035,7 @@ class App:
         self.stop_requested.set()
         self.save_history()
         try:
-            if self.engine:
-                self.engine.close()
+            self.retire_engine(self.engine)
         finally:
             if self.connection_mode == "direct":
                 self.token = ""

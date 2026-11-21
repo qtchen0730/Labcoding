@@ -89,7 +89,7 @@ def create_project(parent, name, initialize_git=False):
 
 
 def show_new_project(app):
-    if app.busy or app.running or app.closing:
+    if app.busy or app.closing:
         return
     window = tk.Toplevel(app.root)
     window.title("新建项目")

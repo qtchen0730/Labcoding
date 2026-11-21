@@ -290,11 +290,8 @@ class ThemeTests(unittest.TestCase):
                 root.geometry("1366x768")
                 root.update()
                 settle_geometry(root)
-                row_height = gui.recent_row_height
-                height_gain = gui.recent_list.winfo_height() - 5 * row_height
-                desired_gain = round(6 * 72 / 2.54 * float(root.tk.call("tk", "scaling")))
-                self.assertGreaterEqual(height_gain, desired_gain * .75)
-                self.assertLessEqual(height_gain, desired_gain + row_height)
+                self.assertGreaterEqual(gui.project_tree.winfo_height(), 100)
+                self.assertEqual(gui.open_button.cget("text"), "打开项目")
                 self.assertEqual(gui.open_button.winfo_width(), gui.remove_recent_button.winfo_width())
                 self.assertEqual(gui.open_button.winfo_rootx() + gui.open_button.winfo_width(),
                                  gui.remove_recent_button.winfo_rootx() + gui.remove_recent_button.winfo_width())
@@ -317,9 +314,6 @@ class ThemeTests(unittest.TestCase):
                     self.assertGreaterEqual(gui.session_group.winfo_height(), 110)
                     self.assertGreaterEqual(gui.session_group.winfo_y() - (
                         gui.project_group.winfo_y() + gui.project_group.winfo_height()), 12)
-                    if height == 1080:
-                        self.assertEqual(int(gui.recent_list.cget("height")),
-                                         gui.recent_base_rows + gui.recent_extra_rows)
             finally:
                 gui.close()
 
@@ -372,8 +366,8 @@ class ThemeTests(unittest.TestCase):
                 gui.show_page("workspace", force=True)
                 root.geometry("1366x768")
                 for index in range(90):
-                    gui.recent_list.insert("end", f"Project {index}")
-                    gui.session_list.insert("end", f"Session {index}")
+                    gui.project_tree.insert("", "end", text=f"Project {index}")
+                    gui.running_task_list.insert("end", f"Session {index}")
                     gui.change_list.insert("end", f"Changed file {index}")
                     gui.activity.tree.insert("", "end", values=(f"Run {index}", "done"))
                 for target in (gui.chat, gui.input):
@@ -382,7 +376,7 @@ class ThemeTests(unittest.TestCase):
                     if target is gui.chat:
                         target.configure(state="disabled")
                 root.update()
-                targets = (gui.recent_list, gui.session_list, gui.chat, gui.input,
+                targets = (gui.project_tree, gui.running_task_list, gui.chat, gui.input,
                            gui.change_list, gui.activity.tree)
                 for target in targets:
                     with self.subTest(target=target.winfo_class()):

@@ -24,6 +24,7 @@ from .accounts import AccountError, Accounts
 from .model_control import ModelControl, ModelControlError
 from .quotas import UsageObserver, require_available
 from .account_errors import QuotaError
+from .task_slots import TaskSlots
 
 
 _MODEL_FIELDS = frozenset({
@@ -262,6 +263,8 @@ def create_app(settings=None, *, model_control=None, upstream_transport=None, al
                                          runtime_unit=settings.runtime_unit, gpu_index=settings.gpu_index,
                                          gateway_output_limit=settings.output_token_limit)
 
+    slots = TaskSlots(model)
+
     @asynccontextmanager
     async def lifetime(app):
         async with httpx.AsyncClient(
@@ -380,7 +383,8 @@ def create_app(settings=None, *, model_control=None, upstream_transport=None, al
 
     @app.get("/api/admin/users")
     def users(_admin=Depends(admin_user)):
-        return {"users": accounts.users()}
+        counts = slots.snapshot()["users"]
+        return {"users": [dict(user, running_tasks=counts.get(user["id"], 0)) for user in accounts.users()]}
 
     @app.post("/api/admin/users/{user_id}/status")
     async def change_status(user_id: int, request: Request, _admin=Depends(admin_user)):
@@ -420,7 +424,39 @@ def create_app(settings=None, *, model_control=None, upstream_transport=None, al
         upstream_limit = values.get("output_limit")
         if type(upstream_limit) is int and upstream_limit > 0:
             limit = min(limit, upstream_limit)
-        return dict(values, output_limit=limit, output_token_limit=limit)
+        stats = slots.snapshot(_user["id"], values.get("slots"))
+        stats.pop("users")
+        return dict(values, output_limit=limit, output_token_limit=limit, **{
+            key: value for key, value in stats.items() if key != "slots"})
+
+    @app.get("/api/tasks")
+    def task_status(user=Depends(active_user)):
+        capacity = model.status().get("slots") if slots.capacity is None else slots.capacity
+        stats = slots.snapshot(user["id"], capacity)
+        if user["role"] != "admin":
+            stats.pop("users")
+        return stats
+
+    def task_key(value):
+        if not isinstance(value, str) or not re.fullmatch(r"[a-f0-9]{32}", value):
+            raise HTTPException(400, "任务标识无效。")
+        return value
+
+    @app.post("/api/tasks/{key}/acquire")
+    def acquire_task(key: str, request: Request, user=Depends(active_user)):
+        key = task_key(key)
+        admitted = slots.acquire(key, user["id"], _token(request), model.status().get("slots"))
+        return {"acquired": admitted, "heartbeat_seconds": 10}
+
+    @app.post("/api/tasks/{key}/heartbeat", status_code=204)
+    def heartbeat_task(key: str, request: Request, user=Depends(active_user)):
+        slots.heartbeat(task_key(key), user["id"], _token(request))
+        return Response(status_code=204)
+
+    @app.delete("/api/tasks/{key}", status_code=204)
+    def release_task(key: str, request: Request, user=Depends(signed_in)):
+        slots.release(task_key(key), user["id"], _token(request))
+        return Response(status_code=204)
 
     @app.post("/api/admin/model/preview")
     async def model_preview(request: Request, admin=Depends(admin_user)):
@@ -434,6 +470,7 @@ def create_app(settings=None, *, model_control=None, upstream_transport=None, al
         if not isinstance(confirmation, str) or not 1 <= len(confirmation) <= 256:
             raise HTTPException(400, "确认令牌无效。")
         await run_in_threadpool(accounts.session, _token(request), admin=True)
+        slots.snapshot()
         return await run_in_threadpool(model.apply, str(admin["id"]), confirmation)
 
     @app.get("/v1/models")
@@ -454,8 +491,22 @@ def create_app(settings=None, *, model_control=None, upstream_transport=None, al
             await run_in_threadpool(accounts.session, token, active=True)
 
         await check()
-        if not model.begin_inference():
-            raise HTTPException(503, "模型维护中，请稍后重试。")
+        lease_key = request.headers.get("X-CCSLab-Task")
+        transient = lease_key is None
+        if transient:
+            lease_key = uuid.uuid4().hex
+            capacity = await run_in_threadpool(lambda: model.status().get("slots"))
+            if not slots.acquire(lease_key, _user["id"], token, capacity):
+                raise HTTPException(429, "模型槽位已满，请稍后重试。")
+        else:
+            task_key(lease_key)
+        # OpenCode may also generate a title/summary. These calls share the task's
+        # one slot and wait for each other instead of consuming extra slots.
+        while not slots.begin_request(lease_key, _user["id"], token):
+            await check()
+            if await request.is_disconnected():
+                raise HTTPException(499, "客户端已断开。")
+            await asyncio.sleep(.1)
 
         upstream = None
         handed_over = False
@@ -478,7 +529,9 @@ def create_app(settings=None, *, model_control=None, upstream_transport=None, al
                         if reservation is not None:
                             await run_in_threadpool(accounts.quotas.finish, reservation, observer.result, sent=sent)
                     finally:
-                        model.end_inference()
+                        slots.end_request(lease_key)
+                        if transient:
+                            slots.release(lease_key, _user["id"], token)
 
         try:
             client = request.app.state.upstream

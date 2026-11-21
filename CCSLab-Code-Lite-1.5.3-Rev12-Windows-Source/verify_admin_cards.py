@@ -77,6 +77,7 @@ def wait(root, condition):
 
 def verify(gui, root):
     fixture = RosterFixture()
+    gui.theme.set(THEMES["mint"][0])
     gui.account_client = fixture
     gui.account = fixture.users[4]
     gui.account_online = True
@@ -88,7 +89,8 @@ def verify(gui, root):
     assert quota.cget("text") == "额度不可用"
     assert name.cget("text") == LONG_NAME
     assert badge.cget("text") == "待审批"
-    assert detail.cget("text") == f"普通用户  ·  注册于 {account_time(CREATED)}"
+    assert detail.cget("text").startswith(f"普通用户  ·  注册于 {account_time(CREATED)}")
+    assert "执行任务 暂不可用" in detail.cget("text")
     assert "管理员" in next(label.cget("text") for label in descendants(page.user_cards[3], tk.Label)
                          if "注册于" in label.cget("text"))
     assert [value.get() for value in page.account_overview] == ["1", "123", "1", "1"]
@@ -154,6 +156,20 @@ def verify(gui, root):
     assert set(buttons(page.user_cards[14])) == {"禁用", "重置登录密码", "设置额度"}
     assert set(buttons(page.user_cards[8])) == {"重新激活", "重置登录密码", "设置额度"}
     assert [value.get() for value in page.account_overview] == ["0", "124", "1", "1"]
+
+    page.update_task_counts({"users": {"14": 3, "9": 1}, "available_slots": 1})
+    assert any("执行任务 3" in label.cget("text") for label in descendants(page.user_cards[14], tk.Label))
+    assert any("执行任务 1" in label.cget("text") for label in descendants(page.user_cards[9], tk.Label))
+    assert page.model_metrics[-1].get() == "1"
+    for identity in (14, 9, 2):
+        card = page.user_cards[identity]
+        assert card.cget("background") == gui.colors["field"]
+        assert all(label.cget("background") == gui.colors["field"]
+                   for label in descendants(card, tk.Label) if "执行任务" in label.cget("text"))
+    page.update_task_counts({})
+    assert any("执行任务 暂不可用" in label.cget("text") for label in descendants(page.user_cards[14], tk.Label))
+    assert page.model_metrics[-1].get() == "暂不可用"
+    assert page.user_cards[14].cget("background") == gui.colors["field"]
 
     with patch.object(gui, "show_page", wraps=gui.show_page) as navigate:
         page.reset_password(2)

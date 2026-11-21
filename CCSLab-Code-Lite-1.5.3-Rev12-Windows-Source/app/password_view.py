@@ -51,8 +51,11 @@ def build_password_settings(app, parent):
         return (contents.winfo_exists() and (not admin or app.is_admin) and app.account_client is client
                 and not app.busy and not app.closing)
 
-    def request(title, action, feedback, completed, controls, secrets=(), *, admin=False):
+    def request(title, action, feedback, completed, controls, secrets=(), *, admin=False, revokes_session=False):
         if not allowed(admin=admin):
+            return
+        if revokes_session and app.confirm_task_transition(title, lambda: request(
+                title, action, feedback, completed, controls, secrets, admin=admin, revokes_session=True)):
             return
         feedback.set("正在处理…")
         for widget, _state in controls:
@@ -106,7 +109,7 @@ def build_password_settings(app, parent):
             field.set("")
         request("修改我的登录密码", lambda: client.change_own_password(current, new, repeat),
                 personal_feedback, lambda _reply: app.require_account_login("登录密码已修改，请重新登录。"),
-                ((personal_button, "normal"),), (current, new))
+                ((personal_button, "normal"),), (current, new), revokes_session=True)
 
     personal_button = app.button(personal_form, "修改登录密码", change_personal_password, "Accent.TButton")
     personal_button.grid(row=6, column=0, sticky="e", pady=(4, 3))
@@ -141,7 +144,7 @@ def build_password_settings(app, parent):
             field.set("")
         request("修改管理员授权密码", lambda: client.change_authorization_code(current, new),
                 rotate_feedback, lambda _reply: app.require_account_login("授权密码已修改，请重新登录。"),
-                ((rotate_button, "normal"),), (current, new), admin=True)
+                ((rotate_button, "normal"),), (current, new), admin=True, revokes_session=True)
 
     rotate_button = app.button(rotate_form, "修改授权密码", change_code, "Accent.TButton")
     rotate_button.grid(row=6, column=0, sticky="e", pady=(4, 3))
@@ -231,7 +234,7 @@ def build_password_settings(app, parent):
 
         request("重置用户登录密码", lambda: client.reset_user_password(user_id, password, code),
                 reset_feedback, updated, ((reset_button, "normal"), (target_picker, "readonly")),
-                (password, code), admin=True)
+                (password, code), admin=True, revokes_session=is_current)
 
     reset_button = app.button(reset_form, "重置登录密码", reset_password, "Accent.TButton")
     reset_button.configure(state="disabled")
@@ -275,7 +278,7 @@ def build_password_settings(app, parent):
         repeat_access.set("")
         request("修改 Open WebUI 访问密码", lambda: client.change_open_webui_access(password),
                 webui_feedback, lambda _reply: webui_feedback.set("入口密码已更新，新进入者请使用新密码。"),
-                ((webui_button, "normal"),), (password,), admin=True)
+                ((webui_button, "normal"),), (password,), admin=True, revokes_session=True)
 
     verify_button = app.button(webui_form, "验证最高权限", verify_webui_access)
     verify_button.grid(row=2, column=0, sticky="e", pady=(4, 8))

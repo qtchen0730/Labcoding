@@ -167,7 +167,7 @@ class AdminPage:
 
         role = "管理员" if user["role"] == "admin" else "普通用户"
         registered = account_time(user.get("created_at"))
-        app.label(card, f"{role}  ·  注册于 {registered}", bg="field", muted=True).grid(
+        app.label(card, f"{role}  ·  注册于 {registered}  ·  执行任务 {count(user.get('running_tasks'))}", bg="field", muted=True).grid(
             row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
         if user["role"] == "user":
@@ -195,7 +195,7 @@ class AdminPage:
 
     def edit_quota(self, identity):
         app = self.app
-        if not app.is_admin or app.busy or app.running or app.closing:
+        if not app.is_admin or app.busy or app.closing:
             return
         user = self.users.get(identity)
         if not user or user["role"] != "user":
@@ -271,7 +271,7 @@ class AdminPage:
         app.label(heading, variable=self.model_title, size=15, bold=True).pack(side="left")
         app.button(heading, "刷新状态", self.refresh_model).pack(side="right")
         app.label(frame, variable=self.model_meta, muted=True).pack(fill="x", pady=(0, 9))
-        self.model_metrics = self.metrics(frame, ("总上下文 · Token", "并发槽位", "每槽上下文 · Token", "GPU 显存占用"))
+        self.model_metrics = self.metrics(frame, ("总上下文 · Token", "并发槽位", "每槽上下文 · Token", "GPU 显存占用", "空余槽位"))
 
         fields = app.frame(frame)
         fields.pack(fill="x", pady=(13, 7))
@@ -327,7 +327,10 @@ class AdminPage:
 
     def call(self, caption, method, path, body, done, *, timeout=10, error_text=None):
         app = self.app
-        if app.busy or app.running or not self.owns_session():
+        if app.busy or not self.owns_session():
+            return
+        if path in {"/api/admin/model/preview", "/api/admin/model/apply"} and app.tasks.active():
+            self.notice.set("请先结束客户端后台任务，再调整模型配置。")
             return
         self.notice.set(caption + "…")
 
@@ -367,6 +370,23 @@ class AdminPage:
             self.tab_changed(None)
         self.call("刷新账号", "GET", "/api/admin/users", None, draw, error_text=self.user_summary)
 
+    def update_task_counts(self, stats):
+        if not self.owns_session():
+            return
+        counts = stats.get("users")
+        created = False
+        for identity, user in self.users.items():
+            count_now = counts.get(str(identity), counts.get(identity, 0)) if isinstance(counts, dict) else None
+            if user.get("running_tasks") != count_now:
+                user["running_tasks"] = count_now
+                self.user_cards[identity].destroy()
+                self.user_cards[identity] = self.build_user_card(identity, user)
+                created = True
+        if created:
+            self.app.apply_theme()
+        self.draw_users()
+        self.model_metrics[-1].set(count(stats.get("available_slots")))
+
     @staticmethod
     def valid_user(user):
         if not isinstance(user, dict):
@@ -402,7 +422,7 @@ class AdminPage:
         self.user_summary.set(f"显示 {len(displayed)} / {len(self.users)} 个账号")
 
     def manageable_user(self, identity):
-        if self.app.busy or self.app.running or not self.owns_session():
+        if self.app.busy or not self.owns_session():
             return None
         user = self.users.get(identity)
         if user and user["role"] == "user":
@@ -448,7 +468,7 @@ class AdminPage:
                                 f"  ·  网关输出上限 {count(model.get('output_token_limit'))} Token")
             for variable, value in zip(self.model_metrics, (
                 count(model.get("total_context")), count(model.get("slots")),
-                count(model.get("effective_context_limit")), gpu_memory(model)
+                count(model.get("effective_context_limit")), gpu_memory(model), count(model.get("available_slots"))
             )):
                 variable.set(value)
             total, slots = str(model.get("total_context")), str(model.get("slots"))

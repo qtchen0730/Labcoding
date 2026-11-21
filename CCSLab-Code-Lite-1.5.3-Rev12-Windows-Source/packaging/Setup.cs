@@ -4,6 +4,7 @@ using System.Drawing;
 using System.IO;
 using System.IO.Compression;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
@@ -122,6 +123,28 @@ static class Setup
         return folder;
     }
 
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern IntPtr OpenProcess(uint access, bool inherit, int processId);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern bool QueryFullProcessImageName(IntPtr process, uint flags, StringBuilder name, ref int size);
+    [DllImport("kernel32.dll")]
+    static extern bool CloseHandle(IntPtr handle);
+
+    static string ProcessImagePath(int processId)
+    {
+        // MainModule can fail inside .NET when an unrelated process exits during enumeration.
+        // Querying the image directly avoids module enumeration and needs only limited access.
+        var handle = OpenProcess(0x1000, false, processId);
+        if (handle == IntPtr.Zero) return null;
+        try
+        {
+            int size = 32768;
+            var name = new StringBuilder(size);
+            return QueryFullProcessImageName(handle, 0, name, ref size) ? name.ToString() : null;
+        }
+        finally { CloseHandle(handle); }
+    }
+
     static void RequireAppClosed(string directory)
     {
         string[] executableNames = { AppName, "CCSLab Code Lite.exe" };
@@ -129,10 +152,8 @@ static class Setup
         {
             using (process)
             {
-                string executable;
-                try { executable = process.MainModule.FileName; }
-                catch (System.ComponentModel.Win32Exception) { continue; }
-                catch (InvalidOperationException) { continue; }
+                var executable = ProcessImagePath(process.Id);
+                if (String.IsNullOrWhiteSpace(executable)) continue;
                 foreach (string name in executableNames)
                     if (SamePath(executable, Path.Combine(directory, name)))
                         throw new IOException("请先退出 CCSLab Labcoding 或 CCSLab Code Lite，然后重试。");

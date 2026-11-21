@@ -142,7 +142,8 @@ def _model_failure(source):
 
 class Engine:
     def __init__(self, state_dir: Path, api_base: str, api_token: str, *, limits=(24000, 4096), ca_bundle=None,
-                 proxy_url=None):
+                 proxy_url=None, task_id=None):
+        self.task_id = task_id
         self.state_dir = Path(state_dir).resolve()
         self.api_base = api_base.rstrip("/")
         self.api_token = api_token
@@ -179,6 +180,7 @@ class Engine:
         self.context_guard = ContextGuard(
             self.api_base, self.api_token, self.limits, self._request_event,
             state / "context-diagnostics.jsonl", ca_bundle=self.ca_bundle, proxy_url=self.proxy_url,
+            task_id=self.task_id,
         )
         self.port = _pick_port()
         password = secrets.token_urlsafe(32)
@@ -384,7 +386,8 @@ class Engine:
             if self._json("DELETE", f"/session/{session_id}") is not True:
                 raise EngineError("OpenCode 未确认删除会话，请重试。")
 
-    def run(self, session_id, prompt, on_event, approve, strict=False, read_only=False, authorize=None):
+    def run(self, session_id, prompt, on_event, approve, strict=False, read_only=False, authorize=None,
+            cancel_event=None):
         session_id = _session_id(session_id)
         if self.process is None:
             raise EngineError("请先打开一个项目。")
@@ -416,7 +419,7 @@ class Engine:
                 if first["type"] != "server.connected":
                     raise EngineError("无法初始化 OpenCode 事件流。")
                 with job.dispatch_lock:
-                    if job.stop.is_set():
+                    if job.stop.is_set() or cancel_event is not None and cancel_event.is_set():
                         return
                     self._json("POST", f"/session/{session_id}/prompt_async", {
                         "model": MODEL, "agent": "ccslab-plan" if read_only else "ccslab",
@@ -434,6 +437,10 @@ class Engine:
         finally:
             conn.close()
             job.stop.set()
+            # A stopped SSE reader can finish before a native command/tool has unwound.
+            # Keep the caller's task active until every mutation has stopped.
+            with job.mutation_lock:
+                pass
             with self.lock:
                 if self.job is job:
                     self.job = None

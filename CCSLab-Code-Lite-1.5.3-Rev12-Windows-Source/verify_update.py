@@ -419,8 +419,12 @@ class UpdateUiTests(unittest.TestCase):
         app.update_download_button = self.Button()
         app.current_page = "settings"
         app.events = Queue()
+        from tasks import TaskScheduler
+        app.tasks = TaskScheduler()
         app.version_info = version_info()
         app.update_actions = lambda: None
+        app.show_next_approval = lambda: None
+        app.park_approvals = lambda: None
         app.update_banner = self.Banner()
         return app
 

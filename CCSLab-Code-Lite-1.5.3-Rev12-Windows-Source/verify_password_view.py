@@ -49,6 +49,10 @@ class AccountFixture:
 
 
 class AppFixture:
+    @staticmethod
+    def confirm_task_transition(_label, _resume):
+        return False  # Form fixture has no background execution; integration covers active tasks.
+
     def __init__(self):
         self.is_admin = True
         self.account = {"id": 4}
