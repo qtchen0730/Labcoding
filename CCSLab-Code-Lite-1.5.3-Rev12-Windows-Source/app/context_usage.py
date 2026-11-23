@@ -132,6 +132,7 @@ class ContextMeter:
         self.reading = ContextReading()
         self.limit = None
         self.output_limit = None
+        self.output_label = "新任务输出预算"
         self.value = tk.DoubleVar(master=parent, value=0)
         self.title = tk.StringVar(master=parent)
         self.detail = tk.StringVar(master=parent)
@@ -160,11 +161,17 @@ class ContextMeter:
                 lightcolor=colors[color], darkcolor=colors[color], thickness=6,
             )
 
-    def set_model(self, metadata=None, output_limit=None):
+    def set_model(self, metadata=None, output_limit=None, output_label="新任务输出预算"):
         data = metadata or {}
         self.limit = positive_tokens(data.get("effective_context_limit"))
         caps = map(positive_tokens, (output_limit, data.get("output_limit"), data.get("output_token_limit")))
         self.output_limit = min((cap for cap in caps if cap is not None), default=None)
+        self.output_label = output_label
+        self.refresh()
+
+    def set_output_limit(self, output_limit, label):
+        self.output_limit = positive_tokens(output_limit)
+        self.output_label = label
         self.refresh()
 
     def record(self, event):
@@ -214,5 +221,5 @@ class ContextMeter:
         if close:
             parts.insert(0, "接近上限")
         if output is not None:
-            parts.append(f"输出预留上限 {output:,}")
+            parts.append(f"{self.output_label} {output:,}")
         self.detail.set(" · ".join(parts))

@@ -1868,6 +1868,7 @@ class App:
         self.session_grants = task.grants if task else SessionGrants()
         self.task_started = task.started_mono if task and task.status in EXECUTING else None
         state = task.metadata() if task else self.history.get(self.session, {}).get("task", {})
+        self.refresh_context_output(state)
         labels = {"queued": "等待服务器空余槽位",
                   "running": "方案分析中" if task and task.read_only else "任务执行中",
                   "cancelling": "正在取消 · 等待模型与工具结束",
@@ -1951,8 +1952,10 @@ class App:
             if task.cancel.is_set():
                 return
             task.model = model
+            limits = self.model_limits(model, self.output_limit)
+            task.output_limit = limits[1]
             task.events.put({"type": "_model", "model": model})
-            engine = task.engine = self.create_task_engine(task, self.model_limits(model, self.output_limit))
+            engine = task.engine = self.create_task_engine(task, limits)
             if task.cancel.is_set():
                 return
             authorize = ((task.client.check_open_webui_access if task.direct else
@@ -2007,6 +2010,7 @@ class App:
         if event.get("type") == "_model":
             if self.task_is_current(task):
                 self.update_model(event["model"])
+                self.task_changed(task)
             return
         if event.get("type") == "_finished":
             self.tasks.finish(task, event.get("error", ""))
@@ -3566,10 +3570,22 @@ class App:
     def update_model(self, model):
         self.model_info = model
         self.model_checked = monotonic()
-        self.context_meter.set_model(model, output_limit=self.model_limits(model)[1])
+        self.context_meter.set_model(model, output_limit=self.model_limits(model, self.output_limit)[1])
+        self.refresh_context_output()
         if "running_tasks" in model:
             self.task_stats = model
             self.refresh_task_sidebar()
+
+    def refresh_context_output(self, state=None):
+        if state is None:
+            task = self.current_task()
+            state = task.metadata() if task else self.history.get(self.session, {}).get("task", {})
+        output = state.get("output_limit") if isinstance(state, dict) else None
+        if type(output) is int and output > 0:
+            self.context_meter.set_output_limit(output, "当前任务输出预算")
+        else:
+            effective = self.model_limits(self.model_info, self.output_limit)[1]
+            self.context_meter.set_output_limit(effective, "新任务有效输出预算")
 
     def choose_project(self):
         if self.busy or self.closing or not self.can_open_project:
@@ -3661,7 +3677,7 @@ class App:
         self.worker("读取项目", work, done)
 
     def start_engine(self, path):
-        limits = self.model_limits(self.model_info)
+        limits = self.model_limits(self.model_info, self.output_limit)
         client = self.account_client if self.connection_mode == "account" else None
         owner, generation = self.state, self.account_generation
         connection = self.api_base, self.token, self.ca_path
@@ -3763,6 +3779,8 @@ class App:
 
         def done(result):
             effective, remote_limit, remote_error, gateway_error = result
+            if not gateway_error:
+                self.update_model(meta)
             if value is None:
                 suffix = f"{effective} Token" if not gateway_error else f"读取失败：{gateway_error}"
                 self.append(self.chat, f"Labcoding 设定值：{self.output_limit}；Gateway/上下文有效值：{suffix}。\n",

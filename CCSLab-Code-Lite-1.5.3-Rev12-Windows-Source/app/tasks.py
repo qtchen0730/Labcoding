@@ -62,6 +62,7 @@ class SessionTask:
     token: str = ""
     ca_path: object = None
     model: dict = field(default_factory=dict)
+    output_limit: int | None = None
     mode: str = "执行"
     strict: bool = False
     direct: bool = False
@@ -100,6 +101,7 @@ class SessionTask:
                 "opencode_session_id": self.session_id, "project_id": canonical(self.context.project),
                 "account_id": self.identity.get("id"), "role": self.identity.get("role"),
                 "status": self.status, "input": self.redact(self.prompt), "mode": self.mode,
+                "output_limit": self.output_limit,
                 "queued_at": self.queued_at, "started_at": self.started_at, "ended_at": self.ended_at,
                 "cancel_requested": self.cancel.is_set(), "error": self.error}
 

@@ -64,6 +64,11 @@ class OutputLimitTests(unittest.TestCase):
         app.output_limit = 4096
         app.prefs = {}
         app.model_info = {}
+        app.history = {}
+        app.session = None
+        app.context_meter = SimpleNamespace(set_model=lambda *_args, **_kwargs: None,
+                                            set_output_limit=lambda value, label:
+                                            setattr(app, "display_budget", (value, label)))
         app.connection_mode = "account"
         app.account_client = Client()
         app.chat = object()
@@ -83,11 +88,13 @@ class OutputLimitTests(unittest.TestCase):
         app.worker = worker
         app.output_command("/output 8192")
         self.assertEqual(app.prefs["output_limit"], 8192)
+        self.assertEqual(app.display_budget, (4096, "新任务有效输出预算"))
         self.assertIn("Labcoding 已设置 8192，当前有效 4096", "".join(app.messages))
         self.assertIn("同步失败", "".join(app.messages))
         self.assertEqual(app.account_client.remote, 4096)
         app.output_command("/output 8192")
         self.assertEqual(app.account_client.remote, 8192)
+        self.assertEqual(app.display_budget, (4096, "新任务有效输出预算"))
         app.output_command("/output 4096")
         self.assertEqual((app.prefs["output_limit"], app.account_client.remote), (4096, 4096))
 
