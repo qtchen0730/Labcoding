@@ -22,6 +22,10 @@ from context_guard import ContextGuard
 
 
 MODEL = {"providerID": "ccslab", "modelID": "lab-general"}
+SHORT_OUTPUT_LIMIT = 4096
+SHORT_REQUEST_TIMEOUT_MS = 120000
+LONG_REQUEST_TIMEOUT_MS = 300000
+STREAM_CHUNK_TIMEOUT_MS = 60000
 GUIDANCE = """你是 CCSLab Code Lite 中的 Windows 编程助手，默认用中文。
 只使用 workspace_ 开头的工具操作用户选中的项目。OpenCode 的运行目录并非项目。
 文件参数使用工作区相对路径。先读取文件，再用唯一文本替换修改内容。
@@ -233,8 +237,10 @@ class Engine:
             raise
 
     def _config(self):
+        request_timeout = (LONG_REQUEST_TIMEOUT_MS if self.limits[1] > SHORT_OUTPUT_LIMIT
+                           else SHORT_REQUEST_TIMEOUT_MS)
         options = {"baseURL": self.context_guard.url if self.context_guard else self.api_base,
-                   "timeout": 120000, "chunkTimeout": 60000}
+                   "timeout": request_timeout, "chunkTimeout": STREAM_CHUNK_TIMEOUT_MS}
         if self.api_token or self.context_guard:
             options["apiKey"] = "{env:CCSLAB_MODEL_TOKEN}"
         return {
