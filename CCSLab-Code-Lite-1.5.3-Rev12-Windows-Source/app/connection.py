@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import atexit
-import ctypes
-from ctypes import wintypes
 from dataclasses import dataclass
 import http.client
 import json
@@ -18,7 +16,10 @@ import threading
 import time
 from typing import BinaryIO
 
-from windows_process import WindowsJob as _SshJob, owns_loopback_listener as _owns_loopback_listener
+if os.name == "nt":
+    import ctypes
+    from ctypes import wintypes
+    from windows_process import WindowsJob as _SshJob, owns_loopback_listener as _owns_loopback_listener
 
 
 DEFAULT_HOST = "192.168.1.107"
@@ -32,39 +33,39 @@ class ConnectionError(RuntimeError):
     """A user-facing SSH or model service error."""
 
 
-class _Blob(ctypes.Structure):
-    _fields_ = [
-        ("size", wintypes.DWORD),
-        ("data", ctypes.POINTER(ctypes.c_ubyte)),
-    ]
+if os.name == "nt":
+    class _Blob(ctypes.Structure):
+        _fields_ = [
+            ("size", wintypes.DWORD),
+            ("data", ctypes.POINTER(ctypes.c_ubyte)),
+        ]
 
-
-def _dpapi(payload: bytes, *, encrypt: bool) -> bytes:
-    crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    local_free = kernel32.LocalFree
-    local_free.argtypes = [wintypes.HLOCAL]
-    local_free.restype = wintypes.HLOCAL
-    api = crypt32.CryptProtectData if encrypt else crypt32.CryptUnprotectData
-    api.argtypes = [
-        ctypes.POINTER(_Blob),
-        wintypes.LPCWSTR if encrypt else ctypes.POINTER(wintypes.LPWSTR),
-        ctypes.POINTER(_Blob),
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        wintypes.DWORD,
-        ctypes.POINTER(_Blob),
-    ]
-    api.restype = wintypes.BOOL
-    buffer = (ctypes.c_ubyte * len(payload)).from_buffer_copy(payload)
-    source = _Blob(len(payload), buffer)
-    result = _Blob()
-    if not api(ctypes.byref(source), None, None, None, None, _NO_UI, ctypes.byref(result)):
-        raise ctypes.WinError(ctypes.get_last_error())
-    try:
-        return ctypes.string_at(result.data, result.size)
-    finally:
-        local_free(result.data)
+    def _dpapi(payload: bytes, *, encrypt: bool) -> bytes:
+        crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        local_free = kernel32.LocalFree
+        local_free.argtypes = [wintypes.HLOCAL]
+        local_free.restype = wintypes.HLOCAL
+        api = crypt32.CryptProtectData if encrypt else crypt32.CryptUnprotectData
+        api.argtypes = [
+            ctypes.POINTER(_Blob),
+            wintypes.LPCWSTR if encrypt else ctypes.POINTER(wintypes.LPWSTR),
+            ctypes.POINTER(_Blob),
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            ctypes.POINTER(_Blob),
+        ]
+        api.restype = wintypes.BOOL
+        buffer = (ctypes.c_ubyte * len(payload)).from_buffer_copy(payload)
+        source = _Blob(len(payload), buffer)
+        result = _Blob()
+        if not api(ctypes.byref(source), None, None, None, None, _NO_UI, ctypes.byref(result)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            return ctypes.string_at(result.data, result.size)
+        finally:
+            local_free(result.data)
 
 
 def _destination(host: str, user: str, port: int) -> tuple[str, str, int]:

@@ -79,12 +79,12 @@ class ContextGuard:
             requests = list(self.requests.items())
         for _done, response in requests:
             if response is not None:
-                # urllib3 is pinned at 2.8.0. Its captured socket remains available
-                # even for HTTP/1.0 responses whose connection.sock is already None.
-                shutdown = response._sock_shutdown
+                # urllib3 2.8.0 exposes _sock_shutdown and shutdown().
+                # On older urllib3 the socket is released when the response is closed.
+                shutdown = getattr(response, "_sock_shutdown", None)
                 try:
-                    response.shutdown()  # Interrupt a read1 waiting for the next upstream token.
-                except (OSError, ValueError, RuntimeError):
+                    response.shutdown()  # Interrupt a read waiting for the next upstream token.
+                except (OSError, ValueError, RuntimeError, AttributeError):
                     pass  # The handler may have already released this response.
                 if os.name == "nt" and shutdown is not None:
                     # Windows' pending select/recv is not woken by shutdown alone;
@@ -215,7 +215,7 @@ class _Handler(BaseHTTPRequestHandler):
             # Stream promptly. Parse usage only; no response text survives this call.
             pending = b""
             stream_error = False
-            while chunk := response.read1(4096, decode_content=True):
+            while chunk := response.read(4096):
                 self.wfile.write(chunk)
                 self.wfile.flush()
                 pending += chunk

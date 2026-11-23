@@ -6,6 +6,7 @@ from fnmatch import fnmatchcase
 from http.client import HTTPConnection, HTTPException, HTTPResponse
 from ipaddress import ip_address
 from queue import Empty, SimpleQueue
+import os
 import re
 import socket
 import ssl
@@ -16,7 +17,16 @@ from urllib.request import getproxies_environment, proxy_bypass_environment
 
 from urllib3.util.ssltransport import SSLTransport
 
-from windows_proxy import ProxyDiscoveryError, windows_proxy
+if os.name == "nt":
+    from windows_proxy import ProxyDiscoveryError, windows_proxy
+else:
+    class ProxyDiscoveryError(RuntimeError):
+        def __init__(self, code):
+            self.code = code
+            super().__init__("Windows proxy discovery failed")
+
+    def windows_proxy(origin):
+        raise OSError("系统代理发现仅在 Windows 上支持；Linux 请使用自动或直连模式。")
 
 
 CONNECTION_MODES = ("auto", "system", "direct")
@@ -314,6 +324,11 @@ class AccountTransport:
             value = proxies.get("https") or proxies.get("all") or proxies.get("http")
             if value:
                 return _proxy(value, "environment")
+        if os.name != "nt":
+            raise TransportError("系统代理模式在 Linux 上不受支持，请使用自动或直连模式。",
+                                 category="proxy", stage="route",
+                                 technical="system_proxy_unsupported_on_linux",
+                                 route="system", fallback=True) from None
         try:
             proxy, bypass = _bounded_call(lambda: windows_proxy(self.base), timeout)
         except (OSError, TimeoutError, ProxyDiscoveryError) as error:
@@ -345,7 +360,9 @@ class AccountTransport:
         try:
             if route is None:
                 route = self._resolve(min(timeout * 0.4, 3))
-            source = {"direct": "直连", "system": "Windows 系统代理", "environment": "环境变量代理"}
+            source = {"direct": "直连",
+                      "system": "系统代理" if os.name != "nt" else "Windows 系统代理",
+                      "environment": "环境变量代理"}
             _notify(observer, "route", "warning" if fallback else "normal",
                     "已采用代理失败后的直连回退。" if fallback else f"当前路线：{source[route.kind]}。")
             route_deadline = min(deadline, monotonic() + max(timeout * 0.55, 0.15)) if (

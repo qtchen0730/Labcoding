@@ -30,16 +30,14 @@ def _initialize_git(git, directory):
     environment.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
                        GIT_TERMINAL_PROMPT="0")
     try:
+        run_kwargs = dict(cwd=directory, env=environment, stdin=subprocess.DEVNULL,
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                          timeout=15, check=False)
+        if os.name == "nt":
+            run_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         result = subprocess.run(
             [git, "init", "--quiet", "--template=", "--initial-branch=main", str(directory)],
-            cwd=directory,
-            env=environment,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=15,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            check=False,
+            **run_kwargs,
         )
     except subprocess.TimeoutExpired as error:
         raise RuntimeError("Git 初始化超时，请重试。") from error

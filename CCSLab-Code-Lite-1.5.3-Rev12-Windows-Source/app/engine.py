@@ -16,7 +16,8 @@ import threading
 import time
 
 from workspace_tools import NO_WINDOW, ToolBridge, Workspace
-from windows_process import WindowsJob, owns_loopback_listener
+if os.name == "nt":
+    from windows_process import WindowsJob, owns_loopback_listener
 from context_usage import context_event
 from context_guard import ContextGuard
 
@@ -62,13 +63,42 @@ def _pick_port():
 
 
 def _binary():
-    base = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
-    candidate = (base / "vendor" / "opencode.exe" if getattr(sys, "frozen", False) else
-                 base.parent.parent / ".work" / "vendor" / "opencode.exe")
-    if not candidate.is_file():
-        raise EngineError("缺少 OpenCode 组件，请重新安装软件。" if getattr(sys, "frozen", False) else
-                          "缺少 OpenCode 组件，请先执行 packaging/Fetch-OpenCode.py。")
-    return candidate
+    """Locate the bundled OpenCode runtime binary.
+
+    Lookup order in frozen mode (PyInstaller --onedir):
+      1. _MEIPASS/app/vendor/opencode[.exe]   — primary, works under /opt/…
+      2. sys.executable.parent/app/vendor/opencode[.exe] — flat bundle fallback
+      3. sys.executable.parent/vendor/opencode[.exe] — legacy portable fallback
+
+    Development mode:
+      .work/vendor/opencode[.exe] beside the source tree.
+    """
+    ext = ".exe" if os.name == "nt" else ""
+    frozen = getattr(sys, "frozen", False)
+
+    if frozen:
+        candidates = []
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            candidates.append(Path(meipass) / "app" / "vendor" / f"opencode{ext}")
+        exe_parent = Path(sys.executable).parent
+        candidates.append(exe_parent / "app" / "vendor" / f"opencode{ext}")
+        candidates.append(exe_parent / "vendor" / f"opencode{ext}")
+    else:
+        src = Path(__file__).resolve().parent
+        candidates = [src.parent.parent / ".work" / "vendor" / f"opencode{ext}"]
+
+    # Try each candidate; collect diagnostics for the final error.
+    details = []
+    for c in candidates:
+        if c.is_file():
+            return c
+        details.append(f"{c}: {'否' if not c.exists() else '无执行权限' if not os.access(str(c), os.X_OK) else '否'}")
+
+    msg = "缺少 OpenCode 组件，请重新安装软件。" if frozen else \
+          "缺少 OpenCode 组件，请先执行 packaging/Fetch-OpenCode.py。"
+    msg += f" 已查找: {', '.join(details)}"
+    raise EngineError(msg)
 
 
 def _session_id(value):
@@ -214,12 +244,16 @@ class Engine:
             environment.update(HTTP_PROXY=self.proxy_url, HTTPS_PROXY=self.proxy_url,
                                NO_PROXY="localhost,127.0.0.1,::1")
         try:
+            kwargs = dict(cwd=sandbox, env=environment, stdin=subprocess.DEVNULL,
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             if os.name == "nt":
                 self.process_job = WindowsJob()
+                kwargs["creationflags"] = NO_WINDOW
+            else:
+                self.process_job = None
             self.process = subprocess.Popen(
                 [str(installed_component), "serve", "--hostname", "127.0.0.1", "--port", str(self.port), "--log-level", "ERROR"],
-                cwd=sandbox, env=environment, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL, creationflags=NO_WINDOW,
+                **kwargs,
             )
             if self.process_job is not None:
                 self.process_job.add(self.process.pid)

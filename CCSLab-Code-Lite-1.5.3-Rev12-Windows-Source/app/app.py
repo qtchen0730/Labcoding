@@ -3,8 +3,6 @@
 import argparse
 from collections import deque
 from copy import copy
-import ctypes
-from ctypes import wintypes
 from datetime import datetime
 import hashlib
 import json
@@ -19,6 +17,10 @@ import tkinter as tk
 from tkinter import font as tkfont
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from uuid import uuid4
+
+if os.name == "nt":
+    import ctypes
+    from ctypes import wintypes
 from versioning import read_version_info
 from update_system import (
     UpdateError, UpdateNetworkError, UpdateService, UpdateTrustError,
@@ -50,7 +52,7 @@ from quota_view import balance_text, blocked_message
 from approval_policy import SessionGrants, session_scope, replacement_details_complete
 
 
-FONT = "Microsoft YaHei UI"
+FONT = "Microsoft YaHei UI" if os.name == "nt" else "Sans"
 APP_VERSION_INFO = read_version_info()
 WORKER_TIMEOUT = 90
 SHUTDOWN_TIMEOUT = 8
@@ -66,9 +68,9 @@ def _colorref(value):
 
 def apply_windows_titlebar(window, colors):
     """Apply supported DWM title-bar attributes to Tk's actual top-level HWND."""
+    if os.name != "nt":
+        return False
     try:
-        if window.tk.call("tk", "windowingsystem") not in ("win", "win32"):
-            return False
         user32 = ctypes.WinDLL("user32", use_last_error=True)
         user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
         user32.GetAncestor.restype = wintypes.HWND
@@ -366,7 +368,11 @@ def update_check_error_message(error):
 class App:
     def __init__(self, root, data_dir=None, smoke=False):
         self.root = root
-        self.data_root = data_dir or Path(os.environ.get("LOCALAPPDATA", Path.home())) / "CCSLabCodeLite" / "data"
+        if os.name == "nt":
+            self.data_root = data_dir or Path(os.environ.get("LOCALAPPDATA", Path.home())) / "CCSLabCodeLite" / "data"
+        else:
+            self.data_root = data_dir or Path(os.environ.get("XDG_DATA_HOME",
+                             Path.home() / ".local" / "share")) / "ccslab-labcoding" / "data"
         self.data_root.mkdir(parents=True, exist_ok=True)
         self.version_info = APP_VERSION_INFO
         self.update_service = UpdateService(self.data_root, self.version_info)
@@ -578,7 +584,7 @@ class App:
         holder = self.frame(parent, background)
         box = tk.Text(holder, wrap=wrap, undo=editable, height=height, borderwidth=0,
                       highlightthickness=0, padx=12, pady=9,
-                      font=("Consolas" if mono else FONT, text_size), spacing1=2, spacing3=3)
+                      font=(("Consolas" if os.name == "nt" else "DejaVu Sans Mono") if mono else FONT, text_size), spacing1=2, spacing3=3)
         self.skin(box, background, "text", insertbackground="text", selectbackground="border")
         self.overlay_scrollbar(holder, box)
         if wrap == "none":

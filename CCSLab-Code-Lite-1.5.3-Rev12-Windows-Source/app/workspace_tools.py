@@ -16,7 +16,8 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from windows_process import WindowsJob
+if os.name == "nt":
+    from windows_process import WindowsJob
 
 
 MAX_FILE = 1024 * 1024
@@ -404,8 +405,11 @@ def _run_command(job, command, cwd, timeout):
     })
     process_job = WindowsJob() if os.name == "nt" else None
     try:
-        process = subprocess.Popen(command, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
-                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, creationflags=NO_WINDOW)
+        popen_kwargs = dict(cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = NO_WINDOW
+        process = subprocess.Popen(command, **popen_kwargs)
         if process_job is not None:
             try:
                 process_job.add(process.pid)

@@ -5,6 +5,11 @@ from tkinter import ttk
 
 from account_client import AccountError, PASSWORD_RANGE, normalize_server, valid_account_password
 
+try:
+    from certificate_view import build_certificate_dialog
+except ImportError:
+    build_certificate_dialog = None
+
 
 MODES = {
     "login": ("登录", "登录实验室账号", "登录"),
@@ -101,6 +106,16 @@ class AccessPage:
         self.select("login")
         self.refresh()
 
+    def _open_certificate_dialog(self):
+        """Open the certificate management dialog."""
+        if build_certificate_dialog is None:
+            return
+        server_url_var = getattr(self.app, "server_url_var", None)
+        address_var = self.server_label if hasattr(self, 'server_label') else None
+        build_certificate_dialog(self.app, self.container,
+                                 server_url_var or tk.StringVar(value=""),
+                                 address_var=address_var)
+
     def build_overview(self, panel):
         app = self.app
         content = app.frame(panel, "soft")
@@ -135,6 +150,9 @@ class AccessPage:
         self.public_button = app.button(location, "使用 Open WebUI 模型",
                                         lambda: app.select_connection("direct"), "Nav.TButton")
         self.public_button.pack(anchor="w", pady=(5, 0))
+        self.cert_button = app.button(location, "证书配置",
+                                      lambda: self._open_certificate_dialog(), "Nav.TButton")
+        self.cert_button.pack(anchor="w", pady=(2, 0))
 
     def build_form(self):
         app = self.app

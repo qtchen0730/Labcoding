@@ -1,4 +1,5 @@
 """Rev9 native UI and Windows-encrypted login regression checks."""
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -26,6 +27,14 @@ class UserFeatures(unittest.TestCase):
     def setUp(self):
         self.scratch = tempfile.TemporaryDirectory(dir=TEST_ROOT, prefix="rev9-ui-")
         self.addCleanup(self.scratch.cleanup)
+        # Clean up keyring entries on Linux so tests are independent.
+        if os.name != "nt":
+            try:
+                import keyring
+                keyring.delete_password("labcoding-login", DEFAULT_SERVER)
+                keyring.delete_password("labcoding-login", "labcoding-login")
+            except Exception:
+                pass
         self.root = tk.Tk()
         self.gui = App(self.root, Path(self.scratch.name), smoke=True)
         self.addCleanup(self.gui.close)
@@ -94,6 +103,7 @@ class UserFeatures(unittest.TestCase):
             app.change_role()
             self.assertEqual(prompt.call_args.args[1], "admin")
 
+    @unittest.skipIf(os.name != "nt", "DPAPI is Windows-only; Linux uses keyring")
     def test_saved_login_dpapi_roundtrip_origin_binding_and_logout(self):
         store = self.gui.saved_login
         store.save(DEFAULT_SERVER, "ordinary-test", "account-test-password", "session-test-token")

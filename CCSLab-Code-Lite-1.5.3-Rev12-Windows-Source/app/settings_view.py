@@ -334,6 +334,16 @@ def build_settings_page(app, parent, section="general"):
             app.button(tools, title, action).pack(side="left", padx=(0, 6))
         app.label(diagnostic, variable=app.gateway_report_status, bg="field", color="heading", size=9).pack(
             fill="x", padx=15, pady=(0, 5))
+        cert_tools = app.frame(diagnostic, "field")
+        cert_tools.pack(fill="x", padx=15, pady=(4, 5))
+        try:
+            from certificate_view import build_certificate_dialog as _build_cert_dialog
+        except ImportError:
+            _build_cert_dialog = None
+        if _build_cert_dialog is not None:
+            app.button(cert_tools, "证书配置",
+                       lambda: _build_cert_dialog(app, parent,
+                                                  tk.StringVar(value=app.account_connection[0]))).pack(side="left")
 
         model = card(parent, "模型与资源")
         message = tk.StringVar(master=parent)

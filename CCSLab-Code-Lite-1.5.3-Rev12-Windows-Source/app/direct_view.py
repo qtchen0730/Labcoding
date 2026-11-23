@@ -112,6 +112,16 @@ def build_direct_page(app, parent):
     show_auth()
     app.button(card, "CCSLab 登录与管理", lambda: app.select_connection("account"), "Nav.TButton").grid(
         row=8, column=0, sticky="w", padx=25, pady=(0, 18))
+
+    # Certificate configuration button (v2.0.4 original)
+    try:
+        from certificate_view import build_certificate_dialog as _build_cert_dialog
+    except ImportError:
+        _build_cert_dialog = None
+    if _build_cert_dialog is not None:
+        app.button(card, "证书配置",
+                   lambda: _build_cert_dialog(app, card, app.direct_address, address), "Nav.TButton").grid(
+            row=9, column=0, sticky="w", padx=25, pady=(0, 12))
     feedback = app.label(card, variable=app.direct_feedback, muted=True, size=9)
     feedback.configure(wraplength=452)
     feedback.grid(row=7, column=0, sticky="ew", padx=25, pady=(4, 10))

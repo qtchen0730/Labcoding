@@ -55,12 +55,15 @@ class Changes:
 
     def _git(self, *args):
         with tempfile.TemporaryFile() as result:
+            run_kwargs = dict(env=self.env, stdin=subprocess.DEVNULL, stdout=result,
+                             stderr=result, timeout=15)
+            if os.name == "nt":
+                run_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
             process = subprocess.run(
                 [self.git, "--no-pager", "--literal-pathspecs", "-c", "core.fsmonitor=false",
                  "-c", "core.untrackedCache=false", "-c", "core.quotePath=false",
                  "-c", "core.hooksPath=NUL", "-C", str(self.root), *args],
-                env=self.env, stdin=subprocess.DEVNULL, stdout=result, stderr=result,
-                timeout=15, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                **run_kwargs,
             )
             result.seek(0)
             raw = result.read(LIMIT + 1)
