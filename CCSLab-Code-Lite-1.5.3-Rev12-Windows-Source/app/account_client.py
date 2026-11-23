@@ -406,6 +406,12 @@ class AccountClient:
         model = reply.get("model", reply)
         return model if isinstance(model, dict) else {}
 
+    def opencode_output_limit(self):
+        return self.request("GET", "/api/opencode/output-limit").get("output_limit")
+
+    def set_opencode_output_limit(self, value):
+        return self.request("PUT", "/api/admin/opencode/output-limit", {"output_limit": value})
+
     def engine_ca_bundle(self, state_path):
         """Give Bun the same CA roots used for account HTTPS on this desktop."""
         certs = self.tls.get_ca_certs(binary_form=True)

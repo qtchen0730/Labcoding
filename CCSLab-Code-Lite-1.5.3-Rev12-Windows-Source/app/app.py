@@ -48,6 +48,7 @@ from ui_icons import ActionIcon, gear_image, apply_window_icon
 from saved_login import SavedLogin
 from quota_view import balance_text, blocked_message
 from approval_policy import SessionGrants, session_scope, replacement_details_complete
+from output_settings import load_output_limit, set_output_limit
 
 
 FONT = "Microsoft YaHei UI"
@@ -390,6 +391,7 @@ class App:
         self.state = self.data_root
         self.prefs_path = self.data_root / "preferences.json"
         self.prefs = read_json(self.prefs_path, {})
+        self.output_limit = load_output_limit(self.prefs)
         theme_migrated = migrate_default_theme(self.prefs)
         self.saved_login = SavedLogin(self.data_root)
         self.saved_login_suppressed = False
@@ -1950,7 +1952,7 @@ class App:
                 return
             task.model = model
             task.events.put({"type": "_model", "model": model})
-            engine = task.engine = self.create_task_engine(task, self.model_limits(model))
+            engine = task.engine = self.create_task_engine(task, self.model_limits(model, self.output_limit))
             if task.cancel.is_set():
                 return
             authorize = ((task.client.check_open_webui_access if task.direct else
@@ -3681,14 +3683,108 @@ class App:
         self.worker("启动本地 OpenCode", work, done, discard=lambda result: self.retire_engine(result[0]))
 
     @staticmethod
-    def model_limits(meta):
+    def model_limits(meta, configured_output=4096):
         limit = meta.get("effective_context_limit")
         caps = [v for key in ("output_token_limit", "output_limit")
                 if type(v := meta.get(key)) is int and v > 0]
         output = min(caps) if caps else None
         context = limit if type(limit) is int and 1024 <= limit <= 2_000_000 else 24000
         max_output = output if type(output) is int and output > 0 else 4096
-        return context, min(max_output, 4096, context // 2)
+        configured_output = configured_output if type(configured_output) is int and configured_output > 0 else 4096
+        return context, min(max_output, configured_output, context // 2)
+
+    def output_command(self, prompt):
+        parts = prompt.split()
+        if self.busy:
+            self.append(self.chat, "当前操作完成后再运行 /output。\n", "muted")
+            return
+        if not parts or len(parts) > 2 or parts[0] != "/output":
+            self.append(self.chat, "用法：/output 或 /output <128–8192>\n", "muted")
+            return
+        value = None
+        if len(parts) == 2:
+            if not parts[1].isascii() or not parts[1].isdigit():
+                self.append(self.chat, "用法：/output 或 /output <128–8192>\n", "muted")
+                return
+            value = int(parts[1])
+            if not 128 <= value <= 8192:
+                self.append(self.chat, "输出 Token 上限须为 128–8192。\n", "muted")
+                return
+            previous = self.output_limit
+            self.output_limit = value
+            had_saved_value = "output_limit" in self.prefs
+            previous_saved_value = self.prefs.get("output_limit")
+            set_output_limit(self.prefs, value)
+            try:
+                self.save_prefs()
+            except OSError as error:
+                self.output_limit = previous
+                if had_saved_value:
+                    self.prefs["output_limit"] = previous_saved_value
+                else:
+                    self.prefs.pop("output_limit", None)
+                self.append(self.chat, f"Labcoding 设置保存失败：{error}\n", "error")
+                return
+        client = self.account_client if self.connection_mode == "account" else None
+        meta = dict(self.model_info)
+        self.append(self.chat, f"Labcoding 已设置 {self.output_limit} Token；新任务生效。\n", "muted")
+
+        def inspect_remote():
+            remote_limit = None
+            remote_error = None
+            gateway_limit = None
+            gateway_error = None
+            if client is None:
+                remote_error = "请通过 CCSLab 账号 Gateway 连接后同步 Ubuntu OpenCode。"
+            else:
+                try:
+                    if value is not None:
+                        remote_limit = client.set_opencode_output_limit(value).get("output_limit")
+                    else:
+                        remote_limit = client.opencode_output_limit()
+                except Exception as error:
+                    remote_error = str(error)
+                    if value is not None:
+                        try:
+                            remote_limit = client.opencode_output_limit()
+                        except Exception as read_error:
+                            remote_error = f"{error}；读取远端设置失败：{read_error}"
+                try:
+                    current = client.model()
+                    gateway_limit = min((n for n in (current.get("output_token_limit"), current.get("output_limit"))
+                                         if type(n) is int and n > 0), default=None)
+                    meta.update(current)
+                except Exception as error:
+                    gateway_error = str(error)
+            effective = self.model_limits(meta, self.output_limit)[1]
+            if gateway_limit is not None:
+                effective = min(effective, gateway_limit)
+            return effective, remote_limit, remote_error, gateway_error
+
+        def done(result):
+            effective, remote_limit, remote_error, gateway_error = result
+            if value is None:
+                suffix = f"{effective} Token" if not gateway_error else f"读取失败：{gateway_error}"
+                self.append(self.chat, f"Labcoding 设定值：{self.output_limit}；Gateway/上下文有效值：{suffix}。\n",
+                            "muted" if not gateway_error else "error")
+            elif not gateway_error and effective < self.output_limit:
+                self.append(self.chat, f"Labcoding 已设置 {self.output_limit}，当前有效 {effective} Token。\n",
+                            "heading")
+            elif gateway_error:
+                self.append(self.chat, f"Labcoding 已设置 {self.output_limit}；Gateway/上下文有效值读取失败：{gateway_error}\n",
+                            "error")
+            if remote_error:
+                retry = "/output" if value is None else f"/output {value}"
+                status = f"同步失败；请检查连接或权限后重试 {retry}"
+                if remote_limit is not None:
+                    status += f"（Ubuntu 当前仍为 {remote_limit} Token）"
+                self.append(self.chat, f"Ubuntu 独立 OpenCode：{status}：{remote_error}\n", "error")
+            elif remote_limit is not None:
+                timing = "；OpenCode 新任务读取配置，已运行任务不变" if value is not None else ""
+                self.append(self.chat, f"Ubuntu server 独立 OpenCode：{remote_limit} Token{timing}。\n", "muted")
+
+        self.worker("读取输出上限" if value is None else "同步输出上限", inspect_remote, done,
+                    on_error=lambda error: self.append(self.chat, f"Gateway 查询失败：{error}\n", "error"))
 
     def create_engine(self, path, limits, *, proxy_url=None, owner=None, connection=None):
         from engine import Engine
@@ -4011,6 +4107,10 @@ class App:
 
     def submit(self):
         prompt = self.input.get("1.0", "end-1c").strip()
+        if prompt.split(maxsplit=1)[:1] == ["/output"]:
+            self.input.delete("1.0", "end")
+            self.output_command(prompt)
+            return
         task = self.current_task()
         if (not prompt or self.busy or self.closing or self.identity_transition or not self.engine
                 or not self.can_use_agent or task and task.status in ACTIVE):

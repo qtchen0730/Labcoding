@@ -25,6 +25,7 @@ from .model_control import ModelControl, ModelControlError
 from .quotas import UsageObserver, require_available
 from .account_errors import QuotaError
 from .task_slots import TaskSlots
+from .output_settings import opencode_config_path, read_output_limit, write_output_limit
 
 
 _MODEL_FIELDS = frozenset({
@@ -50,6 +51,7 @@ class Settings:
     runtime_unit: str | None = None
     gpu_index: int = 0
     admin_registration_code_file: Path | None = None
+    opencode_config: Path | None = None
 
     @classmethod
     def from_environment(cls):
@@ -311,6 +313,29 @@ def create_app(settings=None, *, model_control=None, upstream_transport=None, al
 
     def admin_user(request: Request):
         return accounts.session(_token(request), admin=True)
+
+    @app.get("/api/opencode/output-limit")
+    def opencode_output_limit(_user=Depends(active_user)):
+        path = settings.opencode_config or opencode_config_path()
+        try:
+            value = read_output_limit(path)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            raise HTTPException(503, "无法读取 server 用户的 OpenCode 输出设置。") from error
+        if type(value) is not int or not 128 <= value <= 8192:
+            raise HTTPException(503, "server 用户的 OpenCode 输出设置无效。")
+        return {"output_limit": value}
+
+    @app.put("/api/admin/opencode/output-limit")
+    async def set_opencode_output_limit(request: Request, _admin=Depends(admin_user)):
+        value, = _only(await _json_input(request), "output_limit")
+        if type(value) is not int or not 128 <= value <= 8192:
+            raise HTTPException(400, "输出 Token 上限须为 128–8192 的整数。")
+        path = settings.opencode_config or opencode_config_path()
+        try:
+            await run_in_threadpool(write_output_limit, path, value)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            raise HTTPException(503, "无法更新 server 用户的 OpenCode 输出设置。") from error
+        return {"output_limit": value}
 
     @app.get("/health")
     def health():

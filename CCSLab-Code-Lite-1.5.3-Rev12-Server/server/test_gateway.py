@@ -66,7 +66,7 @@ def admin_login(code=ADMIN_CODE, username="admin-test"):
     return {"username": username, "password": ADMIN_PASSWORD, "role": "admin", "authorization_code": code}
 
 
-def setup(root, upstream, *, admin_code_file=None, bootstrap=True):
+def setup(root, upstream, *, admin_code_file=None, bootstrap=True, opencode_config=None):
     db = root / "accounts.sqlite3"
     if admin_code_file is None:
         admin_code_file = root / "administrator.verifier"
@@ -78,7 +78,7 @@ def setup(root, upstream, *, admin_code_file=None, bootstrap=True):
     controller = ControllerFixture()
     app = create_app(
         Settings(db, "http://llama.fixture", "lab-general", UPSTREAM_KEY,
-                 admin_registration_code_file=admin_code_file),
+                 admin_registration_code_file=admin_code_file, opencode_config=opencode_config),
         model_control=controller,
         upstream_transport=httpx.MockTransport(upstream),
     )
@@ -86,6 +86,53 @@ def setup(root, upstream, *, admin_code_file=None, bootstrap=True):
 
 
 class AccountGatewayTests(unittest.TestCase):
+    def test_opencode_output_setting_read_write_retry_and_authorization(self):
+        with tempfile.TemporaryDirectory(dir=TEST_ROOT) as scratch:
+            root = Path(scratch)
+            config_path = root / ".config" / "opencode" / "opencode.json"
+            _, _, gateway = setup(root, lambda _: None, opencode_config=config_path)
+            with TestClient(gateway, base_url="https://gateway.fixture") as client:
+                admin = credentials(client.post("/api/login", json=admin_login()).json()["token"])
+                ordinary_result = client.post("/api/register", json={
+                    "username": "output-user", "password": USER_PASSWORD,
+                })
+                self.assertEqual(ordinary_result.status_code, 201)
+                user_id = ordinary_result.json()["user"]["id"]
+                self.assertEqual(client.post(f"/api/admin/users/{user_id}/status", json={
+                    "status": "active",
+                }, headers=admin).status_code, 200)
+                user = credentials(client.post("/api/login", json={
+                    "username": "output-user", "password": USER_PASSWORD,
+                }).json()["token"])
+                self.assertEqual(client.put("/api/admin/opencode/output-limit", json={
+                    "output_limit": 8192,
+                }, headers=user).status_code, 403)
+                self.assertEqual(client.put("/api/admin/opencode/output-limit", json={
+                    "output_limit": 8192,
+                }, headers=admin).status_code, 503)
+                self.assertEqual(client.get("/api/opencode/output-limit", headers=user).status_code, 503)
+                config_path.parent.mkdir(parents=True)
+                original = {"model": "ccslab/lab-general", "other": {"keep": True}, "provider": {
+                    "ccslab": {"models": {"lab-general": {"limit": {"context": 131072, "output": 4096}}}}
+                }}
+                config_path.write_text(json.dumps(original), encoding="utf-8")
+                self.assertEqual(client.get("/api/opencode/output-limit", headers=user).json(),
+                                 {"output_limit": 4096})
+                for value in (8192, 4096):
+                    result = client.put("/api/admin/opencode/output-limit", json={"output_limit": value},
+                                        headers=admin)
+                    self.assertEqual(result.status_code, 200, result.text)
+                    self.assertEqual(result.json(), {"output_limit": value})
+                    written = json.loads(config_path.read_text(encoding="utf-8"))
+                    self.assertEqual(written["provider"]["ccslab"]["models"]["lab-general"]
+                                     ["limit"]["output"], value)
+                    self.assertEqual(written["other"], original["other"])
+                    self.assertEqual(client.get("/api/opencode/output-limit", headers=user).json(),
+                                     {"output_limit": value})
+                invalid = client.put("/api/admin/opencode/output-limit", json={"output_limit": True},
+                                     headers=admin)
+                self.assertEqual(invalid.status_code, 400)
+
     def test_administrator_registration_secret_and_role(self):
         with tempfile.TemporaryDirectory(dir=TEST_ROOT) as scratch:
             root = Path(scratch)
