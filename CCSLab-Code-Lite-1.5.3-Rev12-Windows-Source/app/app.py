@@ -13,7 +13,7 @@ import sys
 import traceback
 from pathlib import Path
 from queue import Empty, Queue
-from threading import Event, Lock, Thread
+from threading import Event, Lock, Thread, current_thread
 from time import monotonic, time
 import tkinter as tk
 from tkinter import font as tkfont
@@ -53,6 +53,7 @@ from output_settings import load_output_limit, set_output_limit
 
 FONT = "Microsoft YaHei UI"
 APP_VERSION_INFO = read_version_info()
+WINDOWS_PRODUCT_LABEL = f"CCSLab Labcoding Win {APP_VERSION_INFO['version']}"
 WORKER_TIMEOUT = 90
 SHUTDOWN_TIMEOUT = 8
 IDENTITY_TRANSITION_TIMEOUT = 15
@@ -392,6 +393,10 @@ class App:
         self.prefs_path = self.data_root / "preferences.json"
         self.prefs = read_json(self.prefs_path, {})
         self.output_limit = load_output_limit(self.prefs)
+        self.output_gateway_limit = None
+        self.output_remote_limit = None
+        self.output_sync_status = "尚未同步"
+        self.output_sync_error = ""
         theme_migrated = migrate_default_theme(self.prefs)
         self.saved_login = SavedLogin(self.data_root)
         self.saved_login_suppressed = False
@@ -511,7 +516,7 @@ class App:
         self.style.theme_use("clam")
         self.colors = THEMES[theme_key(self.theme.get())][1]
         self.titlebar_after = {}
-        root.title("CCSLab Labcoding")
+        root.title(WINDOWS_PRODUCT_LABEL)
         apply_window_icon(root)
         root.geometry(f"{min(1748, root.winfo_screenwidth() - 70)}x{min(1228, root.winfo_screenheight() - 130)}")
         root.minsize(760, 540)
@@ -979,7 +984,7 @@ class App:
         self.skin(self.root, "bg", None)
         bar = self.frame(self.root, "header")
         bar.pack(fill="x")
-        self.label(bar, "CCSLab Labcoding", bg="header", size=14, bold=True).pack(
+        self.label(bar, WINDOWS_PRODUCT_LABEL, bg="header", size=14, bold=True).pack(
             side="left", padx=(16, 16), pady=10)
         self.workspace_button = self.button(bar, "工作台", lambda: self.show_page("workspace"), "Header.Nav.TButton")
         self.workspace_button.pack(side="left", padx=(0, 4))
@@ -1712,6 +1717,25 @@ class App:
         except OSError:
             pass
 
+    def record_output_settings_lifecycle(self, event, request_id, started, error=None, **details):
+        """Record output-settings worker lifecycle without credentials or response contents."""
+        row = {
+            "time": datetime.now().astimezone().isoformat(timespec="milliseconds"),
+            "event": event, "request_id": request_id, "thread": current_thread().name,
+            "elapsed_ms": round((monotonic() - started) * 1000),
+        }
+        if error is not None:
+            row["error_type"] = type(error).__name__
+        row.update(details)
+        try:
+            path = self.data_root / "client-diagnostics.jsonl"
+            if path.exists() and path.stat().st_size > 1_000_000:
+                path.replace(path.with_suffix(".previous.jsonl"))
+            with path.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(row, ensure_ascii=False) + "\n")
+        except OSError:
+            pass
+
     def abandon_worker(self):
         job, self.worker_job = self.worker_job, None
         self.busy = ""
@@ -1725,16 +1749,33 @@ class App:
             if result and not result[1] and job["discard"]:
                 job["discard"](result[0])
 
-    def worker(self, caption, fn, on_done, on_error=None, *, timeout=None, discard=None):
+    def worker(self, caption, fn, on_done, on_error=None, *, timeout=None, discard=None, lifecycle=None):
         if self.busy or self.closing:
-            return
+            if lifecycle:
+                lifecycle("OUTPUT_SETTINGS_LOAD_FAILED", error=RuntimeError("worker_rejected"),
+                          reason="closing" if self.closing else "busy")
+            return False
         job = {"caption": caption, "started": monotonic(), "lock": Lock(), "abandoned": False,
                "result": None, "discard": discard, "generation": self.account_generation}
         self.worker_job = job
         self.busy = caption
 
+        def refresh_actions():
+            try:
+                self.update_actions()
+            except Exception as error:
+                if lifecycle:
+                    lifecycle("OUTPUT_SETTINGS_LOAD_FAILED", error=error,
+                              reason="ui_actions_refresh_failed",
+                              stack=[{"file": Path(frame.filename).name, "line": frame.lineno,
+                                      "function": frame.name}
+                                     for frame in traceback.extract_tb(error.__traceback__)])
+
         def finish():
             if self.worker_job is not job:
+                if lifecycle:
+                    lifecycle("OUTPUT_SETTINGS_LOAD_FAILED", error=RuntimeError("worker_replaced"),
+                              reason="callback_stale")
                 return
             with job["lock"]:
                 result, failed = job["result"]
@@ -1744,22 +1785,50 @@ class App:
             timer = self.timers.pop("worker_deadline", None)
             if timer:
                 self.root.after_cancel(timer)
-            self.update_actions()
             if self.closing or job["generation"] != self.account_generation:
                 if not failed and discard:
                     discard(result)
+                if lifecycle:
+                    lifecycle("OUTPUT_SETTINGS_LOAD_FAILED", error=RuntimeError("stale_worker_result"),
+                              reason="closing" if self.closing else "account_generation_changed")
+                if not self.closing and on_error:
+                    try:
+                        on_error(RuntimeError("输出预算状态读取期间账号状态已变化，请重试"))
+                    except Exception as callback_error:
+                        if lifecycle:
+                            lifecycle("OUTPUT_SETTINGS_LOAD_FAILED", error=callback_error,
+                                      reason="error_callback_exception")
+                refresh_actions()
                 return
             try:
+                if lifecycle:
+                    lifecycle("OUTPUT_SETTINGS_LOAD_CALLBACK_EXECUTED",
+                              result="error" if failed else "success")
                 if failed:
                     self.record_client_state("worker_failed", job, result)
+                    if lifecycle:
+                        lifecycle("OUTPUT_SETTINGS_LOAD_FAILED", error=result)
                     if on_error:
                         on_error(result)
                     else:
                         self.show_error(caption, result)
                 else:
                     on_done(result)
+                    if lifecycle:
+                        lifecycle("OUTPUT_SETTINGS_LOAD_COMPLETED")
+            except Exception as callback_error:
+                if lifecycle:
+                    lifecycle("OUTPUT_SETTINGS_LOAD_FAILED", error=callback_error,
+                              reason="callback_exception")
+                if on_error:
+                    try:
+                        on_error(callback_error)
+                    except Exception as error_callback_error:
+                        if lifecycle:
+                            lifecycle("OUTPUT_SETTINGS_LOAD_FAILED", error=error_callback_error,
+                                      reason="error_callback_exception")
             finally:
-                self.update_actions()
+                refresh_actions()
 
         def expired():
             if self.worker_job is not job:
@@ -1768,35 +1837,69 @@ class App:
             self.abandon_worker()
             try:
                 error = TimeoutError("操作等待超时，结果尚未确认。请刷新状态后重试；正在执行的任务不会被标记完成。")
+                if lifecycle:
+                    lifecycle("OUTPUT_SETTINGS_LOAD_FAILED", error=error, reason="worker_timeout")
                 if on_error:
                     on_error(error)
                 else:
                     self.status.set(caption + "等待超时，请重试；详情见 client-diagnostics.jsonl")
             finally:
-                self.update_actions()
+                refresh_actions()
 
         def run():
+            if lifecycle:
+                lifecycle("OUTPUT_SETTINGS_LOAD_STARTED")
             try:
                 result, failed = fn(), False
             except Exception as error:
                 result, failed = error, True
+                if lifecycle:
+                    lifecycle("OUTPUT_SETTINGS_LOAD_FAILED", error=error, reason="worker_exception")
             with job["lock"]:
                 abandoned = job["abandoned"]
                 if not abandoned:
                     job["result"] = result, failed
+                    if lifecycle:
+                        lifecycle("OUTPUT_SETTINGS_LOAD_CALLBACK_SCHEDULED")
                     self.events.put(finish)
             if abandoned and not failed and discard:
                 discard(result)
 
         job["thread"] = Thread(target=run, daemon=True, name="labcoding-worker")
+        if lifecycle:
+            lifecycle("OUTPUT_SETTINGS_LOAD_THREAD_CREATED")
+        refresh_actions()
         try:
-            self.update_actions()
-            self.schedule("worker_deadline", max(1, int(1000 * (WORKER_TIMEOUT if timeout is None else timeout))), expired)
+            try:
+                self.schedule("worker_deadline", max(1, int(1000 * (WORKER_TIMEOUT if timeout is None else timeout))), expired)
+            except Exception as error:
+                if lifecycle:
+                    lifecycle("OUTPUT_SETTINGS_LOAD_FAILED", error=error,
+                              reason="deadline_schedule_failed")
             job["thread"].start()
+            if lifecycle:
+                lifecycle("OUTPUT_SETTINGS_LOAD_THREAD_STARTED")
         except Exception as error:
-            with job["lock"]:
-                job["result"] = error, True
-            finish()
+            if lifecycle:
+                lifecycle("OUTPUT_SETTINGS_LOAD_FAILED", error=error, reason="thread_start_failed")
+            self.worker_job = None
+            self.busy = ""
+            timer = self.timers.pop("worker_deadline", None)
+            if timer:
+                try:
+                    self.root.after_cancel(timer)
+                except tk.TclError:
+                    pass
+            if on_error:
+                try:
+                    on_error(error)
+                except Exception as callback_error:
+                    if lifecycle:
+                        lifecycle("OUTPUT_SETTINGS_LOAD_FAILED", error=callback_error,
+                                  reason="error_callback_exception")
+            refresh_actions()
+            return False
+        return True
 
     def show_error(self, title, error):
         message = str(error).replace(self.token, "••••") if self.token else str(error)
@@ -3709,6 +3812,190 @@ class App:
         configured_output = configured_output if type(configured_output) is int and configured_output > 0 else 4096
         return context, min(max_output, configured_output, context // 2)
 
+    @staticmethod
+    def output_sync_error_status(error, account=None):
+        status = getattr(error, "status", None)
+        category = getattr(error, "category", None)
+        if status == 401:
+            return "账号未激活或登录已过期"
+        if status == 403:
+            if not account or account.get("status") != "active":
+                return "账号未激活"
+            return "权限不足（需要管理员账号）"
+        if status == 404:
+            return "Gateway 不支持该接口"
+        if isinstance(status, int) and status >= 500:
+            return f"Gateway 服务错误（HTTP {status}）"
+        if category in {"timeout", "network", "connect", "transport"} or isinstance(
+                error, (TimeoutError, ConnectionError, OSError)):
+            return "网络连接失败"
+        if str(error).startswith("请通过 CCSLab 账号 Gateway"):
+            return "账号未激活"
+        return "同步失败"
+
+    def configure_output_limit(self, value=None, *, on_status=None):
+        """Persist the shared output budget and inspect/sync its remote limits."""
+        request_id = uuid4().hex
+        lifecycle_started = monotonic()
+        is_load = value is None
+
+        def lifecycle(event, error=None, **details):
+            if is_load:
+                self.record_output_settings_lifecycle(event, request_id, lifecycle_started,
+                                                      error=error, **details)
+
+        if is_load:
+            lifecycle("OUTPUT_SETTINGS_LOAD_QUEUED", reason="request_created")
+        if value is not None:
+            if type(value) is not int or not 128 <= value <= 8192:
+                raise ValueError("输出 Token 上限须为 128–8192 的整数。")
+            previous = self.output_limit
+            had_saved_value = "output_limit" in self.prefs
+            previous_saved_value = self.prefs.get("output_limit")
+            self.output_limit = value
+            set_output_limit(self.prefs, value)
+            try:
+                self.save_prefs()
+            except OSError:
+                self.output_limit = previous
+                if had_saved_value:
+                    self.prefs["output_limit"] = previous_saved_value
+                else:
+                    self.prefs.pop("output_limit", None)
+                raise
+            self.refresh_context_output()
+
+        requested = value
+        client = self.account_client if self.connection_mode == "account" else None
+        meta = dict(self.model_info)
+        self.output_sync_error = ""
+
+        def inspect_remote():
+            remote_limit = None
+            remote_error = None
+            gateway_limit = None
+            gateway_error = None
+            if client is None:
+                remote_error = RuntimeError("请通过 CCSLab 账号 Gateway 连接后同步 Ubuntu OpenCode。")
+            else:
+                if requested is None:
+                    try:
+                        lifecycle("OUTPUT_SETTINGS_LOAD_REQUEST_SENT", route="/api/opencode/output-limit")
+                        remote_limit = client.opencode_output_limit()
+                        lifecycle("OUTPUT_SETTINGS_LOAD_RESPONSE_RECEIVED",
+                                  response_type=type(remote_limit).__name__, output_limit=remote_limit
+                                  if type(remote_limit) is int else None)
+                    except Exception as error:
+                        remote_error = error
+                        lifecycle("OUTPUT_SETTINGS_LOAD_FAILED", error=error,
+                                  reason="output_limit_request_failed",
+                                  http_status=getattr(error, "status", None))
+                else:
+                    try:
+                        client.set_opencode_output_limit(requested)
+                    except Exception as error:
+                        remote_error = error
+                    try:
+                        remote_limit = client.opencode_output_limit()
+                        if remote_error is None and remote_limit != requested:
+                            remote_error = RuntimeError(
+                                f"远端回读值为 {remote_limit}，与请求的 {requested} 不一致。")
+                    except Exception as error:
+                        remote_error = remote_error or error
+                try:
+                    lifecycle("OUTPUT_SETTINGS_LOAD_REQUEST_SENT", route="/api/model")
+                    current = client.model()
+                    lifecycle("OUTPUT_SETTINGS_LOAD_RESPONSE_RECEIVED", route="/api/model")
+                    gateway_limit = min(
+                        (n for n in (current.get("output_token_limit"), current.get("output_limit"))
+                         if type(n) is int and n > 0), default=None)
+                    meta.update(current)
+                except Exception as error:
+                    gateway_error = error
+                    lifecycle("OUTPUT_SETTINGS_LOAD_FAILED", error=error,
+                              reason="model_request_failed", http_status=getattr(error, "status", None))
+            effective = self.model_limits(meta, self.output_limit)[1]
+            if gateway_limit is not None:
+                effective = min(effective, gateway_limit)
+            return effective, remote_limit, remote_error, gateway_limit, gateway_error, meta
+
+        def done(result):
+            effective, remote_limit, remote_error, gateway_limit, gateway_error, current_meta = result
+            if not gateway_error:
+                self.update_model(current_meta)
+            self.output_gateway_limit = gateway_limit
+            self.output_remote_limit = remote_limit
+            self.output_sync_status = (self.output_sync_error_status(remote_error, self.account)
+                                       if remote_error else
+                                       ("同步成功" if requested is not None else "状态已读取"))
+            self.output_sync_error = str(remote_error) if remote_error else ""
+            result_state = {
+                "phase": "done", "local": self.output_limit, "gateway": gateway_limit,
+                "effective": effective, "remote": remote_limit,
+                "sync_status": self.output_sync_status, "sync_error": self.output_sync_error,
+                "gateway_error": str(gateway_error) if gateway_error else "",
+            }
+            if on_status:
+                on_status(result_state)
+
+        def failed(error):
+            lifecycle("OUTPUT_SETTINGS_LOAD_FAILED", error=error, reason="operation_failed")
+            self.output_sync_status = self.output_sync_error_status(error, self.account)
+            self.output_sync_error = str(error)
+            result_state = {
+                "phase": "done", "local": self.output_limit,
+                "gateway": self.output_gateway_limit,
+                "effective": self.model_limits(self.model_info, self.output_limit)[1],
+                "remote": self.output_remote_limit, "sync_status": self.output_sync_status,
+                "sync_error": self.output_sync_error, "gateway_error": str(error),
+            }
+            if on_status:
+                on_status(result_state)
+
+        queue_deadline = lifecycle_started + 30
+        queued_notified = False
+
+        def start_when_idle():
+            nonlocal queued_notified
+            if self.closing:
+                error = RuntimeError("client_closing")
+                lifecycle("OUTPUT_SETTINGS_LOAD_FAILED", error=error, reason="client_closing")
+                failed(error)
+                return
+            if self.busy:
+                if monotonic() >= queue_deadline:
+                    error = TimeoutError("等待客户端当前操作完成超时")
+                    lifecycle("OUTPUT_SETTINGS_LOAD_FAILED", error=error, reason="queue_timeout")
+                    failed(error)
+                    return
+                self.output_sync_status = "等待当前操作完成"
+                if not queued_notified:
+                    lifecycle("OUTPUT_SETTINGS_LOAD_QUEUED", reason="client_busy")
+                    queued_notified = True
+                if on_status:
+                    on_status({"phase": "waiting", "local": self.output_limit,
+                               "gateway": self.output_gateway_limit,
+                               "effective": self.model_limits(meta, self.output_limit)[1],
+                               "remote": self.output_remote_limit,
+                               "sync_status": self.output_sync_status, "sync_error": ""})
+                self.schedule("output_limit_sync", 250, start_when_idle)
+                return
+            self.output_sync_status = ("正在同步（本地已保存）" if requested is not None else "正在读取")
+            if on_status:
+                on_status({"phase": "running", "local": self.output_limit,
+                           "gateway": self.output_gateway_limit,
+                           "effective": self.model_limits(meta, self.output_limit)[1],
+                           "remote": self.output_remote_limit,
+                           "sync_status": self.output_sync_status, "sync_error": ""})
+            started = self.worker("读取输出上限" if requested is None else "同步输出上限",
+                                  inspect_remote, done, on_error=failed, lifecycle=lifecycle)
+            if not started and getattr(self, "worker_job", None) is None:
+                error = RuntimeError("worker_not_started")
+                lifecycle("OUTPUT_SETTINGS_LOAD_FAILED", error=error, reason="worker_not_started")
+                failed(error)
+
+        start_when_idle()
+
     def output_command(self, prompt):
         parts = prompt.split()
         if self.busy:
@@ -3726,61 +4013,12 @@ class App:
             if not 128 <= value <= 8192:
                 self.append(self.chat, "输出 Token 上限须为 128–8192。\n", "muted")
                 return
-            previous = self.output_limit
-            self.output_limit = value
-            had_saved_value = "output_limit" in self.prefs
-            previous_saved_value = self.prefs.get("output_limit")
-            set_output_limit(self.prefs, value)
-            try:
-                self.save_prefs()
-            except OSError as error:
-                self.output_limit = previous
-                if had_saved_value:
-                    self.prefs["output_limit"] = previous_saved_value
-                else:
-                    self.prefs.pop("output_limit", None)
-                self.append(self.chat, f"Labcoding 设置保存失败：{error}\n", "error")
+        def report(state):
+            if state.get("phase") != "done":
                 return
-        client = self.account_client if self.connection_mode == "account" else None
-        meta = dict(self.model_info)
-        self.append(self.chat, f"Labcoding 已设置 {self.output_limit} Token；新任务生效。\n", "muted")
-
-        def inspect_remote():
-            remote_limit = None
-            remote_error = None
-            gateway_limit = None
-            gateway_error = None
-            if client is None:
-                remote_error = "请通过 CCSLab 账号 Gateway 连接后同步 Ubuntu OpenCode。"
-            else:
-                try:
-                    if value is not None:
-                        remote_limit = client.set_opencode_output_limit(value).get("output_limit")
-                    else:
-                        remote_limit = client.opencode_output_limit()
-                except Exception as error:
-                    remote_error = str(error)
-                    if value is not None:
-                        try:
-                            remote_limit = client.opencode_output_limit()
-                        except Exception as read_error:
-                            remote_error = f"{error}；读取远端设置失败：{read_error}"
-                try:
-                    current = client.model()
-                    gateway_limit = min((n for n in (current.get("output_token_limit"), current.get("output_limit"))
-                                         if type(n) is int and n > 0), default=None)
-                    meta.update(current)
-                except Exception as error:
-                    gateway_error = str(error)
-            effective = self.model_limits(meta, self.output_limit)[1]
-            if gateway_limit is not None:
-                effective = min(effective, gateway_limit)
-            return effective, remote_limit, remote_error, gateway_error
-
-        def done(result):
-            effective, remote_limit, remote_error, gateway_error = result
-            if not gateway_error:
-                self.update_model(meta)
+            effective = state["effective"]
+            remote = state.get("remote")
+            gateway_error = state.get("gateway_error")
             if value is None:
                 suffix = f"{effective} Token" if not gateway_error else f"读取失败：{gateway_error}"
                 self.append(self.chat, f"Labcoding 设定值：{self.output_limit}；Gateway/上下文有效值：{suffix}。\n",
@@ -3791,18 +4029,23 @@ class App:
             elif gateway_error:
                 self.append(self.chat, f"Labcoding 已设置 {self.output_limit}；Gateway/上下文有效值读取失败：{gateway_error}\n",
                             "error")
-            if remote_error:
+            if state.get("sync_error"):
                 retry = "/output" if value is None else f"/output {value}"
-                status = f"同步失败；请检查连接或权限后重试 {retry}"
-                if remote_limit is not None:
-                    status += f"（Ubuntu 当前仍为 {remote_limit} Token）"
-                self.append(self.chat, f"Ubuntu 独立 OpenCode：{status}：{remote_error}\n", "error")
-            elif remote_limit is not None:
+                status = f"同步失败（{state['sync_status']}）；请检查连接或权限后重试 {retry}"
+                if remote is not None:
+                    status += f"（Ubuntu 当前为 {remote} Token）"
+                self.append(self.chat, f"Ubuntu 独立 OpenCode：{status}：{state['sync_error']}\n", "error")
+            elif remote is not None:
                 timing = "；OpenCode 新任务读取配置，已运行任务不变" if value is not None else ""
-                self.append(self.chat, f"Ubuntu server 独立 OpenCode：{remote_limit} Token{timing}。\n", "muted")
+                self.append(self.chat, f"Ubuntu server 独立 OpenCode：{remote} Token{timing}。\n", "muted")
 
-        self.worker("读取输出上限" if value is None else "同步输出上限", inspect_remote, done,
-                    on_error=lambda error: self.append(self.chat, f"Gateway 查询失败：{error}\n", "error"))
+        try:
+            self.configure_output_limit(value, on_status=report)
+        except OSError as error:
+            self.append(self.chat, f"Labcoding 设置保存失败：{error}\n", "error")
+            return
+        if value is not None:
+            self.append(self.chat, f"Labcoding 已设置 {self.output_limit} Token；新任务生效。\n", "muted")
 
     def create_engine(self, path, limits, *, proxy_url=None, owner=None, connection=None):
         from engine import Engine
@@ -4501,7 +4744,7 @@ class App:
 
 
 def main():
-    parser = argparse.ArgumentParser(prog="CCSLab Labcoding")
+    parser = argparse.ArgumentParser(prog=WINDOWS_PRODUCT_LABEL)
     parser.add_argument("--smoke-test", action="store_true", help="initialize the UI and exit")
     parser.add_argument("--data-dir", type=Path)
     args = parser.parse_args()

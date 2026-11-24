@@ -159,6 +159,17 @@ class UpdateFlowTests(unittest.TestCase):
         stable_service = self.service(version_info("1.6.0", "stable"))
         self.assertIsNone(stable_service._release_candidate(release("1.6.0-beta.3")))
 
+    def test_windows_201_asset_name_is_accepted_and_trust_checked(self):
+        service = self.service(version_info("2.0.0", "stable"))
+        item = release("2.0.1")
+        asset = item["assets"][0]
+        asset["name"] = "CCSLab-Labcoding-Win-2.0.1-Setup-x64.exe"
+        asset["browser_download_url"] = UpdateService.release_asset_url(item["tag_name"], asset["name"])
+        candidate = service._release_candidate(item)
+        self.assertEqual(candidate.asset_name, "CCSLab-Labcoding-Win-2.0.1-Setup-x64.exe")
+        self.assertEqual(candidate.asset_url, asset["browser_download_url"])
+        service._validate_candidate(candidate)
+
     def test_no_newer_release_returns_none(self):
         http = QueueHttp([api_response([release("1.6.0-beta.1")])])
         self.assertIsNone(self.service(http=http).check())

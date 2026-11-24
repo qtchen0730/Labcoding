@@ -1,5 +1,5 @@
 param(
-    [string]$Output = (Join-Path (Split-Path (Split-Path $PSScriptRoot)) '.work\releases\CCSLab-Labcoding-Test-Setup-x64.exe'),
+    [string]$Output = '',
     [string]$Python = 'python',
     [string]$PyInstallerPath = '',
     [string]$BuildRoot = (Join-Path (Split-Path (Split-Path $PSScriptRoot)) ('.work\build\test-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))),
@@ -10,24 +10,28 @@ param(
 $ErrorActionPreference = 'Stop'
 $LocalWork = Join-Path (Split-Path (Split-Path $PSScriptRoot)) '.work'
 $BuildRoot = [System.IO.Path]::GetFullPath($BuildRoot)
+$VersionInfo = Get-Content -LiteralPath (Join-Path (Split-Path $PSScriptRoot) 'app\version.json') -Raw -Encoding utf8 | ConvertFrom-Json
+$VersionedWindowsOutput = [System.IO.Path]::GetFullPath((Join-Path $LocalWork `
+    ('releases\CCSLab-Labcoding-Win-' + $VersionInfo.version + '-Setup-x64.exe')))
+if (!$Output) { $Output = $VersionedWindowsOutput }
 $Output = [System.IO.Path]::GetFullPath($Output)
 $FixedTestOutput = [System.IO.Path]::GetFullPath((Join-Path $LocalWork 'releases\CCSLab-Labcoding-Test-Setup-x64.exe'))
-$VersionInfo = Get-Content -LiteralPath (Join-Path (Split-Path $PSScriptRoot) 'app\version.json') -Raw -Encoding utf8 | ConvertFrom-Json
+$LegacyVersionedTestOutput = [System.IO.Path]::GetFullPath((Join-Path $LocalWork `
+    ('releases\CCSLab-Labcoding-' + $VersionInfo.version + '-Setup-x64.exe')))
 if ($VersionInfo.version -notmatch '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$') {
     throw "Invalid semantic version for installer output: $($VersionInfo.version)"
 }
-$VersionedTestOutput = [System.IO.Path]::GetFullPath((Join-Path $LocalWork `
-    ('releases\CCSLab-Labcoding-' + $VersionInfo.version + '-Setup-x64.exe')))
 if ($Stage -eq 'Installer') {
     if (!(Test-Path -LiteralPath (Join-Path $BuildRoot 'portable-source.json'))) {
         throw 'Installer stage requires a completed Portable build in the same BuildRoot.'
     }
 } elseif (Test-Path -LiteralPath $BuildRoot) { throw "Build directory already exists; refusing to overwrite: $BuildRoot" }
-if ($Output -ne $FixedTestOutput -and $Output -ne $VersionedTestOutput) {
-    throw "Output must be the fixed test installer or the versioned installer for $($VersionInfo.version): $Output"
+if ($Output -ne $FixedTestOutput -and $Output -ne $LegacyVersionedTestOutput -and
+    $Output -ne $VersionedWindowsOutput) {
+    throw "Output must be a recognized CCSLab x64 installer under .work\releases: $Output"
 }
 if ((Test-Path -LiteralPath $Output) -and $Output -ne $FixedTestOutput) {
-    throw "Refusing to overwrite a versioned installer: $Output"
+    throw "Refusing to overwrite an existing versioned installer: $Output"
 }
 if ($Stage -ne 'Installer') { $BuildRoot = (New-Item -ItemType Directory -Path $BuildRoot).FullName }
 $env:PYTHONPYCACHEPREFIX = (New-Item -ItemType Directory -Force -Path (Join-Path $BuildRoot 'pycache')).FullName
@@ -106,13 +110,16 @@ $FreezeOptions = @(
     '--specpath', $BuildRoot, '--workpath', $AnalysisOutput, '--distpath', $Dist
 )
 $versionCore = $VersionInfo.version.Split('-')[0].Split('.')
-$fileVersion = "{0}.{1}.{2}.{3}" -f [int]$versionCore[0], [int]$versionCore[1], [int]$versionCore[2], [int]$VersionInfo.release_sequence
-$fileVersionTuple = ($fileVersion.Split('.') -join ', ')
+$assemblyVersion = "{0}.{1}.{2}.{3}" -f [int]$versionCore[0], [int]$versionCore[1], [int]$versionCore[2], [int]$VersionInfo.release_sequence
+$fileVersion = "{0}.{1}.{2}" -f [int]$versionCore[0], [int]$versionCore[1], [int]$versionCore[2]
+$fileVersionTuple = (($fileVersion + '.0').Split('.') -join ', ')
 $productVersion = $VersionInfo.version
+$productName = 'CCSLab Labcoding Win'
+$productLabel = "$productName $productVersion"
 @"
 VSVersionInfo(
   ffi=FixedFileInfo(filevers=($fileVersionTuple), prodvers=($fileVersionTuple), mask=0x3f, flags=0x0, OS=0x40004, fileType=0x1, subtype=0x0, date=(0, 0)),
-  kids=[StringFileInfo([StringTable('040904B0', [StringStruct('CompanyName', 'CCSLab'), StringStruct('FileDescription', 'CCSLab Labcoding'), StringStruct('FileVersion', '$productVersion'), StringStruct('ProductName', 'CCSLab Labcoding'), StringStruct('ProductVersion', '$productVersion')])]), VarFileInfo([VarStruct('Translation', [1033, 1200])])]
+  kids=[StringFileInfo([StringTable('040904B0', [StringStruct('CompanyName', 'CCSLab'), StringStruct('FileDescription', '$productLabel'), StringStruct('FileVersion', '$fileVersion'), StringStruct('ProductName', '$productName'), StringStruct('ProductVersion', '$productVersion')])]), VarFileInfo([VarStruct('Translation', [1033, 1200])])]
 )
 "@ | Set-Content -LiteralPath (Join-Path $BuildRoot 'version-resource.txt') -Encoding utf8
 & $Python -m PyInstaller @FreezeOptions (Join-Path $Source 'app.py')
@@ -167,11 +174,12 @@ $CompilerOptions = @(
 )
 $AssemblyInfo = Join-Path $BuildRoot 'AssemblyVersion.cs'
 $versionCore = $VersionInfo.version.Split('-')[0].Split('.')
-$fileVersion = "{0}.{1}.{2}.{3}" -f [int]$versionCore[0], [int]$versionCore[1], [int]$versionCore[2], [int]$VersionInfo.release_sequence
+$assemblyVersion = "{0}.{1}.{2}.{3}" -f [int]$versionCore[0], [int]$versionCore[1], [int]$versionCore[2], [int]$VersionInfo.release_sequence
+$fileVersion = "{0}.{1}.{2}" -f [int]$versionCore[0], [int]$versionCore[1], [int]$versionCore[2]
 $productVersion = $VersionInfo.version
 @"
 using System.Reflection;
-[assembly: AssemblyVersion("$fileVersion")]
+[assembly: AssemblyVersion("$assemblyVersion")]
 [assembly: AssemblyFileVersion("$fileVersion")]
 [assembly: AssemblyInformationalVersion("$productVersion")]
 "@ | Set-Content -LiteralPath $AssemblyInfo -Encoding utf8

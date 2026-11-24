@@ -174,9 +174,14 @@ class UpdateService:
         if not isinstance(tag, str) or not re.fullmatch(r"v[0-9A-Za-z.+-]+", tag):
             raise UpdateTrustError("GitHub Release 标签无效")
         if not isinstance(name, str) or not re.fullmatch(
-                r"CCSLab-Labcoding-[0-9A-Za-z.+-]+-Setup-x64\.exe", name):
+                r"CCSLab-Labcoding-(?:Win-)?[0-9A-Za-z.+-]+-Setup-x64\.exe", name):
             raise UpdateTrustError("更新资产名不是固定的 Windows x64 安装包格式")
         return f"https://github.com/{REPOSITORY}/releases/download/{quote(tag, safe='.-+')}/{quote(name, safe='.-')}"
+
+    @staticmethod
+    def release_asset_names(version):
+        return (f"CCSLab-Labcoding-Win-{version}-Setup-x64.exe",
+                f"CCSLab-Labcoding-{version}-Setup-x64.exe")
 
     def _get(self, url, *, max_bytes, cancel=None, progress=None, expected_size=None):
         api = urlsplit(url).hostname == "api.github.com"
@@ -280,14 +285,16 @@ class UpdateService:
         if parsed <= self.current_version:
             return None
 
-        name = f"CCSLab-Labcoding-{version}-Setup-x64.exe"
+        allowed_names = self.release_asset_names(version)
         assets = release.get("assets")
         if not isinstance(assets, list):
             raise UpdateTrustError("Release 资产列表无效")
-        matching = [asset for asset in assets if isinstance(asset, dict) and asset.get("name") == name]
+        matching = [asset for asset in assets if isinstance(asset, dict)
+                    and asset.get("name") in allowed_names]
         if len(matching) != 1:
             raise UpdateError(f"新版本 {version} 未提供唯一的 Windows x64 安装包")
         asset = matching[0]
+        name = asset["name"]
         expected_url = self.release_asset_url(tag, name)
         if asset.get("browser_download_url") != expected_url:
             raise UpdateTrustError("Release 安装包下载地址与固定来源不一致")
@@ -325,8 +332,8 @@ class UpdateService:
             version = SemVer(candidate.version)
         except VersionError as error:
             raise UpdateTrustError("更新版本格式无效") from error
-        expected_name = f"CCSLab-Labcoding-{candidate.version}-Setup-x64.exe"
-        if (candidate.tag != "v" + candidate.version or candidate.asset_name != expected_name
+        expected_names = self.release_asset_names(candidate.version)
+        if (candidate.tag != "v" + candidate.version or candidate.asset_name not in expected_names
                 or candidate.channel not in {"stable", "beta"}
                 or version.stable != (candidate.channel == "stable")
                 or self.version_info["channel"] == "stable" and candidate.channel != "stable"

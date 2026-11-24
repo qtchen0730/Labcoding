@@ -125,7 +125,7 @@ class OutputLimitTests(unittest.TestCase):
         self.assertEqual(load_output_limit(prefs), 4096)
         with tempfile.TemporaryDirectory() as scratch:
             path = Path(scratch) / "preferences.json"
-            for value in (8192, 4096):
+            for value in (1024, 2048, 4096, 6144, 8192, 128, 3000, 5000, 7500, 8192):
                 set_output_limit(prefs, value)
                 path.write_text(json.dumps(prefs), encoding="utf-8")
                 self.assertEqual(load_output_limit(json.loads(path.read_text(encoding="utf-8"))), value)
@@ -306,7 +306,7 @@ class OutputLimitTests(unittest.TestCase):
                 server_thread.join(2)
 
     def test_rejects_invalid_persisted_and_requested_values(self):
-        for value in (True, 127, 8193, "8192"):
+        for value in (True, -1, 127, 8193, "8192", 3000.0, None):
             self.assertEqual(load_output_limit({"output_limit": value}), 4096)
             with self.assertRaises(ValueError):
                 set_output_limit({}, value)
@@ -315,15 +315,19 @@ class OutputLimitTests(unittest.TestCase):
         class Client:
             remote = 4096
             failures = 1
+            writes = 0
+            reads = 0
 
             def model(self):
                 return {"effective_context_limit": 131072, "output_limit": 4096,
                         "output_token_limit": 4096}
 
             def opencode_output_limit(self):
+                self.reads += 1
                 return self.remote
 
             def set_opencode_output_limit(self, value):
+                self.writes += 1
                 if self.failures:
                     self.failures -= 1
                     raise RuntimeError("fixture offline")
@@ -334,6 +338,11 @@ class OutputLimitTests(unittest.TestCase):
         app.busy = False
         app.closing = False
         app.output_limit = 4096
+        app.output_gateway_limit = None
+        app.output_remote_limit = None
+        app.output_sync_status = "尚未同步"
+        app.output_sync_error = ""
+        app.account = {"status": "active", "role": "admin"}
         app.prefs = {}
         app.model_info = {}
         app.history = {}
@@ -347,6 +356,10 @@ class OutputLimitTests(unittest.TestCase):
         app.messages = []
         app.append = lambda _box, message, *_args, **_kwargs: app.messages.append(message)
         app.save_prefs = lambda: None
+        app.refresh_context_output = lambda: setattr(
+            app, "display_budget", (app.output_limit, "新任务有效输出预算"))
+        app.update_model = lambda info: setattr(
+            app, "display_budget", (App.model_limits(info, app.output_limit)[1], "新任务有效输出预算"))
 
         def worker(_caption, operation, done, on_error=None, **_kwargs):
             try:
@@ -366,9 +379,39 @@ class OutputLimitTests(unittest.TestCase):
         self.assertEqual(app.account_client.remote, 4096)
         app.output_command("/output 8192")
         self.assertEqual(app.account_client.remote, 8192)
+        self.assertGreaterEqual(app.account_client.reads, 2)
+        self.assertEqual(app.account_client.writes, 2)
         self.assertEqual(app.display_budget, (4096, "新任务有效输出预算"))
         app.output_command("/output 4096")
         self.assertEqual((app.prefs["output_limit"], app.account_client.remote), (4096, 4096))
+
+        scheduled = []
+        app.schedule = lambda _name, _delay, callback: scheduled.append(callback)
+        app.busy = "读取项目"
+        states = []
+        app.configure_output_limit(6144, on_status=states.append)
+        self.assertEqual(app.prefs["output_limit"], 6144)
+        self.assertEqual(states[-1]["phase"], "waiting")
+        self.assertEqual(app.account_client.remote, 4096)
+        self.assertEqual(len(scheduled), 1)
+        app.busy = ""
+        scheduled.pop()()
+        self.assertEqual(app.account_client.remote, 6144)
+        self.assertEqual(states[-1]["phase"], "done")
+
+    def test_output_budget_error_states_are_distinguished(self):
+        class Error(Exception):
+            def __init__(self, status=None, category=None):
+                self.status = status
+                self.category = category
+
+        self.assertEqual(App.output_sync_error_status(Error(401)), "账号未激活或登录已过期")
+        self.assertEqual(App.output_sync_error_status(Error(403), {"status": "pending"}), "账号未激活")
+        self.assertEqual(App.output_sync_error_status(Error(403), {"status": "active"}),
+                         "权限不足（需要管理员账号）")
+        self.assertEqual(App.output_sync_error_status(Error(404)), "Gateway 不支持该接口")
+        self.assertEqual(App.output_sync_error_status(Error(503)), "Gateway 服务错误（HTTP 503）")
+        self.assertEqual(App.output_sync_error_status(TimeoutError()), "网络连接失败")
 
 
 if __name__ == "__main__":
