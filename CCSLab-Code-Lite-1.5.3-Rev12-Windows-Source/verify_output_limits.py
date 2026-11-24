@@ -16,7 +16,8 @@ from unittest.mock import patch
 from app import App
 import engine as engine_module
 from engine import Engine
-from output_settings import load_output_limit, set_output_limit
+from output_settings import (load_account_output_limit, load_output_limit, set_account_output_limit,
+                             set_output_limit)
 
 
 class _StreamFixture(BaseHTTPRequestHandler):
@@ -311,10 +312,9 @@ class OutputLimitTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 set_output_limit({}, value)
 
-    def test_output_command_reports_partial_failure_and_retry(self):
+    def test_output_command_changes_personal_budget_only(self):
         class Client:
             remote = 4096
-            failures = 1
             writes = 0
             reads = 0
 
@@ -328,9 +328,6 @@ class OutputLimitTests(unittest.TestCase):
 
             def set_opencode_output_limit(self, value):
                 self.writes += 1
-                if self.failures:
-                    self.failures -= 1
-                    raise RuntimeError("fixture offline")
                 self.remote = value
                 return {"output_limit": value}
 
@@ -352,12 +349,14 @@ class OutputLimitTests(unittest.TestCase):
                                             setattr(app, "display_budget", (value, label)))
         app.connection_mode = "account"
         app.account_client = Client()
+        app.account_online = True
         app.chat = object()
         app.messages = []
         app.append = lambda _box, message, *_args, **_kwargs: app.messages.append(message)
         app.save_prefs = lambda: None
         app.refresh_context_output = lambda: setattr(
-            app, "display_budget", (app.output_limit, "新任务有效输出预算"))
+            app, "display_budget", (App.model_limits(app.model_info, app.output_limit)[1],
+                                    "新任务有效输出预算"))
         app.update_model = lambda info: setattr(
             app, "display_budget", (App.model_limits(info, app.output_limit)[1], "新任务有效输出预算"))
 
@@ -374,30 +373,53 @@ class OutputLimitTests(unittest.TestCase):
         app.output_command("/output 8192")
         self.assertEqual(app.prefs["output_limit"], 8192)
         self.assertEqual(app.display_budget, (4096, "新任务有效输出预算"))
-        self.assertIn("Labcoding 已设置 8192，当前有效 4096", "".join(app.messages))
-        self.assertIn("同步失败", "".join(app.messages))
+        self.assertIn("个人预算：8192；新任务有效预算：4096", "".join(app.messages))
         self.assertEqual(app.account_client.remote, 4096)
+        self.assertEqual(app.account_client.writes, 0)
         app.output_command("/output 8192")
-        self.assertEqual(app.account_client.remote, 8192)
-        self.assertGreaterEqual(app.account_client.reads, 2)
-        self.assertEqual(app.account_client.writes, 2)
+        self.assertEqual(app.account_client.remote, 4096)
+        self.assertEqual(app.account_client.reads, 0)
+        self.assertEqual(app.account_client.writes, 0)
         self.assertEqual(app.display_budget, (4096, "新任务有效输出预算"))
         app.output_command("/output 4096")
         self.assertEqual((app.prefs["output_limit"], app.account_client.remote), (4096, 4096))
 
-        scheduled = []
-        app.schedule = lambda _name, _delay, callback: scheduled.append(callback)
-        app.busy = "读取项目"
-        states = []
-        app.configure_output_limit(6144, on_status=states.append)
-        self.assertEqual(app.prefs["output_limit"], 6144)
-        self.assertEqual(states[-1]["phase"], "waiting")
-        self.assertEqual(app.account_client.remote, 4096)
-        self.assertEqual(len(scheduled), 1)
-        app.busy = ""
-        scheduled.pop()()
-        self.assertEqual(app.account_client.remote, 6144)
-        self.assertEqual(states[-1]["phase"], "done")
+    def test_server_output_write_requires_authenticated_admin(self):
+        class Client:
+            remote = 4096
+            writes = 0
+
+            def opencode_output_limit(self):
+                return self.remote
+
+            def set_opencode_output_limit(self, value):
+                self.writes += 1
+                self.remote = value
+                return {"output_limit": value}
+
+            def model(self):
+                return {"effective_context_limit": 131072, "output_token_limit": 8192}
+
+        app = App.__new__(App)
+        app.connection_mode = "account"
+        app.account = {"status": "active", "role": "user"}
+        app.account_online = True
+        app.account_client = Client()
+        with self.assertRaises(PermissionError):
+            app.configure_output_limit(8192)
+        self.assertEqual(app.account_client.writes, 0)
+
+    def test_personal_budgets_are_scoped_per_account(self):
+        preferences = {"output_limit": 2048}
+        self.assertEqual(load_account_output_limit(preferences, "qtchen"), 2048)
+        set_account_output_limit(preferences, "qtchen", 2048)
+        self.assertEqual(load_account_output_limit(preferences, "bl"), 4096)
+        set_account_output_limit(preferences, "bl", 4096)
+        set_account_output_limit(preferences, "another-user", 6144)
+        self.assertEqual(load_account_output_limit(preferences, "qtchen"), 2048)
+        self.assertEqual(load_account_output_limit(preferences, "bl"), 4096)
+        self.assertEqual(load_account_output_limit(preferences, "another-user"), 6144)
+        self.assertEqual(preferences["output_limit"], 6144)
 
     def test_output_budget_error_states_are_distinguished(self):
         class Error(Exception):

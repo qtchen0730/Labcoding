@@ -388,8 +388,6 @@ def build_settings_page(app, parent, section="general"):
         feedback.pack(fill="x", padx=15, pady=(0, 5))
         app.button(parent, "使用 Open WebUI 模型", lambda: app.select_connection("direct")).pack(anchor="w")
 
-        budget = card(parent, "单次输出 Token 上限",
-                      "只影响新建任务；已运行或历史任务继续使用各自保存的预算。")
         preset_values = {
             "1024 Token（短回答）": 1024,
             "2048 Token（普通回答）": 2048,
@@ -398,142 +396,230 @@ def build_settings_page(app, parent, section="general"):
             "8192 Token（长文本输出）": 8192,
         }
         custom_label = "自定义"
-        initial_choice = next((label for label, value in preset_values.items()
-                               if value == app.output_limit), custom_label)
-        choice = tk.StringVar(master=parent, value=initial_choice)
-        custom_value = tk.StringVar(master=parent, value=str(app.output_limit))
-        selector_row = app.frame(budget, "field")
-        selector_row.pack(fill="x", padx=15, pady=(0, 7))
-        app.label(selector_row, "预算档位", bg="field", muted=True).pack(side="left", padx=(0, 10))
-        selector = ttk.Combobox(selector_row, textvariable=choice,
-                                values=tuple(preset_values) + (custom_label,),
-                                state="readonly", width=23)
-        selector.pack(side="left")
-        custom_row = app.frame(budget, "field")
-        custom_row.pack(fill="x", padx=15, pady=(0, 7))
-        app.label(custom_row, "自定义 Token（128–8192）", bg="field", muted=True).pack(side="left", padx=(0, 10))
-        custom_error = tk.StringVar(master=parent, value="")
-
-        def valid_custom_input(value):
-            valid = value == "" or (len(value) <= 4 and value.isascii() and value.isdigit())
-            custom_error.set("" if valid else "只能输入 4 位以内的非负整数。")
-            return valid
-
-        validate_integer = parent.register(valid_custom_input)
-        custom_entry = ttk.Entry(custom_row, textvariable=custom_value, width=12,
-                                 validate="key", validatecommand=(validate_integer, "%P"))
-        custom_entry.pack(side="left")
-        app.label(custom_row, variable=custom_error, bg="field", color="heading", size=9).pack(
-            side="left", padx=(8, 0))
-        custom_row.pack_forget()
-
-        status_frame = app.frame(budget, "field")
-        status_frame.pack(fill="x", padx=15, pady=(1, 7))
-        status_values = {}
-        for key, label_text in (("local", "Labcoding 本地预算"), ("gateway", "Gateway 输出上限"),
-                                ("effective", "新任务有效预算"), ("remote", "Ubuntu 独立 OpenCode"),
-                                ("sync", "同步状态")):
-            row = app.frame(status_frame, "field")
-            row.pack(fill="x", pady=(0, 3))
-            label = app.label(row, label_text, bg="field", muted=True)
-            label.configure(width=22, anchor="w")
-            label.pack(side="left", anchor="w")
-            value = tk.StringVar(master=parent)
-            display_value = app.label(row, variable=value, bg="field", bold=(key == "sync"))
-            display_value.configure(wraplength=470, anchor="w")
-            display_value.pack(side="left", fill="x", expand=True)
-            status_values[key] = value
+        layout = app.frame(parent, "field")
+        layout.pack(fill="x", pady=(0, 10))
+        for column in (0, 1):
+            layout.grid_columnconfigure(column, weight=1, uniform="output-budget-halves", minsize=0)
 
         def budget_text(value, *, unknown="尚未读取"):
             return f"{value:,} Token" if type(value) is int and value > 0 else unknown
 
-        def render_status(state=None):
-            if not budget.winfo_exists():
-                return
-            state = state or {
-                "local": app.output_limit, "gateway": app.output_gateway_limit,
-                "effective": app.model_limits(app.model_info, app.output_limit)[1],
-                "remote": app.output_remote_limit, "sync_status": app.output_sync_status,
-                "sync_error": app.output_sync_error,
-            }
-            status_values["local"].set(budget_text(state.get("local")))
-            status_values["gateway"].set(budget_text(state.get("gateway")))
-            status_values["effective"].set(budget_text(state.get("effective"), unknown="暂不可用"))
-            status_values["remote"].set(budget_text(state.get("remote")))
-            text = state.get("sync_status") or "尚未同步"
-            if state.get("sync_error"):
-                text += f"：{state['sync_error']}"
-            elif state.get("gateway_error"):
-                text += f"；模型信息读取失败：{state['gateway_error']}"
-            status_values["sync"].set(text)
+        def make_budget_card(column, title, detail, *, server=False):
+            shelf = app.frame(layout, "field")
+            shelf.grid(row=0, column=column, sticky="nsew", padx=(0, 7) if column == 0 else (7, 0))
+            app.label(shelf, title, bg="field", bold=True, size=11).pack(fill="x", padx=15, pady=(11, 4))
+            intro = app.label(shelf, detail, bg="field", muted=True, size=9)
+            intro.configure(wraplength=340, justify="left")
+            intro.pack(fill="x", padx=15, pady=(0, 8))
+            admin = bool(server and app.has_admin_session)
+            current = app.output_remote_limit if server else app.output_limit
+            choice = tk.StringVar(master=parent, value=next(
+                (label for label, number in preset_values.items() if number == current), custom_label))
+            custom_value = tk.StringVar(master=parent, value=str(current or 4096))
+            custom_row = None
+            custom_error = tk.StringVar(master=parent, value="")
+            if not server or admin:
+                row = app.frame(shelf, "field")
+                row.pack(fill="x", padx=15, pady=(0, 7))
+                app.label(row, "预算档位", bg="field", muted=True).pack(anchor="w")
+                selector = ttk.Combobox(row, textvariable=choice,
+                                        values=tuple(preset_values) + (custom_label,),
+                                        state="readonly", width=28)
+                selector.pack(anchor="w", pady=(3, 0))
+                custom_row = app.frame(shelf, "field")
+                app.label(custom_row, "自定义 Token（128–8192）", bg="field", muted=True).pack(anchor="w")
 
-        syncing = {"active": False}
-        save_button = retry_button = refresh_status_button = None
+                def valid_custom_input(value):
+                    valid = value == "" or (len(value) <= 4 and value.isascii() and value.isdigit())
+                    custom_error.set("" if valid else "只能输入整数。")
+                    return valid
 
-        def set_syncing(active):
-            syncing["active"] = active
-            state = "disabled" if active else "normal"
-            for button in (save_button, retry_button, refresh_status_button):
-                if button is not None and button.winfo_exists():
-                    button.configure(state=state)
+                validate_integer = parent.register(valid_custom_input)
+                ttk.Entry(custom_row, textvariable=custom_value, width=12, validate="key",
+                          validatecommand=(validate_integer, "%P")).pack(side="left", pady=(3, 0))
+                app.label(custom_row, variable=custom_error, bg="field", color="heading", size=9).pack(
+                    side="left", padx=(8, 0), pady=(3, 0))
 
-        def sync_status(state):
-            render_status(state)
-            set_syncing(state.get("phase") in {"running", "waiting"})
+                def selection_changed(_event=None):
+                    if choice.get() == custom_label:
+                        custom_row.pack(fill="x", padx=15, pady=(0, 7))
+                    else:
+                        custom_row.pack_forget()
 
-        def selected_value():
-            if choice.get() == custom_label:
-                text = custom_value.get()
-                if not text:
-                    raise ValueError("自定义 Token 数量不能为空。")
-                value = int(text)
+                selector.bind("<<ComboboxSelected>>", selection_changed)
+                if current not in preset_values.values():
+                    selection_changed()
+            state_values = {}
+            keys = (("gateway", "Gateway 输出上限"),
+                    ("effective", "服务器新任务有效预算" if server else "个人新任务有效预算"),
+                    ("remote", "Ubuntu OpenCode 当前配置"),
+                    ("sync", "配置同步状态")) if server else (
+                    ("local", "Labcoding 本地预算"), ("gateway", "Gateway 输出上限"),
+                    ("effective", "个人新任务有效预算"), ("personal", "个人设置状态"))
+            info = app.frame(shelf, "field")
+            info.pack(fill="x", padx=15, pady=(3, 7))
+            for key, label_text in keys:
+                line = app.frame(info, "field")
+                line.pack(fill="x", pady=(0, 4))
+                app.label(line, label_text, bg="field", muted=True).pack(anchor="w")
+                var = tk.StringVar(master=parent)
+                value_label = app.label(line, variable=var, bg="field", bold=(key in {"sync", "personal"}))
+                value_label.configure(wraplength=340, justify="left", anchor="w")
+                value_label.pack(fill="x")
+                state_values[key] = var
+
+            buttons = app.frame(shelf, "field")
+            buttons.pack(fill="x", padx=15, pady=(0, 10))
+            save_btn = retry_btn = refresh_btn = None
+
+            def selected_value():
+                if choice.get() == custom_label:
+                    text = custom_value.get()
+                    if not text or not text.isascii() or not text.isdigit():
+                        raise ValueError("自定义 Token 数量必须是整数。")
+                    result = int(text)
+                else:
+                    result = preset_values.get(choice.get())
+                if type(result) is not int or not 128 <= result <= 8192:
+                    raise ValueError("Token 数量必须是 128–8192 的整数。")
+                return result
+
+            if not server:
+                state_values["local"].set(budget_text(app.output_limit))
+                state_values["gateway"].set(budget_text(app.output_gateway_limit))
+                state_values["effective"].set(budget_text(app.model_limits(
+                    app.model_info, app.output_limit)[1], unknown="暂不可用"))
+                state_values["personal"].set("已保存到当前用户设置")
+
+                def save_personal():
+                    try:
+                        app.save_user_output_limit(selected_value())
+                        state_values["local"].set(budget_text(app.output_limit))
+                        state_values["effective"].set(budget_text(app.model_limits(
+                            app.model_info, app.output_limit)[1], unknown="暂不可用"))
+                        state_values["personal"].set("已保存；仅影响新任务")
+                    except (ValueError, OSError) as error:
+                        state_values["personal"].set(f"保存失败：{error}")
+
+                def restore_personal():
+                    choice.set("4096 Token（标准输出）")
+                    custom_value.set("4096")
+                    save_personal()
+
+                for text, command, style in (
+                        ("保存个人设置", save_personal, "Accent.TButton"),
+                        ("恢复默认值", restore_personal, None)):
+                    button = app.button(buttons, text, command, style) if style else app.button(
+                        buttons, text, command)
+                    # ttk.Button centers its label by default; keep a compact fixed width.
+                    button.configure(width=12)
+                    button.pack(side="left", padx=(0, 8))
+            elif admin:
+                server_tier = tk.StringVar(master=parent)
+                app.label(shelf, variable=server_tier, bg="field", muted=True, size=9).pack(
+                    fill="x", padx=15, pady=(0, 4))
+
+                def update_server_state(state=None):
+                    state = state or {}
+                    gateway = state.get("gateway", app.output_gateway_limit)
+                    remote = state.get("remote", app.output_remote_limit)
+                    state_values["gateway"].set(budget_text(gateway))
+                    state_values["remote"].set(budget_text(remote))
+                    server_tier.set("当前服务器档位：" + next(
+                        (label for label, number in preset_values.items() if number == remote), custom_label))
+                    effective = state.get("server_effective")
+                    if effective is None and type(remote) is int and type(gateway) is int:
+                        effective = min(remote, gateway, app.model_limits(app.model_info, remote)[0] // 2)
+                    state_values["effective"].set(budget_text(effective, unknown="暂不可用"))
+                    text = state.get("sync_status", app.output_sync_status)
+                    error = state.get("sync_error", app.output_sync_error)
+                    state_values["sync"].set(f"{text}：{error}" if error else text)
+                    active = state.get("phase") in {"running", "waiting"}
+                    for button in (save_btn, retry_btn, refresh_btn):
+                        if button is not None and button.winfo_exists():
+                            button.configure(state="disabled" if active else "normal")
+
+                def sync_status(state):
+                    update_server_state(state)
+
+                def save_server():
+                    try:
+                        app.configure_output_limit(selected_value(), on_status=sync_status)
+                    except (ValueError, PermissionError) as error:
+                        state_values["sync"].set(f"权限或设置错误：{error}")
+
+                def retry_server():
+                    if not app.has_admin_session:
+                        return
+                    save_server()
+
+                def refresh_server():
+                    app.configure_output_limit(None, on_status=sync_status)
+
+                def restore_server():
+                    choice.set("4096 Token（标准输出）")
+                    custom_value.set("4096")
+                    save_server()
+
+                for column in range(2):
+                    buttons.grid_columnconfigure(column, weight=1, uniform="budget-actions")
+                save_btn = app.button(buttons, "保存服务器设置", save_server, "Accent.TButton")
+                save_btn.grid(row=0, column=0, sticky="ew", padx=(0, 7), pady=(0, 5))
+                retry_btn = app.button(buttons, "重新同步", retry_server)
+                retry_btn.grid(row=0, column=1, sticky="ew", pady=(0, 5))
+                refresh_btn = app.button(buttons, "刷新状态", refresh_server)
+                refresh_btn.grid(row=1, column=0, sticky="ew", padx=(0, 7))
+                app.button(buttons, "恢复默认值", restore_server).grid(row=1, column=1, sticky="ew")
+                update_server_state()
+                app.configure_output_limit(None, on_status=sync_status)
             else:
-                value = preset_values.get(choice.get())
-                if value is None:
-                    raise ValueError("请选择有效的输出预算档位。")
-            if not 128 <= value <= 8192:
-                raise ValueError("自定义 Token 数量必须是 128–8192 的整数。")
-            return value
+                server_tier = tk.StringVar(master=parent)
+                app.label(shelf, variable=server_tier, bg="field", muted=True, size=9).pack(
+                    fill="x", padx=15, pady=(0, 4))
+                state_values["gateway"].set(budget_text(app.output_gateway_limit))
+                state_values["remote"].set(budget_text(app.output_remote_limit))
+                server_tier.set("当前服务器档位：" + next(
+                    (label for label, number in preset_values.items()
+                     if number == app.output_remote_limit), custom_label))
+                _, effective = app.model_limits(app.model_info, app.output_remote_limit or 4096)
+                if type(app.output_remote_limit) is not int or type(app.output_gateway_limit) is not int:
+                    effective = None
+                state_values["effective"].set(budget_text(effective, unknown="暂不可用"))
+                state_values["sync"].set(app.output_sync_status or "尚未读取")
+                def update_readonly(state):
+                    state_values["gateway"].set(budget_text(state.get("gateway")))
+                    state_values["remote"].set(budget_text(state.get("remote")))
+                    server_tier.set("当前服务器档位：" + next(
+                        (label for label, number in preset_values.items()
+                         if number == state.get("remote")), custom_label))
+                    state_values["effective"].set(budget_text(
+                        state.get("server_effective"), unknown="暂不可用"))
+                    text = state.get("sync_status", "尚未读取")
+                    if state.get("sync_error"):
+                        text += f"：{state['sync_error']}"
+                    state_values["sync"].set(text)
 
-        def save_budget():
-            try:
-                value = selected_value()
-                app.configure_output_limit(value, on_status=sync_status)
-            except (ValueError, OSError) as error:
-                status_values["sync"].set(f"本地保存失败：{error}")
-                return
-            status_values["local"].set(budget_text(app.output_limit))
+                app.configure_output_limit(None, on_status=update_readonly)
 
-        def retry_sync():
-            app.configure_output_limit(app.output_limit, on_status=sync_status)
+            return shelf
 
-        def refresh_status():
-            app.configure_output_limit(None, on_status=sync_status)
+        personal = make_budget_card(0, "个人输出 Token 上限",
+            "仅影响当前 Labcoding 用户的新任务，已运行或历史任务继续使用各自保存的预算。")
+        server = make_budget_card(1, "Ubuntu 独立 OpenCode",
+            "管理 Ubuntu server 用户的共享 OpenCode 默认输出配置；仅管理员可以修改。", server=True)
 
-        def restore_default():
-            choice.set("4096 Token（标准输出）")
-            custom_value.set("4096")
-            save_budget()
-
-        def selection_changed(_event=None):
-            if choice.get() == custom_label:
-                custom_row.pack(fill="x", padx=15, pady=(0, 7), before=status_frame)
+        def responsive(event):
+            wide = event.width >= 900
+            if wide:
+                for column in (0, 1):
+                    layout.grid_columnconfigure(column, weight=1, uniform="output-budget-halves", minsize=0)
+                personal.grid_configure(row=0, column=0, sticky="nsew", padx=(0, 7))
+                server.grid_configure(row=0, column=1, sticky="nsew", padx=(7, 0))
             else:
-                custom_row.pack_forget()
+                personal.grid_configure(row=0, column=0, columnspan=2, sticky="ew", padx=0, pady=(0, 10))
+                server.grid_configure(row=1, column=0, columnspan=2, sticky="ew", padx=0)
 
-        selector.bind("<<ComboboxSelected>>", selection_changed)
-        selection_changed()
-        buttons = app.frame(budget, "field")
-        buttons.pack(fill="x", padx=15, pady=(0, 9))
-        save_button = app.button(buttons, "保存设置", save_budget, "Accent.TButton")
-        save_button.pack(side="left")
-        retry_button = app.button(buttons, "重新同步", retry_sync)
-        retry_button.pack(side="left", padx=(8, 0))
-        refresh_status_button = app.button(buttons, "刷新状态", refresh_status)
-        refresh_status_button.pack(side="left", padx=(8, 0))
-        app.button(buttons, "恢复默认值", restore_default).pack(side="left", padx=(8, 0))
-        render_status()
-        refresh_status()
+        layout.bind("<Configure>", responsive)
 
     def shortcuts(parent):
         shelf = card(parent, "键盘快捷键")

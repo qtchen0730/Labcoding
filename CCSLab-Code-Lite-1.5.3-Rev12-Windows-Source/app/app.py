@@ -48,7 +48,8 @@ from ui_icons import ActionIcon, gear_image, apply_window_icon
 from saved_login import SavedLogin
 from quota_view import balance_text, blocked_message
 from approval_policy import SessionGrants, session_scope, replacement_details_complete
-from output_settings import load_output_limit, set_output_limit
+from output_settings import (load_account_output_limit, load_output_limit, set_account_output_limit,
+                             set_output_limit)
 
 
 FONT = "Microsoft YaHei UI"
@@ -1227,7 +1228,7 @@ class App:
             page = "direct" if self.connection_mode == "direct" else ("status" if self.account else "access")
         if page == "admin" and not self.is_admin:
             return
-        if page == self.current_page and not (force and page == "direct"):
+        if page == self.current_page and not (force and page in {"direct", "settings"}):
             return
         if self.current_page == "workspace" and page != "workspace":
             self.park_approvals()
@@ -2619,8 +2620,6 @@ class App:
                 self.engine = None
             self.engine_limits = None
             self.account_state_changed()
-            if self.current_page in {"settings", "admin"}:
-                self.show_page("workspace", force=True)
             self.poll_account()
 
         def failed(error):
@@ -3431,6 +3430,7 @@ class App:
         self.account_connection = (client.base, self.account_connection[1])
         self.gateway_transport = self.account_connection, client
         self.account_client, self.account = client, user
+        self.output_limit = load_account_output_limit(self.prefs, user.get("username"))
         self.state = self.account_directory(client.base, user)
         self.state.mkdir(parents=True, exist_ok=True)
         self.ca_path = self.account_ca_path = client.engine_ca_bundle(self.state)
@@ -3542,8 +3542,8 @@ class App:
         self.status.set(f"{title} · {mode} · {label}")
         if self.current_page == "admin" and not self.is_admin:
             self.show_page("workspace", force=True)
-        elif self.current_page == "settings" and getattr(self, "settings_admin", False) and not self.is_admin:
-            self.show_page("workspace", force=True)
+        elif self.current_page == "settings" and getattr(self, "settings_admin", False) != self.is_admin:
+            self.show_page("settings", force=True, section="connection")
         if state == "active" and self.account_online and self.current_page == "status":
             self.show_page("workspace", force=True)
         elif state != "active":
@@ -3833,8 +3833,37 @@ class App:
             return "账号未激活"
         return "同步失败"
 
+    def save_user_output_limit(self, value):
+        """Persist only this Labcoding user's budget; never write server config."""
+        if type(value) is not int or not 128 <= value <= 8192:
+            raise ValueError("输出 Token 上限须为 128–8192 的整数。")
+        previous = self.output_limit
+        had_saved_value = "output_limit" in self.prefs
+        previous_saved_value = self.prefs.get("output_limit")
+        previous_accounts = self.prefs.get("output_limit_accounts")
+        previous_accounts = dict(previous_accounts) if isinstance(previous_accounts, dict) else previous_accounts
+        self.output_limit = value
+        if self.connection_mode == "account" and self.account:
+            set_account_output_limit(self.prefs, self.account.get("username"), value)
+        else:
+            set_output_limit(self.prefs, value)
+        try:
+            self.save_prefs()
+        except OSError:
+            self.output_limit = previous
+            if had_saved_value:
+                self.prefs["output_limit"] = previous_saved_value
+            else:
+                self.prefs.pop("output_limit", None)
+            if previous_accounts is None:
+                self.prefs.pop("output_limit_accounts", None)
+            else:
+                self.prefs["output_limit_accounts"] = previous_accounts
+            raise
+        self.refresh_context_output()
+
     def configure_output_limit(self, value=None, *, on_status=None):
-        """Persist the shared output budget and inspect/sync its remote limits."""
+        """Read or administer the shared Ubuntu OpenCode budget (admin writes only)."""
         request_id = uuid4().hex
         lifecycle_started = monotonic()
         is_load = value is None
@@ -3848,22 +3877,9 @@ class App:
             lifecycle("OUTPUT_SETTINGS_LOAD_QUEUED", reason="request_created")
         if value is not None:
             if type(value) is not int or not 128 <= value <= 8192:
-                raise ValueError("输出 Token 上限须为 128–8192 的整数。")
-            previous = self.output_limit
-            had_saved_value = "output_limit" in self.prefs
-            previous_saved_value = self.prefs.get("output_limit")
-            self.output_limit = value
-            set_output_limit(self.prefs, value)
-            try:
-                self.save_prefs()
-            except OSError:
-                self.output_limit = previous
-                if had_saved_value:
-                    self.prefs["output_limit"] = previous_saved_value
-                else:
-                    self.prefs.pop("output_limit", None)
-                raise
-            self.refresh_context_output()
+                raise ValueError("服务器输出 Token 上限须为 128–8192 的整数。")
+            if not self.has_admin_session:
+                raise PermissionError("只有已认证的管理员可以修改 Ubuntu OpenCode 服务器设置。")
 
         requested = value
         client = self.account_client if self.connection_mode == "account" else None
@@ -3891,6 +3907,8 @@ class App:
                                   reason="output_limit_request_failed",
                                   http_status=getattr(error, "status", None))
                 else:
+                    if not self.has_admin_session:
+                        raise PermissionError("管理员权限已变化，已取消服务器配置写入。")
                     try:
                         client.set_opencode_output_limit(requested)
                     except Exception as error:
@@ -3914,9 +3932,10 @@ class App:
                     gateway_error = error
                     lifecycle("OUTPUT_SETTINGS_LOAD_FAILED", error=error,
                               reason="model_request_failed", http_status=getattr(error, "status", None))
-            effective = self.model_limits(meta, self.output_limit)[1]
+            server_budget = remote_limit if type(remote_limit) is int else (requested or 4096)
+            context, effective = self.model_limits(meta, server_budget)
             if gateway_limit is not None:
-                effective = min(effective, gateway_limit)
+                effective = min(effective, gateway_limit, context // 2)
             return effective, remote_limit, remote_error, gateway_limit, gateway_error, meta
 
         def done(result):
@@ -3931,6 +3950,7 @@ class App:
             self.output_sync_error = str(remote_error) if remote_error else ""
             result_state = {
                 "phase": "done", "local": self.output_limit, "gateway": gateway_limit,
+                "server_effective": effective if gateway_limit is not None else None,
                 "effective": effective, "remote": remote_limit,
                 "sync_status": self.output_sync_status, "sync_error": self.output_sync_error,
                 "gateway_error": str(gateway_error) if gateway_error else "",
@@ -3946,6 +3966,10 @@ class App:
                 "phase": "done", "local": self.output_limit,
                 "gateway": self.output_gateway_limit,
                 "effective": self.model_limits(self.model_info, self.output_limit)[1],
+                "server_effective": (self.model_limits(
+                    self.model_info, self.output_remote_limit)[1]
+                    if type(self.output_remote_limit) is int and type(self.output_gateway_limit) is int
+                    else None),
                 "remote": self.output_remote_limit, "sync_status": self.output_sync_status,
                 "sync_error": self.output_sync_error, "gateway_error": str(error),
             }
@@ -4013,39 +4037,18 @@ class App:
             if not 128 <= value <= 8192:
                 self.append(self.chat, "输出 Token 上限须为 128–8192。\n", "muted")
                 return
-        def report(state):
-            if state.get("phase") != "done":
-                return
-            effective = state["effective"]
-            remote = state.get("remote")
-            gateway_error = state.get("gateway_error")
-            if value is None:
-                suffix = f"{effective} Token" if not gateway_error else f"读取失败：{gateway_error}"
-                self.append(self.chat, f"Labcoding 设定值：{self.output_limit}；Gateway/上下文有效值：{suffix}。\n",
-                            "muted" if not gateway_error else "error")
-            elif not gateway_error and effective < self.output_limit:
-                self.append(self.chat, f"Labcoding 已设置 {self.output_limit}，当前有效 {effective} Token。\n",
-                            "heading")
-            elif gateway_error:
-                self.append(self.chat, f"Labcoding 已设置 {self.output_limit}；Gateway/上下文有效值读取失败：{gateway_error}\n",
-                            "error")
-            if state.get("sync_error"):
-                retry = "/output" if value is None else f"/output {value}"
-                status = f"同步失败（{state['sync_status']}）；请检查连接或权限后重试 {retry}"
-                if remote is not None:
-                    status += f"（Ubuntu 当前为 {remote} Token）"
-                self.append(self.chat, f"Ubuntu 独立 OpenCode：{status}：{state['sync_error']}\n", "error")
-            elif remote is not None:
-                timing = "；OpenCode 新任务读取配置，已运行任务不变" if value is not None else ""
-                self.append(self.chat, f"Ubuntu server 独立 OpenCode：{remote} Token{timing}。\n", "muted")
-
         try:
-            self.configure_output_limit(value, on_status=report)
+            if value is not None:
+                self.save_user_output_limit(value)
         except OSError as error:
             self.append(self.chat, f"Labcoding 设置保存失败：{error}\n", "error")
             return
         if value is not None:
             self.append(self.chat, f"Labcoding 已设置 {self.output_limit} Token；新任务生效。\n", "muted")
+        effective = self.model_limits(self.model_info, self.output_limit)[1]
+        self.append(self.chat,
+                    f"Labcoding 个人预算：{self.output_limit}；新任务有效预算：{effective} Token。\n",
+                    "muted")
 
     def create_engine(self, path, limits, *, proxy_url=None, owner=None, connection=None):
         from engine import Engine
