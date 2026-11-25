@@ -520,10 +520,18 @@ class ModelApplyIntegrationTests(unittest.TestCase):
         root = self.root = Path(temp.name)
         paths = {"MODEL_SPEC": root / "policy.json", "CONTEXT_ENV": root / "context.env",
                  "ROLLBACK_PENDING": root / "pending",
+                 "MODEL_MAINTENANCE": root / "model-maintenance",
+                 "DEPLOYMENT_HOLD": root / "deployment-hold",
                  "CONTROLLER": str(root / "controller")}
         for key, value in paths.items():
             self.enterContext(patch.object(m, key, value))
         self.enterContext(patch.object(host, "BACKUP", root / "previous"))
+        self.enterContext(patch.object(m.model_service, 'STATE', root / 'service-state.json'))
+        self.enterContext(patch.object(m.ModelControl, 'service_inspection', return_value={
+            'estimate': None, 'sample_status': 'unverified', 'reason': 'inspection_unavailable'}))
+        self.enterContext(patch.object(m.model_service, 'unit_status', side_effect=lambda _: {
+            'ActiveState': 'active', 'SubState': 'running', 'MainPID': str(self.pid),
+            'ExecMainStartTimestamp': 'fixture-start', 'Result': 'success'}))
         Path(m.CONTROLLER).write_text("isolated helper boundary", encoding="ascii")
         m.MODEL_SPEC.write_text(json.dumps({
             "enabled": True, "gpu_index": 0, "llama_url": "http://127.0.0.1:8000",

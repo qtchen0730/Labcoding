@@ -1,5 +1,81 @@
 # Labcoding 模型上下文与受控维护
 
+## 2.0.5 启动显存样本热修复（源码与增量包完成，尚未部署）
+
+用户已确认2.0.5生命周期功能生产部署；真实停止成功，Gateway持续可用。此次只读调查确认：旧helper将完整`systemctl show ExecStart`显示字符串（含PID、start_time、stop_time、code、status）计入`unit_profile`，停止后的记账字段变化使持久样本失配；UI估算没有检查该指纹，因而仍显示需求。不是样本过期或停止事务删除样本。
+
+新版使用稳定的实际启动配置身份，关联模型/量化、权重与后端文件身份、GPU UUID/型号/驱动、上下文/槽位及环境配置。正常停止前必须采样并原子保存；除原生命周期记录外，增加固定root私有`/etc/ccslab/model-service-sample.json`（0600）。停机/Gateway重启/时间经过不会使匹配样本失效，实质配置变化则拒绝旧样本。页面与真实启动预检共用固定helper的只读`inspect`及同一匹配/余量函数：历史实测进程显存加`max(1024 MiB, 3%)`，与当前驱动free比较。刷新不写样本、不推理、不占槽、不读取模型API Key。Windows2.0.5接口兼容，客户端源码及现有安装包未改。
+
+当前root停止记录仍保留真实29102 MiB样本。只在内存还原同一次执行的停止记账后，旧SHA与记录精确一致；模型/配置及文件时间检查也通过。候选代码只读计算需求30126 MiB，现场free32083 MiB。未把人工提供数值写成样本；只在后续另行确认的管理员启动事务中迁移该可信旧记录，并记录`sample_recovered`审计。若原状态样本缺失，可恢复匹配的root私有副本；两份记录都缺失或证据无法验证时仍拒绝，不提供永久跳过预检。当前不需要冷启动绕过方案。
+
+增量包：`.work/releases/Labcoding-Server-Start-Sample-Hotfix-20261125.tar.gz`，35222字节，SHA-256 `cd89fb5ae41ccb9a515704e75653d66493c8031c5a030e0fee85814160985423`；已上传并解压至服务器cache。仅替换三个Server模块及对应root副本/固定helper，共六个固定目标，无迁移。复用原备份/原子替换/失败恢复机制，适配当前停机状态；与helper共用事务锁，验证并保留离线记录、原直连屏障、上下文/槽位、账号/额度/会话及操作审计。只重启Gateway，绝不自动启动模型。此次仅执行非root只读预检；root私有drop-in及nft完整检查需下面的sudo检查，不宣称已执行。
+
+server终端，另行确认后执行：
+```bash
+cd /home/server/.cache/labcoding-server-updates && \
+sha256sum -c Labcoding-Server-Start-Sample-Hotfix-20261125.tar.gz.sha256 && \
+cd start-sample-hotfix-20261125 && \
+sha256sum -c SHA256SUMS && \
+sudo python3 -B update.py --check
+```
+```bash
+sudo python3 -B update.py --deploy && sudo python3 -B update.py --verify
+```
+`--deploy`在本机终端提示既有Gateway管理员凭据；不发送凭据给他人，不扩大sudoers。备份在`/var/backups/labcoding-start-sample-hotfix-20261125`。失败自动恢复旧代码；恢复失败保留HOLD，不手工删除屏障。回滚命令：
+```bash
+cd /home/server/.cache/labcoding-server-updates/start-sample-hotfix-20261125 && \
+sudo python3 -B update.py --rollback
+```
+回滚仅适用于该停机基线未发生新生命周期/配置事务时；拒绝覆盖后续状态、样本及代码，不回灌数据库。部署后先刷新Windows管理页核对匹配历史需求和当前free；实际模型启动仍须用户另行明确确认，再由管理员按钮执行，失败保持离线保护。不直接`systemctl start`绕开预检。
+
+验证：26项生命周期/样本专项、2项相关上下文/共享租约回归通过；三类隔离部署仿真覆盖成功/手动回滚、健康失败自动恢复、恢复失败保留HOLD后重试。补充回归初次发现旧测试夹具未隔离MODEL_MAINTENANCE，读到现场只读屏障并返回503；改为临时路径后通过，未修改生产标记。90安装文件/33冻结模块与现有Windows2.0.5源码一致。原始日志在`.work/tests/model-service-2.0.5/start-hotfix/`。生产热修复部署和真实恢复启动仍未执行，估算不是冷启动峰值保证。
+
+## Windows2.0.5 模型服务生命周期（原交付记录；生产部署已由用户确认）
+
+模型页“模型服务控制”位于参数设置上方；仅管理员可预览/确认启动、停止、重启。新增`/api/admin/model/service/preview`和`/api/admin/model/service/apply`，沿用已有认证、单次确认票据和版本保护。刷新为只读。`model_service`字段是旧API的兼容扩展，缺少配套Gateway时新按钮保持禁用。
+
+操作与参数变更共用Gateway事务门控及原固定无参数helper的flock；客户端只能提交预定义操作，不能指定unit、路径或命令。新增root管理的`/etc/ccslab/model-service-state.json`保存离线意图、阶段、版本及显存历史，Gateway仅读取。helper预检开始前即保存维护意图，Gateway重启不自动启动模型。停止前检查所有全生命周期租约（含工具、审批及等待请求）和实际推理请求，复用原固定端口直连屏障，再复核空闲，只stop `ccslab-llm.service`。核验原PID退出后重新采样GPU；停止期间保留屏障及离线状态。显示的上次停止GPU已用显存差值为驱动总量的前后变化，其他进程同时分配显存可影响该数值；不能冒充模型独占释放量。
+
+启动只读取既有上下文/槽位配置，不改权重、量化、GPU或Key。需有同一policy、配置、GPU和启动配置指纹的历史模型进程显存样本，预检需求为该样本加`max(1024 MiB, 3%)`余量；这是估算，不能保证后续科研进程不抢占显存。无可信样本、采样失败或实际free不足时拒绝启动；首次部署应在模型正常运行时启用功能，首次安全停止会记录样本。重启先评估仅本模型可回收的显存，停止后再按实际free复核。不结束任何训练进程。模型PID、健康、保存配置、实际槽位和每槽上下文核验通过后才解除屏障；失败保持离线保护、正常停止未就绪模型并明确报告，不无限重试。独立OpenCode不强制重载的既有限制不变。
+
+离线时实际上下文、槽位和模型进程显存不沿用历史；已保存参数仍可查看。参数预览/应用和重新同步均由服务端拒绝，避免意外拉起模型。登录、账号、额度和Gateway健康保持可用，推理/新租约返回503，保留旧`detail`及新增`error.code=model_paused`，拒绝发生在额度预留之前。新003迁移仅新增服务操作审计表，不改账号/额度/历史数据。状态或维护屏障不可信、异常断电或强制终止helper留下未完成事务时保持关闭，需运维只读核查后恢复，不能盲目删除标记。
+
+后续部署须另行确认：使用现有增量备份/原子安装/回滚机制，配套更新Gateway的model_control/model_service/model_host/gateway、003迁移及root库中的model_control/model_service与固定helper；不使用旧首次接入脚本或陈旧SHA载荷。无需扩大sudoers、改变systemd模型参数或重启llama.cpp；Gateway需重启加载代码。Windows2.0.5已完成正式构建及隔离覆盖升级验证。本轮只在.cache隔离目录运行模拟服务/GPU与本地Gateway测试，未执行生产stop/start/restart或部署，不修改Ubuntu客户端仓库。
+
+
+### 2.0.5正式交付记录
+
+服务字段已按模型部署、运行状态、显存评估、时间分组，每行最多2–3字段；复用原主题和布局组件。客户端x64 PE ProductVersion/FileVersion均2.0.5，sequence8；33个冻结模块和90个安装文件与最终源码/构建一致，2.0.4→2.0.5覆盖升级、隔离启动与历史/项目样本保留通过。普通用户在客户端三个动作均不发送请求，直接API三个预览和应用均403；停机状态隔离Gateway健康/账号/额度仍可用，推理/租约503且不扣费，参数同步和重建Gateway不唤醒模型。复用17+40项结果，本次只补分组原生UI、两项权限/暂停保护和三类部署恢复仿真。
+
+产物均保留于仓库根`.work/releases/`：
+
+- `CCSLab-Labcoding-Win-2.0.5-Setup-x64.exe`：76847104字节，SHA-256 `a0bc14f399f2115dfbe16ccd65e85f10b8183972257efefd90a14ff4b0b5fa46`。
+- `Labcoding-Server-Lifecycle-2.0.5-20261125.tar.gz`：39687字节，SHA-256 `3b764e0536780ac47bcd3d1f9d4bfc3e6b756f15f9500b69b489917797dd6fd2`。
+
+服务端已上传并解压至`/home/server/.cache/labcoding-server-updates/service-lifecycle-2.0.5-20261125`，update.py SHA-256 `e2910c27b23009fcd4092af981e8ed2795840306ede0122fa6cc8d67e6be4dc9`。只读现场实测为160K/1槽、实际每槽163840；Ubuntu仓库为ubuntu/desktop-port、1c34e07b8c1157851ce43cd45cb4eee329d3367a且干净，与历史b42f9ae不同，不回退或修改；安装元数据仍2.0.4（用户标识2.0.4+x11fix2）。这些实测值均锁入新鲜基线。Gateway1648127、模型1660936及生产文件SHA在交付期间未变。
+
+部署前检查（已只读验证，不改变模型）：
+```bash
+cd /home/server/.cache/labcoding-server-updates
+sha256sum -c Labcoding-Server-Lifecycle-2.0.5-20261125.tar.gz.sha256
+cd service-lifecycle-2.0.5-20261125
+sha256sum -c SHA256SUMS
+python3 -B update.py --check
+```
+正式更新及更新后核验（尚未执行，另行确认后由server终端执行）：
+```bash
+sudo python3 -B update.py --deploy
+sudo python3 -B update.py --verify
+```
+手动代码回滚（单独执行）：
+```bash
+cd /home/server/.cache/labcoding-server-updates/service-lifecycle-2.0.5-20261125
+sudo python3 -B update.py --rollback
+```
+更新/回滚只重启Gateway，安装root helper但不调用它；备份位于`/var/backups/labcoding-service-lifecycle-2.0.5-20261125`，仅手动部署时创建。失败自动恢复代码并核验；恢复失败保留HOLD。003仅新增服务审计表，回滚保留表和记录，不回灌旧数据库。若后续已暂停模型或有未完成生命周期/参数事务，禁止退回不能识别持久离线状态的旧代码，需先另行授权受控恢复。部署基线漂移或活动任务/直连请求存在会拒绝更新，不绕过检查。推荐先更新配套服务端并核验，再安装Windows2.0.5；旧Windows/Ubuntu原API保持兼容。
+
+本次未部署生产、未启停真实模型、未扩sudoers、未变更生产上下文/槽位/数据库内容或Ubuntu客户端，未提交/推送。真实GPU启停、释放及冷启动峰值仍待用户明确确认；安装包和隔离测试通过不替代生产验收。
+
 ## Windows Labcoding 2.0.4 正式归档
 
 Windows版本为2.0.4 / stable / release_sequence 7；包含六区模型管理页、双列同步状态、GPU资源及高级详情、六档上下文/并发槽位管理和内置OpenCode主动同步。Gateway配套源码包含受控维护降容、事务/版本/恢复、独立OpenCode文件同步及最终运行时核验热修复。Windows与Ubuntu客户端继续共享账号、认证、额度和全局任务槽位，本地项目及会话独立。

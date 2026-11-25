@@ -306,6 +306,32 @@ class AdminPage:
             cards.append(card)
         self.model_flow(metrics, cards, 150, column_options=(6, 3, 2, 1))
 
+        service = self.model_section(frame, '模型服务控制')
+        for title, fields, columns in (
+            ('模型与部署', (('service_model', '当前模型名称'), ('service_backend', '推理后端'), ('service_gpu', '部署 GPU')), (3, 2, 1)),
+            ('服务运行状态', (('service_state', '模型服务运行状态'), ('service_api', 'API 可用状态'), ('service_pid', '模型进程 PID')), (3, 2, 1)),
+            ('显存与启动评估', (('service_memory', '模型进程显存占用'), ('service_release', '预计可释放显存（估算）'),
+                ('service_budget', '启动显存需求（历史样本 + 余量）'), ('service_released', '上次停止的GPU已用显存变化（实测）')), (2, 1)),
+            ('时间记录', (('service_started', '最近一次启动时间'), ('service_checked', '最近一次状态核验时间')), (2, 1)),
+        ):
+            app.label(service, title, muted=True, size=9).pack(fill='x', pady=(5, 4))
+            group = app.frame(service)
+            group.pack(fill='x', pady=(0, 4))
+            self.model_flow(group, [self.model_field(group, key, name, bg='panel') for key, name in fields],
+                            265, column_options=columns)
+        service_actions = app.frame(service)
+        service_actions.pack(fill='x', pady=(8, 8))
+        self.service_buttons = {}
+        self.service_busy = False
+        for action, name in (('start', '启动模型'), ('stop', '停止模型'), ('restart', '重启模型')):
+            self.service_buttons[action] = app.button(service_actions, name, lambda action=action: self.service_preview(action))
+            self.service_buttons[action].configure(state='disabled')
+        self.model_flow(service_actions, list(self.service_buttons.values()), 180)
+        self.service_note = tk.StringVar(frame, '正在读取真实服务状态…')
+        service_note = app.label(service, variable=self.service_note)
+        service_note.pack(fill='x')
+        self.wrap_model_label(service_note)
+
         parameters = self.model_section(frame, "模型参数设置")
         fields = app.frame(parameters)
         fields.pack(fill="x")
@@ -811,10 +837,10 @@ class AdminPage:
         total, slots = self.total.get(), self.slots.get()
         self.estimated_context.set(f"{int(total) // int(slots):,} Token" if total in CONTEXT_OPTIONS
                                    and slots in SLOT_OPTIONS else "—")
-        ready = (self.control_available and self.total.get() in CONTEXT_OPTIONS
+        ready = (self.control_available and not getattr(self, 'service_busy', False) and self.total.get() in CONTEXT_OPTIONS
                  and self.slots.get() in SLOT_OPTIONS)
         self.preview_button.configure(state="normal" if ready else "disabled")
-        self.resync_button.configure(state="normal" if self.control_available and self.server_configuration else "disabled")
+        self.resync_button.configure(state="normal" if self.control_available and self.server_configuration and not getattr(self, 'service_busy', False) else "disabled")
         draft = {"total_context": self.total.get(), "slots": self.slots.get()}
         saved = {key: str(value) for key, value in self.server_configuration.items()}
         self.sync_state.set("有未保存的更改" if self.has_model and draft != saved else
@@ -836,10 +862,13 @@ class AdminPage:
             builtin = sync.get("builtin") or {}
             backend = sync.get("backend") or {}
             builtin_state = self.draw_model_fields(model, saved, backend, builtin, independent)
-            total, slots = str(model.get("total_context")), str(model.get("slots"))
-            self.server_configuration = {"total_context": model.get("total_context"), "slots": model.get("slots")}
+            self.draw_model_service(model)
+            configuration = saved or {"total_context": model.get("total_context"), "slots": model.get("slots")}
+            total, slots = str(configuration.get("total_context")), str(configuration.get("slots"))
+            self.server_configuration = configuration
             self.server_version = model.get("configuration_version")
-            self.server_sync_state = self.model_synchronization_state(model, backend)
+            self.server_sync_state = ('模型服务已停止，实际上下文未加载' if (model.get('model_service') or {}).get('state') == 'stopped'
+                                      else self.model_synchronization_state(model, backend))
             if not preserve_draft:
                 self.total.set(total if total in CONTEXT_OPTIONS else "")
                 self.slots.set(slots if slots in SLOT_OPTIONS else "")
@@ -868,6 +897,86 @@ class AdminPage:
                                 else self.control_detail)
             self.app.update_model(model)
         self.call("刷新模型状态", "GET", "/api/model", None, draw, error_text=self.model_note)
+
+    def draw_model_service(self, model):
+        service = model.get('model_service') or {}
+        self.service_snapshot = service
+        unknown = '未知'
+        memory = lambda value: f'{value:,} MiB' if type(value) is int else unknown
+        budget = service.get('startup_estimate') or {}
+        values = dict(service_model=service.get('model_name') or model.get('model_name') or unknown,
+                      service_backend=service.get('backend') or unknown,
+                      service_gpu=f"GPU{service['gpu_index']}" if type(service.get('gpu_index')) is int else unknown,
+                      service_state=service.get('state_label') or '状态未知',
+                      service_api='可用' if service.get('api_available') else '不可用' if 'api_available' in service else unknown,
+                      service_pid=str(service.get('pid') or ('未运行' if service.get('state') == 'stopped' else unknown)),
+                      service_memory=memory(service.get('model_process_mib')),
+                      service_release=memory(service.get('estimated_release_mib')),
+                      service_released=memory(service.get('observed_released_mib')),
+                      service_started=service.get('last_started_at') or unknown,
+                      service_checked=account_time(service.get('checked_at')),
+                      service_budget=memory(budget.get('required_mib')))
+        if service.get('state') == 'stopped':
+            values.update(service_memory='未加载', service_release='未加载')
+            for metric in self.model_metrics[:3]:
+                metric.set('未加载')
+            self.set_model_field('backend_context', '未加载')
+            self.set_model_field('backend_slots', '未运行')
+            self.set_model_field('backend_state', '模型已停止', 'muted')
+            self.set_model_field('gpu_process', '未运行')
+        for key, value in values.items():
+            self.set_model_field(key, value)
+        phase = service.get('state')
+        self.set_model_field('service_state', values['service_state'], 'success' if phase == 'running' else
+                             'warning' if phase in {'starting','stopping'} else 'error' if phase in {'error','start_failed'} else 'muted')
+        for action, button in self.service_buttons.items():
+            button.configure(state='normal' if service.get('can_' + action) and not self.service_busy else 'disabled')
+        self.service_note.set(getattr(self, 'service_result', '') or service.get('detail') or ('模型离线期间保留登录、账号及额度服务；参数应用和重新同步暂停。'
+                             if service.get('state') == 'stopped' else '服务状态来自服务器实时核验。'))
+
+    def service_preview(self, operation):
+        if self.service_busy or not self.owns_session():
+            return
+        names = {'start': '启动模型', 'stop': '停止模型', 'restart': '重启模型'}
+        def confirm(reply):
+            service = reply.get('service') or {}
+            release = service.get('estimated_release_mib')
+            estimate = service.get('startup_estimate') or {}
+            text = (f"操作：{names[operation]}\n当前活动任务/租约：{count(reply.get('running_tasks'))}\n"
+                    f"预计释放显存：{count(release)} MiB（估算）\n"
+                    f"启动需求：{count(estimate.get('required_mib'))} MiB（历史样本及安全余量）\n"
+                    f"GPU可用：{count(service.get('gpu_free_mib'))} MiB\n\n{reply.get('impact', '')}")
+            if not messagebox.askyesno(names[operation], text, parent=self.parent):
+                return
+            self.service_busy = True
+            self.clear_review()
+            for button in self.service_buttons.values():
+                button.configure(state='disabled')
+            self.preview_button.configure(state='disabled')
+            self.resync_button.configure(state='disabled')
+            self.set_model_field('service_state', '正在停止' if operation == 'stop' else '正在启动' if operation == 'start' else '正在停止 → 正在启动')
+            self.service_note.set('正在执行受控服务事务，请等待真实状态核验；请勿重复提交。')
+            def finished(result):
+                self.service_busy = False
+                self.service_result = '最近操作：' + names[operation] + '完成，已核验真实服务状态。'
+                updated = result.get('model')
+                if updated:
+                    self.app.update_model(updated)
+                def refreshed():
+                    self.refresh_model(message=names[operation] + '完成，已重新核验状态。')
+                if operation != 'stop':
+                    self.app.reload_idle_model_engine(on_done=refreshed)
+                else:
+                    refreshed()
+            def failed(error):
+                self.service_busy = False
+                self.service_result = '最近操作失败：' + str(error)
+                self.refresh_model(message=str(error))
+            self.call(names[operation], 'POST', '/api/admin/model/service/apply',
+                      {'confirmation': reply.get('confirmation')}, finished, timeout=280,
+                      error_text=self.service_note, on_error=failed)
+        self.call('预览模型服务操作', 'POST', '/api/admin/model/service/preview', {'operation': operation},
+                  confirm, error_text=self.service_note)
 
     def resynchronize(self):
         target = self.server_configuration

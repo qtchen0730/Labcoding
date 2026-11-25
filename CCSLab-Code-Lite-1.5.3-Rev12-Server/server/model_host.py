@@ -398,10 +398,26 @@ def run_change(host, policy, payload):
 def execute_change(payload):
     import fcntl
     # sudoers grants this fixed helper without arguments; only this validated payload is accepted.
-    descriptor = os.open(LOCK_FILE, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(descriptor, "wb") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    inspection = payload.get('operation') == 'inspect'
+    try:
+        descriptor = os.open(LOCK_FILE, os.O_RDONLY | os.O_NOFOLLOW) if inspection else os.open(LOCK_FILE, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    except FileNotFoundError:
+        if inspection:return dict(status='inspected', reason='sample_missing', sample_status='missing', estimate=None)
+        raise
+    with os.fdopen(descriptor, "rb" if inspection else "wb") as lock:
+        fcntl.flock(lock, (fcntl.LOCK_SH if inspection else fcntl.LOCK_EX) | fcntl.LOCK_NB)
         policy = control.Policy.read(control.MODEL_SPEC)
+        if inspection:
+            state = control.model_service.read_state(control._root_file)
+            if payload['policy'] != policy.digest or payload['expected_generation'] != (state or {}).get('generation', 0):
+                return dict(status='inspected', reason='state_changed', sample_status='unverified', estimate=None)
+            worker = ServiceHost(policy, '')  # Inspect does not contact the model API or load its key.
+            result = control.model_service.startup_assessment(worker, state, control.context_env(worker.snapshot()), policy)
+            return dict(status='inspected', **{k:result[k] for k in ('estimate', 'sample_status', 'reason')})
+        if 'operation' in payload:
+            return run_service(ServiceHost(policy, api_key(policy.api_key_file)), policy, payload)
+        if control.model_service.held(control.model_service.read_state(control._root_file)):
+            return {'status': 'refused', 'reason': 'previous_transaction_pending'}
         if control.ROLLBACK_PENDING.exists() or control.MODEL_MAINTENANCE.exists():
             return {"status": "refused", "reason": "previous_transaction_pending"}
         secret = api_key(policy.api_key_file)
@@ -412,6 +428,14 @@ def parse_request(envelope):
     if len(envelope) > 1024:
         raise ValueError("oversized model configuration request")
     payload = json.loads(envelope)
+    if isinstance(payload, dict) and 'operation' in payload:
+        if (set(payload) != {'operation', 'policy', 'expected_generation', 'operation_id'}
+                or not isinstance(payload['operation'], str) or payload['operation'] not in {'start', 'stop', 'restart', 'inspect'}
+                or type(payload['expected_generation']) is not int or payload['expected_generation'] < 0
+                or any(not isinstance(payload[k], str) or not re.fullmatch(r'[a-f0-9]{64}', payload[k])
+                       for k in ('policy', 'operation_id'))):
+            raise ValueError('invalid fixed service request')
+        return payload
     if (not isinstance(payload, dict)
             or set(payload) != {"old_context", "old_slots", "new_context", "new_slots", "policy"}
             or any(type(payload[key]) is not int for key in ("old_context", "old_slots", "new_context", "new_slots"))
@@ -425,21 +449,235 @@ def parse_request(envelope):
     return payload
 
 
+class ServiceHost(Host):
+    """Uses the same fixed unit, helper flock and direct-request fence as configuration changes."""
+    def service(self, operation):
+        if operation not in {'start', 'stop'}:
+            raise ValueError('invalid service verb')
+        control._fixed_command([control.SYSTEMCTL, operation, '--', control.MODEL_UNIT], timeout=45)
+
+    def unit(self):
+        return control.model_service.unit_status(control)
+
+    def unit_profile(self):
+        return self.configuration_identity()['fingerprint']
+
+    def configuration_identity(self, gpu=None):
+        return control.model_service.configuration_identity(control, self.policy, self.snapshot(), gpu or self.gpu())
+
+    def sample_record(self):
+        try:
+            value = json.loads(control._root_file(control.model_service.SAMPLE_RECORD))
+            return value if isinstance(value, dict) else None
+        except FileNotFoundError:return None
+
+    def store_sample(self, sample):
+        atomic_write(control.model_service.SAMPLE_RECORD, json.dumps(sample).encode(), 0o600)
+
+    def save_state(self, state):
+        atomic_write(control.model_service.STATE, json.dumps(state).encode(), 0o644)
+
+    def gpu(self, pid=None):
+        return control._read_gpu(self.policy.gpu_index, pid)
+
+    def fence(self, previous):
+        self.prepare_guard()
+        if previous and previous.get('guard') and control.MODEL_MAINTENANCE.exists():
+            # Only reattach the root-recorded fence; never adopt context recovery.
+            if (control._root_file(control.MODEL_MAINTENANCE) != b'ccslab fixed model maintenance\n'
+                    or control.ROLLBACK_PENDING.exists()):
+                raise MaintenanceError('guard_failed')
+            raw = control._fixed_command([NFT, '-j', 'list', 'table', 'inet', NFT_TABLE])
+            entries = json.loads(raw)['nftables']
+            chains = [e['chain'] for e in entries if 'chain' in e]
+            rules = [e['rule'] for e in entries if 'rule' in e]
+            def fixed_port(rule):
+                return any(e.get('match') == {'op': '==', 'left': {'payload': {'protocol': 'tcp', 'field': 'dport'}},
+                                             'right': 8000} for e in rule.get('expr', []))
+            if ({c.get('name') for c in chains} != {'input', 'output'} or len(rules) != 2
+                    or any(c.get('table') != NFT_TABLE or c.get('hook') != c.get('name')
+                           or c.get('prio') != -150 or c.get('policy') != 'accept' for c in chains)
+                    or any(r.get('table') != NFT_TABLE or not fixed_port(r)
+                           or 'reject' not in json.dumps(r.get('expr')) for r in rules)):
+                raise MaintenanceError('guard_failed')
+            self.guard.installed = self.guard.marked = True
+            self.guard.marker = control.MODEL_MAINTENANCE
+        else:
+            self.guard.start()
+
+    def stopped(self, old_pid):
+        deadline = monotonic() + 30
+        while monotonic() < deadline:
+            unit = self.unit()
+            if (unit.get('ActiveState') in {'inactive', 'failed'} and unit.get('MainPID') == '0'
+                    and (not old_pid or not Path(f'/proc/{old_pid}').exists())
+                    and control._llama_get(self.policy.llama_url, self.token, '/health') is None):
+                return True
+            sleep(.25)
+        return False
+
+
+def run_service(host, policy, payload):
+    service = control.model_service
+    previous = service.read_state(control._root_file)
+    generation = (previous or {}).get('generation', 0)
+    operation = payload['operation']
+    if (payload['policy'] != policy.digest or generation != payload['expected_generation']
+            or control.ROLLBACK_PENDING.exists() or control.DEPLOYMENT_HOLD.exists()
+            or (previous or {}).get('phase') in {'starting', 'stopping', 'unknown'}):
+        return dict(status='refused', reason='state_changed')
+    state = dict(previous or {}, generation=generation + 1, operation_id=payload['operation_id'],
+                 reason='', guard=True, desired='stopped', phase='stopping')
+    fenced = False
+    changed = False
+    starting = operation == 'start'
+    intent_written = False
+    recovered_sample = False
+    try:
+        # Persist admission intent before telemetry/preflight. A Gateway restarted
+        # during this interval must not admit new leases or auto-start the model.
+        host.save_state(dict(state, phase='starting' if starting else 'stopping',
+                             guard=bool((previous or {}).get('guard'))))
+        intent_written = True
+        saved = control.context_env(host.snapshot())
+        before = host.current()
+        unit = host.unit()
+        if operation in {'stop', 'restart'}:
+            if service.held(previous) or before['status'] != 'running' or before.get('_active_slots') != 0:
+                raise MaintenanceError('busy')
+            control.validate_change(before, saved['total_context'], saved['slots'], require_idle=True)
+            gpu = before.get('gpu') or {}
+            usage = gpu.get('model_process_mib') or gpu.get('_model_mib')
+            if type(usage) is not int or usage <= 0:raise MaintenanceError('sample_unavailable')
+            identity = host.configuration_identity(gpu)
+            execution = identity.get('_execution') or {}
+            if (execution.get('pid') != before['_pid'] or execution.get('start_epoch') is None
+                    or identity.get('_latest_change', 0) > execution['start_epoch'] + 1):
+                raise MaintenanceError('profile_mismatch')
+            state['sample'] = service.make_sample(usage, gpu.get('sampled_at', control.time()), saved, policy, identity)
+            # Both root-owned copies must exist BEFORE stopping the model.
+            host.store_sample(state['sample'])
+            state.update(model_name=before.get('model_name'), last_started_at=unit.get('ExecMainStartTimestamp'))
+            if operation == 'restart':
+                assessment = service.startup_assessment(host, state, saved, policy, reclaim_mib=usage)
+                if assessment['reason']:raise MaintenanceError(assessment['reason'])
+        elif unit.get('ActiveState') not in {'inactive', 'failed'} or before.get('_pid'):
+            raise MaintenanceError('state_changed')
+        # Read-only startup preflight before changing a stopped service.
+        if operation == 'start':
+            assessment = check_start_memory(host, previous, saved, policy)
+            recovered_sample = assessment['estimate'].get('source') != 'state'
+            state['sample'] = assessment['sample']
+            host.store_sample(state['sample'])
+        try:
+            host.fence(previous)
+        except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
+            raise MaintenanceError('guard_failed') from error
+        fenced = True
+        if operation in {'stop', 'restart'}:
+            check = host.current()
+            if check.get('_active_slots') != 0 or check.get('_pid') != before.get('_pid'):
+                raise MaintenanceError('busy')
+            host.save_state(state)
+            changed = True
+            host.service('stop')
+            if not host.stopped(before['_pid']):
+                raise MaintenanceError('stop_failed')
+            after = host.gpu()
+            state.update(phase='stopped', gpu_after_stop=public_gpu(after),
+                         observed_released_mib=(gpu['used_mib'] - after['used_mib'] if after and 'used_mib' in gpu else None))
+            host.save_state(state)
+            if operation == 'stop':
+                return dict(status='applied', reason='')
+        starting = True
+        assessment = check_start_memory(host, state, saved, policy)
+        state['sample'] = assessment['sample']
+        host.store_sample(state['sample'])
+        state.update(phase='starting', desired='running')
+        host.save_state(state)
+        changed = True
+        host.service('start')
+        if not host.wait_verified(saved['total_context'], saved['slots'], None):
+            raise MaintenanceError('start_failed')
+        live = host.current()
+        if live.get('_active_slots') != 0:
+            raise MaintenanceError('start_failed')
+        state.update(phase='running', desired='running', last_started_at=host.unit().get('ExecMainStartTimestamp'),
+                     ready_checked_at=control.time(), reason='')
+        # Keep the persistent gate until the direct fence is removed successfully.
+        host.save_state(state)
+        host.end_maintenance()
+        state['guard'] = False
+        host.save_state(state)
+        return dict(status='applied', reason='sample_recovered' if recovered_sample else '')
+    except (OSError, ValueError, KeyError, TypeError, control.ModelControlError, subprocess.SubprocessError, Interrupted) as error:
+        reason = getattr(error, 'reason', 'start_failed' if starting else 'stop_failed')
+        if starting and changed:
+            try:
+                if host.guard is not None and not host.guard.installed:
+                    host.fence(state)
+                # Only the just-started, fenced fixed unit; no user/GPU process signals.
+                host.service('stop')
+                if not host.stopped(host.current().get('_pid')):
+                    starting = False
+                    reason = 'stop_failed'
+            except (OSError, ValueError, subprocess.SubprocessError, Interrupted):
+                starting = False
+                reason = 'stop_failed'
+        if changed:
+            state.update(phase='start_failed' if starting else 'error', desired='stopped', reason=reason, guard=True)
+            try:
+                host.save_state(state)
+            except OSError:
+                pass  # Existing non-running root record and fence stay fail-closed.
+        elif fenced:
+            if not service.held(previous):
+                try:
+                    host.end_maintenance()
+                except (OSError, ValueError):
+                    state.update(phase='error', reason='guard_failed')
+                    host.save_state(state)
+        elif getattr(host, 'guard', None) and host.guard.marked and not service.held(previous):
+            state.update(phase='error', reason='guard_failed')
+            host.save_state(state)
+        if intent_written and not changed and not (getattr(host, 'guard', None) and host.guard.marked and not service.held(previous)):
+            # Refused before touching the service: restore admission, keeping the
+            # generation so old confirmations cannot survive an intervening action.
+            restored = dict(previous or dict(phase='running' if host.unit().get('ActiveState') == 'active' else 'stopped',
+                                             desired='running' if host.unit().get('ActiveState') == 'active' else 'stopped', guard=False))
+            restored.update(generation=state['generation'], reason=reason if service.held(previous) else '')
+            host.save_state(restored)
+        return dict(status='refused', reason=reason)
+
+
+def public_gpu(gpu):
+    return {k: v for k, v in gpu.items() if not k.startswith('_')} if gpu else None
+
+
+def check_start_memory(host, state, saved, policy):
+    assessment = control.model_service.startup_assessment(host, state, saved, policy)
+    if assessment['reason']:raise MaintenanceError(assessment['reason'])
+    return assessment
+
+
 def main():
     import syslog
     result = {"status": "refused", "reason": "policy_or_runtime_refused"}
+    inspection = False
     try:
         if os.geteuid() != 0 or len(sys.argv) != 1:
             raise ValueError("requires root and no command arguments")
         payload = parse_request(sys.stdin.buffer.read(1025))
+        inspection = payload.get('operation') == 'inspect'
         signal.signal(signal.SIGINT, interrupt)
         signal.signal(signal.SIGTERM, interrupt)
         result = execute_change(payload)
     except (OSError, ValueError, TypeError, control.ModelControlError, Interrupted, RecursionError):
         pass
-    syslog.syslog(syslog.LOG_NOTICE, f"ccslab model control: {result['status']} {result['reason']}")
+    if not inspection:
+        syslog.syslog(syslog.LOG_NOTICE, f"ccslab model control: {result['status']} {result['reason']}")
     print(json.dumps(result, separators=(",", ":")))
-    return 0 if result["status"] == "applied" else 1
+    return 0 if result["status"] in {"applied", "inspected"} else 1
 
 
 if __name__ == "__main__":

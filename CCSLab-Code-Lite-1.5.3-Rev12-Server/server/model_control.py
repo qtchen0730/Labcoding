@@ -15,6 +15,11 @@ from threading import Lock
 from time import time
 from urllib.parse import urlsplit
 
+if __package__:
+    from . import model_service
+else:
+    import model_service
+
 
 CONTEXT_OPTIONS = (32768, 65536, 131072, 147456, 163840, 196608)
 MODEL_SPEC = Path("/etc/ccslab/model-control.json")
@@ -37,12 +42,14 @@ REASONS = {"", "restart_failed", "health_or_dimensions_failed", "interrupted", "
            "independent_running", "process_check_failed", "managed_config_failed",
            "maintenance_not_enrolled", "direct_guard_failed", "direct_guard_release_failed", "model_busy",
            "managed_config_permission", "managed_config_missing", "managed_config_io", "managed_config_mismatch"}
+REASONS |= set(model_service.MESSAGES)
 
 
 class ModelControlError(RuntimeError):
-    def __init__(self, message, status_code=422):
+    def __init__(self, message, status_code=422, code=None):
         super().__init__(message)
         self.status_code = status_code
+        self.code = code
 
 
 def positive(value):
@@ -326,6 +333,7 @@ def migrate_model_control(database_path):
     migration = Path(__file__).with_name("migrations") / "002_model_control.sql"
     with closing(sqlite3.connect(database_path)) as db, db:
         db.executescript(migration.read_text(encoding="utf-8"))
+        db.executescript(migration.with_name('003_model_service.sql').read_text(encoding='utf-8'))
 
 
 class ModelControl:
@@ -347,7 +355,7 @@ class ModelControl:
 
     def begin_inference(self):
         with self._gate:
-            if self._maintenance or DEPLOYMENT_HOLD.exists() or MODEL_MAINTENANCE.exists() or (self.config_path == MODEL_SPEC and ROLLBACK_PENDING.exists()):
+            if self._maintenance or model_service.held(model_service.read_state(_root_file)) or DEPLOYMENT_HOLD.exists() or MODEL_MAINTENANCE.exists() or (self.config_path == MODEL_SPEC and ROLLBACK_PENDING.exists()):
                 return False
             self._in_flight += 1
             return True
@@ -355,6 +363,44 @@ class ModelControl:
     def end_inference(self):
         with self._gate:
             self._in_flight -= 1
+
+    @property
+    def in_flight(self):
+        return self._in_flight
+
+    def require_online(self):
+        if model_service.held(model_service.read_state(_root_file)):
+            raise ModelControlError('模型服务已暂停或正在恢复，请等待管理员启动并核验就绪后重试。', 503, 'model_paused')
+        if self._maintenance or MODEL_MAINTENANCE.exists():
+            raise ModelControlError('模型服务维护中，请稍后重新提交任务。', 503, 'model_maintenance')
+
+    def admission_closed(self):
+        return bool(self._maintenance or model_service.held(model_service.read_state(_root_file))
+                    or MODEL_MAINTENANCE.exists() or DEPLOYMENT_HOLD.exists())
+
+    def service_preview(self, actor, operation):
+        return model_service.preview(self, actor, operation)
+
+    def service_inspection(self, policy):
+        """Same fixed helper and permissions; read-only sample assessment only."""
+        state = model_service.read_state(_root_file)
+        payload = dict(operation='inspect', policy=policy.digest, expected_generation=(state or {}).get('generation', 0), operation_id='0'*64)
+        try:
+            reply = subprocess.run(['/usr/bin/sudo', '-n', '--', CONTROLLER], input=json.dumps(payload),
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10, encoding='utf-8',
+                env={'PATH':'/usr/bin:/bin','LC_ALL':'C'}, check=False)
+            result = json.loads(reply.stdout[:8192])
+            if reply.returncode == 0 and isinstance(result, dict) and result.get('status') == 'inspected':
+                budget = result.get('estimate')
+                if (budget is None or isinstance(budget, dict) and all(type(budget.get(k)) is int and budget[k] > 0
+                        for k in ('measured_model_mib', 'safety_margin_mib', 'required_mib'))
+                        and budget['measured_model_mib'] + budget['safety_margin_mib'] == budget['required_mib']):
+                    return result
+        except (OSError, ValueError, TypeError, subprocess.SubprocessError):pass
+        return dict(estimate=None, sample_status='unverified', reason='inspection_unavailable')
+
+    def service_apply(self, actor, confirmation):
+        return model_service.apply(self, actor, confirmation)
 
     def _policy(self):
         if self.config_path != MODEL_SPEC or not Path(CONTROLLER).is_file():
@@ -420,7 +466,15 @@ class ModelControl:
                 saved = context_env(_root_file(CONTEXT_ENV))
             except (OSError, ValueError):
                 pass
-        observed = runtime.get("_observed_slot_context") if runtime.get("_uniform_context") else None
+        service = model_service.describe(self, runtime, policy, saved)
+        result['model_service'] = service
+        if not service['api_available'] and (model_service.read_state(_root_file) is not None or service['state'] == 'stopped'):
+            result.update(status='unavailable', total_context=None, slots=None, effective_context_limit=None,
+                          ready_checked_at=None, control_available=False,
+                          detail=service['detail'] or '模型服务已暂停或尚未就绪，实际上下文未加载。')
+            if result.get('gpu') and not service['pid']:
+                result['gpu'].pop('model_process_mib', None)
+        observed = (runtime.get("_observed_slot_context") if runtime.get("_uniform_context") else None) if result['status'] == 'running' else None
         matched = (saved is not None and runtime["status"] == "running" and observed is not None
                    and saved == {"total_context": runtime["total_context"], "slots": runtime["slots"]}
                    and observed == slot_context(saved["total_context"], saved["slots"]))
@@ -431,7 +485,8 @@ class ModelControl:
                         "ready_checked_at": runtime.get("ready_checked_at")},
             "builtin": {"status": "new_task" if observed else "unavailable",
                         "context_limit": observed, "effective_context_limit": None},
-            "opencode": (getattr(self.context_store, "runtime_status", self.context_store.status)(observed) if self.context_store else
+            "opencode": (getattr(self.context_store, "runtime_status", self.context_store.status)(
+                observed if observed is not None else slot_context(saved['total_context'], saved['slots']) if saved else None) if self.context_store else
                          {"managed": False, "status": "unmanaged", "effective_context_limit": None,
                           "detail": "未纳管，未修改独立 OpenCode。"}),
         }
@@ -444,7 +499,7 @@ class ModelControl:
             generation = db.execute("SELECT coalesce(max(id), 0) FROM model_configuration_audit "
                                     "WHERE result <> 'requested'").fetchone()[0]
         values = [generation, runtime.get("_pid"), runtime.get("_config"),
-                  runtime.get("_observed_slot_context"), runtime.get("slots")]
+                  runtime.get("_observed_slot_context"), runtime.get("slots"), model_service.read_state(_root_file), model_service.SAMPLE_VERSION]
         return hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
 
     def _check_decrease(self, runtime, requested_slot_context):
@@ -455,6 +510,8 @@ class ModelControl:
                 raise ModelControlError("降容已阻止，原配置未改动：受控 helper 尚未纳管指定独立 OpenCode，或与 Gateway 纳管路径不一致。请安装配套维护配置。", 409)
 
     def _check_pending(self):
+        if model_service.held(model_service.read_state(_root_file)):
+            raise ModelControlError('模型服务已停止或启动未核验。请先恢复服务，再修改参数或重新同步。', 409)
         if MODEL_MAINTENANCE.exists():
             raise ModelControlError("模型维护尚未结束，请等待核验或由运维恢复；新请求继续暂停。", 503)
         if DEPLOYMENT_HOLD.exists():
@@ -556,6 +613,8 @@ class ModelControl:
             policy = self._policy()
             self._check_pending()
             payload = self._consume(actor, confirmation)
+            if 'operation' in payload:
+                raise ModelControlError('确认票据不属于模型参数操作。', 409)
             if payload["policy"] != policy.digest:
                 raise ModelControlError("服务器模型控制配置已经变更。请重新预览。", 409)
             before = self._runtime(policy)

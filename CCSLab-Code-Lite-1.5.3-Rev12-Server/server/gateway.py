@@ -302,7 +302,10 @@ def create_app(settings=None, *, model_control=None, upstream_transport=None, al
                 "message": str(error), "code": error.code, "type": "insufficient_quota",
                 "quota_diagnostics": diagnostics}}, error.status_code,
                 headers={"X-Request-ID": request_id} if request_id else None)
-        return JSONResponse({"detail": str(error)}, error.status_code, headers=headers)
+        body = {"detail": str(error)}
+        if getattr(error, 'code', None):
+            body['error'] = dict(message=str(error), code=error.code, type='service_unavailable')
+        return JSONResponse(body, error.status_code, headers=headers)
 
     @app.exception_handler(RequestValidationError)
     async def invalid_input(_request, _error):
@@ -457,6 +460,8 @@ def create_app(settings=None, *, model_control=None, upstream_transport=None, al
         if type(upstream_limit) is int and upstream_limit > 0:
             limit = min(limit, upstream_limit)
         stats = slots.snapshot(_user["id"], values.get("slots"))
+        if hasattr(model, 'admission_closed') and model.admission_closed():
+            stats['available_slots'] = 0
         stats.pop("users")
         return dict(values, output_limit=limit, output_token_limit=limit, **{
             key: value for key, value in stats.items() if key != "slots"})
@@ -465,9 +470,25 @@ def create_app(settings=None, *, model_control=None, upstream_transport=None, al
     def task_status(user=Depends(active_user)):
         capacity = model.status().get("slots") if slots.capacity is None else slots.capacity
         stats = slots.snapshot(user["id"], capacity)
+        if hasattr(model, 'admission_closed') and model.admission_closed():
+            stats['available_slots'] = 0
         if user["role"] != "admin":
             stats.pop("users")
         return stats
+
+    @app.post('/api/admin/model/service/preview')
+    async def service_preview(request: Request, admin=Depends(admin_user)):
+        operation, = _only(await _json_input(request), 'operation')
+        slots.snapshot()
+        await run_in_threadpool(accounts.session, _token(request), admin=True)
+        return await run_in_threadpool(model.service_preview, str(admin['id']), operation)
+
+    @app.post('/api/admin/model/service/apply')
+    async def service_apply(request: Request, admin=Depends(admin_user)):
+        confirmation, = _only(await _json_input(request), 'confirmation')
+        await run_in_threadpool(accounts.session, _token(request), admin=True)
+        slots.snapshot()
+        return await run_in_threadpool(model.service_apply, str(admin['id']), confirmation)
 
     def task_key(value):
         if not isinstance(value, str) or not re.fullmatch(r"[a-f0-9]{32}", value):
@@ -476,6 +497,8 @@ def create_app(settings=None, *, model_control=None, upstream_transport=None, al
 
     @app.post("/api/tasks/{key}/acquire")
     def acquire_task(key: str, request: Request, user=Depends(active_user)):
+        if hasattr(model, 'require_online'):
+            model.require_online()
         key = task_key(key)
         admitted = slots.acquire(key, user["id"], _token(request), model.status().get("slots"))
         return {"acquired": admitted, "heartbeat_seconds": 10}
@@ -517,6 +540,8 @@ def create_app(settings=None, *, model_control=None, upstream_transport=None, al
 
     @app.post("/v1/chat/completions")
     async def chat(request: Request, _user=Depends(active_user)):
+        if hasattr(model, 'require_online'):
+            model.require_online()
         request_id = request.headers.get("X-Request-ID", "")
         if not re.fullmatch(r"[a-f0-9]{32}", request_id):
             request_id = uuid.uuid4().hex
