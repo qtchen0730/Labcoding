@@ -22,7 +22,7 @@ mkdir -p "$WORK_DIR"
 
 # Step 1: Build portable version first (if not already present)
 PORTABLE="$DIST_DIR/Labcoding-Linux-x64-portable/Labcoding-Linux-x64"
-if [ ! -f "$PORTABLE/Labcoding" ]; then
+if [ ! -f "$PORTABLE/Labcoding" ] || [ ! -f "$PORTABLE/linux-fonts.conf" ]; then
     echo ""
     echo "=== Step 1: Building portable version ==="
     python3 "$SRC_DIR/packaging/build_linux_portable.py" --output "$DIST_DIR/Labcoding-Linux-x64-portable"
@@ -45,7 +45,7 @@ cp -a "$PORTABLE/." "$DEB_ROOT/opt/labcoding/"
 # Step 4: Create symlink for executable
 cat > "$DEB_ROOT/usr/bin/labcoding" << 'LAUNCHER'
 #!/usr/bin/env bash
-exec /opt/labcoding/Labcoding "$@"
+exec /opt/labcoding/labcoding "$@"
 LAUNCHER
 chmod 755 "$DEB_ROOT/usr/bin/labcoding"
 
@@ -55,7 +55,7 @@ cat > "$DEB_ROOT/usr/share/applications/ccslab-labcoding.desktop" << DESKTOP
 Type=Application
 Name=CCSLab Labcoding
 Comment=CCSLab Code Lite — AI-assisted coding assistant
-Exec=/opt/labcoding/Labcoding %F
+Exec=/usr/bin/labcoding %F
 Icon=ccslab-labcoding
 Terminal=false
 Categories=Development;IDE;

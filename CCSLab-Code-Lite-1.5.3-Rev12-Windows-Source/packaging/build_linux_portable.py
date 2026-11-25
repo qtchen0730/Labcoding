@@ -80,8 +80,15 @@ def create_launcher(build_dir):
     launcher.write_text(
         "#!/usr/bin/env bash\n"
         'SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"\n'
+        'export FONTCONFIG_FILE="$SCRIPT_DIR/linux-fonts.conf"\n'
+        'SYSTEM_XFT=/usr/lib/x86_64-linux-gnu/libXft.so.2\n'
+        'if [[ -r "$SYSTEM_XFT" ]]; then\n'
+        '    export LD_PRELOAD="$SYSTEM_XFT${LD_PRELOAD:+:$LD_PRELOAD}"\n'
+        'fi\n'
         "exec \"$SCRIPT_DIR/Labcoding\" \"$@\"\n"
     )
+    shutil.copy2(Path(__file__).with_name("linux-fonts.conf"), build_dir / "linux-fonts.conf")
+    (build_dir / "linux-fonts.conf").chmod(0o644)
     launcher.chmod(launcher.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
@@ -94,7 +101,6 @@ def add_readme(build_dir):
         f"\n"
         f"Launch:\n"
         f"  ./labcoding\n"
-        f"  ./Labcoding\n"
         f"\n"
         f"User data is stored in ~/.config/ccslab-labcoding by default.\n"
     )
