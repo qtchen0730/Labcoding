@@ -13,7 +13,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent / "app"))
 
 from account_client import AccountError
-from admin_view import AdminPage, account_time, build_admin_page
+from admin_view import AdminPage, CONTEXT_LABELS, CONTEXT_OPTIONS, account_time, build_admin_page
 from app import App, DARK, LIGHT
 from themes import THEMES
 
@@ -160,7 +160,7 @@ def verify(gui, root):
     page.update_task_counts({"users": {"14": 3, "9": 1}, "available_slots": 1})
     assert any("执行任务 3" in label.cget("text") for label in descendants(page.user_cards[14], tk.Label))
     assert any("执行任务 1" in label.cget("text") for label in descendants(page.user_cards[9], tk.Label))
-    assert page.model_metrics[-1].get() == "1"
+    assert page.model_metrics[4].get() == "1"
     for identity in (14, 9, 2):
         card = page.user_cards[identity]
         assert card.cget("background") == gui.colors["field"]
@@ -168,7 +168,7 @@ def verify(gui, root):
                    for label in descendants(card, tk.Label) if "执行任务" in label.cget("text"))
     page.update_task_counts({})
     assert any("执行任务 暂不可用" in label.cget("text") for label in descendants(page.user_cards[14], tk.Label))
-    assert page.model_metrics[-1].get() == "暂不可用"
+    assert page.model_metrics[4].get() == "暂不可用"
     assert page.user_cards[14].cget("background") == gui.colors["field"]
 
     with patch.object(gui, "show_page", wraps=gui.show_page) as navigate:
@@ -188,28 +188,44 @@ class ModelConfigFixture:
         self.model = {"status": "running", "model_id": "fixture", "model_name": "Fixture",
                       "total_context": 131072, "slots": 5, "effective_context_limit": 26368,
                       "output_token_limit": 4096, "gpu": None, "control_available": True, "detail": ""}
+        self.model["configuration_version"] = "f" * 64
         self.requests = []
         self.requested = None
         self.fail_apply = False
         self.no_effect = False
+        self.partial = False
 
     def request(self, method, path, body=None, **_options):
         self.requests.append((method, path, body))
+        if (method, path) == ("GET", "/api/admin/users"):
+            return {"users": []}
         if (method, path) == ("GET", "/api/model"):
             return {"model": dict(self.model)}
         if (method, path) == ("POST", "/api/admin/model/preview"):
-            self.requested = dict(body)
+            self.requested = {key: body[key] for key in ("total_context", "slots")}
             return {"confirmation": "fixture-confirmation", "expires_in": 90,
                     "current": dict(self.model), "requested": dict(body),
                     "estimated_slot_context": body["total_context"] // body["slots"],
-                    "gpu_risk": "隔离测试", "restart_required": True, "user_impact": "隔离测试"}
+                    "gpu_risk": "隔离测试", "restart_required": True, "user_impact": "隔离测试",
+                    "opencode": {"managed": True}}
         if (method, path) == ("POST", "/api/admin/model/apply"):
             if self.fail_apply:
                 raise AccountError("fixture apply failure", 503)
             if not self.no_effect:
                 self.model.update(self.requested)
                 self.model["effective_context_limit"] = self.requested["total_context"] // self.requested["slots"]
-            return {"status": "applied", "model": dict(self.model)}
+            self.model["gpu"] = {"index": 0, "used_mib": 21000, "total_mib": 32000}
+            self.model["gpu"].update(name="Fixture 5090", free_mib=10000, unaccounted_mib=1000,
+                                     model_process_mib=20000, utilization_percent=65.6, sampled_at=1795538763.6)
+            self.model["context_sync"] = {
+                "saved_configuration": dict(self.requested),
+                "backend": {"status": "synced", "effective_context_limit": self.model["effective_context_limit"]},
+                "builtin": {"context_limit": self.model["effective_context_limit"]},
+                "opencode": {"managed": True, "configured_context_limit": self.model["effective_context_limit"],
+                             "status": "error" if self.partial else "pending_reload",
+                             "detail": "同步失败，请重试。" if self.partial else "配置已同步；运行值未核实。"},
+            }
+            return {"status": "partially_applied" if self.partial else "applied", "model": dict(self.model)}
         raise AssertionError((method, path, body))
 
     def clear_open_webui_access(self):
@@ -242,6 +258,11 @@ def verify_model_configuration(root, gui):
     wait(root, lambda: not gui.busy)
     assert not page.preview_button.instate(["disabled"])
 
+    fixture.model.update(total_context=163840, slots=1, effective_context_limit=163840)
+    page.refresh_model()
+    wait(root, lambda: not gui.busy)
+    assert page.total.get() == "163840" and page.slots.get() == "1", "read live 160K rather than initialization default"
+
     page.total.set("65535")
     assert page.preview_button.instate(["disabled"])
     page.total.set("65536")
@@ -249,12 +270,26 @@ def verify_model_configuration(root, gui):
     page.preview_button.invoke()
     wait(root, lambda: bool(page.review_ticket) and not gui.busy)
     assert fixture.requests[-1] == ("POST", "/api/admin/model/preview",
-                                    {"total_context": 65536, "slots": 2})
+                                    {"total_context": 65536, "slots": 2, "expected_version": "f" * 64})
     page.apply_preview()
     wait(root, lambda: not gui.busy and page.total.get() == "65536")
     assert fixture.requests[-2] == ("POST", "/api/admin/model/apply",
                                     {"confirmation": "fixture-confirmation"})
     assert "运行参数与目标一致" in page.model_note.get()
+    assert page.model_fields["backend_context"].get() == "32,768 Token"
+    assert page.model_fields["independent_loaded"].get() == "尚未核验"
+    assert page.model_fields["independent_state"].get() == "待重新加载"
+    assert page.model_fields["gpu_memory"].get() == "21,000 / 32,000 MiB"
+    assert "Fixture 5090" in page.model_fields["gpu_name"].get()
+    assert page.model_metrics[5].get() == "65.6%" and abs(page.gpu_usage.get() - 65.625) < .001
+    assert page.model_fields["gpu_process"].get() == "20,000 MiB"
+    assert page.model_fields["gpu_difference"].get() == "1,000 MiB"
+    assert "GPU" not in page.model_meta.get() and "配置版本" in page.advanced_text.get()
+    fixture.model["running_tasks"] = 1
+    page.refresh_model()
+    wait(root, lambda: not gui.busy)
+    assert page.sync_state.get() == "服务器忙碌"
+    fixture.model["running_tasks"] = 0
 
     fixture.fail_apply = True
     page.total.set("131072")
@@ -266,10 +301,46 @@ def verify_model_configuration(root, gui):
 
     fixture.fail_apply = False
     fixture.no_effect = True
+    # Failure now refreshes the actual parameters too; choose a new target again.
+    page.total.set("131072")
+    page.slots.set("5")
     page.preview()
     wait(root, lambda: bool(page.review_ticket) and not gui.busy)
     page.apply_preview()
     wait(root, lambda: not gui.busy and "尚未确认生效" in page.model_note.get())
+
+    fixture.no_effect = False
+    fixture.partial = True
+    assert CONTEXT_OPTIONS == ("32768", "65536", "131072", "147456", "163840", "196608")
+    page.total.set("196608")
+    page.slots.set("4")
+    page.preview()
+    wait(root, lambda: bool(page.review_ticket) and not gui.busy)
+    page.apply_preview()
+    wait(root, lambda: not gui.busy and "部分完成" in page.model_note.get())
+    assert page.model_fields["independent_state"].get() == "同步失败"
+    fixture.partial = False
+
+    saved = dict(fixture.model)
+    page.total.set("163840")
+    page.refresh_model()
+    wait(root, lambda: not gui.busy)
+    assert page.total.get() == "163840", "read-only refresh must preserve the unsaved draft"
+    assert page.sync_state.get() == "有未保存的更改"
+    before = len(fixture.requests)
+    default = next(button for button in descendants(page.model_viewport, ttk.Button)
+                   if button.cget("text") == "恢复默认值")
+    default.invoke()
+    assert page.total.get() == "131072"
+    assert len(fixture.requests) == before and fixture.model == saved
+    page.resynchronize()
+    wait(root, lambda: bool(page.review_ticket) and not gui.busy)
+    assert page.review_requested == {"total_context": saved["total_context"], "slots": saved["slots"]}
+    assert page.total.get() == "131072", "resynchronize must not submit or discard the draft"
+    page.apply_preview()
+    wait(root, lambda: not gui.busy)
+    assert fixture.model["total_context"] == saved["total_context"]
+    assert page.total.get() == "131072"
 
     # Older responses without an explicit capability must remain read-only too.
     page.total.set("131072")
@@ -299,8 +370,157 @@ def verify_model_configuration(root, gui):
     assert build_admin_page(gui, parent) is None
     parent.destroy()
 
+    gui.account["role"] = "admin"
+    gui.show_page("admin")
+    page = gui.page_controller
+    page.tabs.select(page.model_tab)
+    root.geometry("800x600")
+    wait(root, lambda: page.has_model and not gui.busy)
+    page.total.set("65536")
+    page.slots.set("2")
+    page.preview()
+    wait(root, lambda: bool(page.review_ticket) and not gui.busy)
+    root.update()
+    viewport = page.model_viewport
+    assert viewport.yview()[1] < 1, "small window must expose scrolling"
+    confirm = next(button for button in descendants(page.review_card, ttk.Button) if button.cget("text") == "确认应用")
+    confirm.focus_force()
+    root.update()
+    assert confirm.winfo_rooty() >= viewport.winfo_rooty()
+    assert confirm.winfo_rooty() + confirm.winfo_height() <= viewport.winfo_rooty() + viewport.winfo_height()
+    previous_scroll = viewport.yview()[0]
+    page.review_card.event_generate("<MouseWheel>", delta=120)
+    root.update()
+    assert viewport.yview()[0] < previous_scroll
+    # High-resolution wheel deltas accumulate even while a selector owns focus,
+    # and scrolling must never change the selected configuration.
+    previous_scroll = viewport.yview()[0]
+    selector = next(descendants(viewport, ttk.Combobox))
+    selected = selector.get()
+    for _ in range(3):
+        selector.event_generate("<MouseWheel>", delta=40)
+    root.update()
+    assert viewport.yview()[0] < previous_scroll
+    assert selector.get() == selected
+
+    verify_model_layout(root, gui, page, fixture)
+
+
+def verify_model_layout(root, gui, page, fixture):
+    """Native rendering checks against isolated telemetry; no model engine is started."""
+    from types import SimpleNamespace
+
+    page.cancel_preview()
+    fixture.model.update(total_context=163840, slots=1, effective_context_limit=163840, available_slots=1)
+    fixture.model["context_sync"].update(
+        saved_configuration={"total_context": 163840, "slots": 1},
+        backend={"status": "synced", "effective_context_limit": 163840, "ready_checked_at": CREATED},
+        builtin={"context_limit": 163840},
+        opencode={"status": "pending_reload", "managed": True, "configured_context_limit": 163840,
+                  "effective_context_limit": None, "detail": "文件已同步，运行时尚未核验。"})
+    page.total.set("163840")
+    page.slots.set("1")
+    page.refresh_model()
+    wait(root, lambda: not gui.busy)
+    assert tuple(page.context_selector.cget("values")) == tuple(CONTEXT_LABELS.values())
+    assert page.context_selector.get() == "160K（163840）"
+    page.context_selector.current(2)
+    page.context_selector.event_generate("<<ComboboxSelected>>")
+    assert page.total.get() == "131072" and page.estimated_context.get() == "131,072 Token"
+    page.refresh_model_button.invoke()
+    wait(root, lambda: not gui.busy)
+    assert page.context_selector.get() == "128K（131072）" and page.sync_state.get() == "有未保存的更改"
+
+    assert page.model_fields["builtin_loaded"].get() == "未启动"
+    with patch.object(gui, "engine", SimpleNamespace(process=SimpleNamespace(poll=lambda: None),
+                      limits=(163840, 4096), loaded_limits={"context": 163840, "output": 4096})):
+        for theme in THEMES:
+            gui.theme.set(THEMES[theme][0])
+            gui.apply_theme()
+            page.refresh_model()
+            wait(root, lambda: not gui.busy)
+            assert page.model_fields["builtin_state"].get() == "已同步"
+            assert page.model_field_labels["builtin_state"].cget("foreground") == gui.colors["success"]
+            assert page.model_fields["independent_loaded"].get() == "尚未核验"
+            assert page.model_field_labels["independent_state"].cget("foreground") == gui.colors["warning"]
+            assert gui.style.lookup("Context.Horizontal.TProgressbar", "background") == gui.colors["accent"]
+        gui.theme.set("Dark")
+        gui.apply_theme()
+        for width in (1440, 800):
+            root.geometry(f"{width}x900")
+            root.update()
+            left, right = (page.model_field_labels[key] for key in ("builtin_target", "independent_target"))
+            if width == 1440:
+                assert abs(left.winfo_rooty() - right.winfo_rooty()) <= 1
+                assert right.winfo_rootx() > left.winfo_rootx() + left.winfo_width()
+            else:
+                assert right.winfo_rooty() > left.winfo_rooty()
+            for widget in (*descendants(page.model_viewport, ttk.Button),
+                           *descendants(page.model_viewport, ttk.Combobox),
+                           *page.model_field_labels.values()):
+                x = widget.winfo_rootx() - page.model_viewport.winfo_rootx()
+                if widget.winfo_ismapped():
+                    assert x >= 0 and x + widget.winfo_width() <= page.model_viewport.winfo_width(), (width, widget)
+                    if isinstance(widget, ttk.Button):
+                        assert widget.winfo_width() >= widget.winfo_reqwidth()
+
+    for status, text, tone in (("error", "同步失败", "error"), ("out_of_sync", "配置不一致", "error"),
+                               ("unverified", "尚未核验", "muted"), ("unmanaged", "未纳管", "muted"),
+                               ("synced", "尚未核验", "muted")):
+        fixture.model["context_sync"]["opencode"]["status"] = status
+        page.refresh_model()
+        wait(root, lambda: not gui.busy)
+        assert page.model_fields["independent_state"].get() == text
+        assert page.model_field_labels["independent_state"].cget("foreground") == gui.colors[tone]
+    fixture.model["context_sync"]["opencode"]["effective_context_limit"] = 163840
+    page.refresh_model()
+    wait(root, lambda: not gui.busy)
+    assert page.model_fields["independent_state"].get() == "已同步"
+    fixture.model["context_sync"]["opencode"].update(status='ready',instance_count=0,effective_context_limit=None)
+    page.refresh_model()
+    wait(root,lambda:not gui.busy)
+    assert page.model_fields['builtin_state'].get()=='配置已就绪，待引擎启动'
+    assert page.model_fields['independent_state'].get()=='配置已就绪，待启动'
+    assert page.model_fields['independent_loaded'].get()=='未启动'
+    assert page.server_sync_state=='配置已就绪'
+    with patch.object(gui,'reload_idle_model_engine') as synchronize:
+        before=len(fixture.requests)
+        page.refresh_model()
+        wait(root,lambda:not gui.busy)
+        synchronize.assert_not_called()
+        assert all(method=='GET' for method,path,body in fixture.requests[before:])
+    for text, tone in (("正在应用", "warning"), ("部分同步", "warning"), ("恢复失败", "error"),
+                       ("状态未知", "muted"), ("已同步", "success")):
+        page.sync_state.set(text)
+        assert page.sync_state_label.cget("foreground") == gui.colors[tone]
+
+    assert not page.advanced_card.winfo_manager()
+    page.advanced_toggle.invoke()
+    root.update()
+    assert page.advanced_card.winfo_manager() == "pack" and "f" * 64 in page.advanced_text.get()
+    page.copy_model_button.invoke()
+    assert root.clipboard_get() == page.advanced_text.get()
+    page.advanced_toggle.invoke()
+    root.update()
+    assert not page.advanced_card.winfo_manager()
+    fixture.model["gpu"] = None
+    page.refresh_model()
+    wait(root, lambda: not gui.busy)
+    assert page.model_fields["gpu_memory"].get() == page.model_metrics[5].get() == "未知"
+    assert not page.gpu_bar.winfo_manager()
+    fixture.model["gpu"] = {"index": 0, "name": "Fixture 5090", "used_mib": 12000, "total_mib": 32000,
+                            "free_mib": 19000, "unaccounted_mib": 1000, "sampled_at": CREATED + 60}
+    page.refresh_model()
+    wait(root, lambda: not gui.busy)
+    assert page.gpu_bar.winfo_manager() == "pack" and page.gpu_usage.get() == 37.5
+    assert page.model_fields["gpu_sampled"].get().endswith(":00")
+
 
 if __name__ == "__main__":
+    # Match the application's native Windows entry point for geometry checks.
+    if sys.platform == "win32":
+        import ctypes
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
     with TemporaryDirectory(dir=TEST_ROOT, prefix="approval-cards-",
                             ignore_cleanup_errors=True) as data:
         window = tk.Tk()
@@ -318,3 +538,4 @@ if __name__ == "__main__":
             app.close()
     print("PASS native approval cards: data, sizes, themes, scrolling, filters, counts, protected status actions and reset targeting")
     print("PASS admin model settings: typed payload, validation, apply/error/mismatch status, admin access gate")
+    print("PASS model layout: six presets, responsive fields, seven themes, sync semantics, GPU unknown/refresh, details/copy")

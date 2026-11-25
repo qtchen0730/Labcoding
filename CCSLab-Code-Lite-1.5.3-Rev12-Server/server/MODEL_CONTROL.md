@@ -1,100 +1,145 @@
-# Labcoding 模型参数控制
+# Labcoding 模型上下文与受控维护
 
-本功能让已登录管理员在 Labcoding 管理界面预览并确认新的 `total_context` 与 `slots`，由 Gateway 调用一个固定、受限的 root helper 更新 llama.cpp 配置并重启固定服务。它不改变账号、额度、审批或 OpenCode 功能。
+## Windows Labcoding 2.0.4 正式归档
 
-## 固定行为与限制
+Windows版本为2.0.4 / stable / release_sequence 7；包含六区模型管理页、双列同步状态、GPU资源及高级详情、六档上下文/并发槽位管理和内置OpenCode主动同步。Gateway配套源码包含受控维护降容、事务/版本/恢复、独立OpenCode文件同步及最终运行时核验热修复。Windows与Ubuntu客户端继续共享账号、认证、额度和全局任务槽位，本地项目及会话独立。
 
-任务并发由配套客户端和 Gateway 的全局任务槽位接口统一控制。沿用 `python -m server` 的单 worker 入口；不要用多个独立 Gateway worker/副本管理同一个模型池，因为任务租约保存在当前 Gateway 进程内。槽位数来自实际模型状态，项目和账号没有额外上限。任务在工具调用和等待审批期间继续占槽；原生标题/摘要请求共用所属任务槽位，依次转发。旧客户端的独立模型请求也会占用槽位。
+2026-11-25用户确认已完成生产部署及核心功能实机验收（本次归档不重新执行生产操作）：Windows2.0.4覆盖升级/启动、Gateway增量包及热修复部署、内置OpenCode配置与运行值、独立OpenCode未启动识别及正常重启后无推理的运行核验、管理页总体同步状态均正常。热修复部署未重启llama.cpp，账号及额度记录保持不变。
 
-客户端通过 `/api/tasks/{task_id}/acquire` 获取槽位、每 10 秒向 `/heartbeat` 续期、结束后 DELETE 释放；45 秒无心跳且没有在途模型请求时回收。运行中的转发结束前不复用槽位。Gateway 重启后原租约失效，客户端停止相关任务；不自动重放。`GET /api/tasks` 返回服务器任务总数、空槽和当前用户任务数；管理员另有各用户计数。`GET /api/model` 含空槽数，`GET /api/admin/users` 的每个用户含 `running_tasks`。两端需配套更新，旧 Gateway 不支持全局调度。独立 Open WebUI 直连不经过此 Gateway，统计显示不可用。
+| 已验收总上下文 | 槽位 | 已核验每槽上下文 / OpenCode预算 |
+| --- | --- | --- |
+| 128K（131072） | 1 | 131072 |
+| 160K（163840） | 1 | 163840 |
+| 160K（163840） | 2 | 81920 |
 
-- Gateway API 继续提供状态、预览、确认应用；预览确认票据绑定管理员、一次性使用且 90 秒过期。应用前等待推理结束，记录 SQLite 审计结果。
-- 请求只接受 `total_context`（32768、65536、131072、262144 之一）和 `slots`（1–10）。客户端不能指定路径、命令或服务名。
-- root helper 只管理 `/etc/ccslab/model-context.env` 和 `ccslab-llm.service`。环境文件只写 `LLAMA_ARG_CTX_SIZE` 和 `LLAMA_ARG_N_PARALLEL`。应用后核对新 PID、`/health`、`/slots` 和每槽 `n_ctx`；失败则恢复原文件并重启，恢复未验证时留下 pending 标记并阻止后续模型请求。
-- llama.cpp 按 `total_context / slots` 分配每槽上下文并按 256 对齐。示例 `131072 / 5` 得到每槽 `n_ctx=26368`。这不是显存安全保证；较大上下文或槽数可能耗尽显存并导致重启失败。管理员预览需明确显示此风险。
-- 受管配置必须来自环境文件。显式 `-c/--ctx-size` 或 `-np/--parallel` 会覆盖环境变量，因此部署时必须从 `ExecStart` 移除这两个参数。Gateway/helper 在预览与应用时均核实进程参数和环境一致。
+当前生产为160K、2槽。本次仅本地Git归档，不改变现场。双平台真实并发任务、第三任务超额保护及槽位释放的生产联调仍待验收；已有隔离测试不能代替这三项实机证据。满上下文压力测试亦不作通过声明。独立OpenCode不强制自动重载的安全限制保留。
 
-## 权限模型
+现有交付文件保留在仓库根目录`.work/releases/`，不纳入Git、不重新构建：
 
-控制 spec 固定在 `/etc/ccslab/model-control.json`，初始 `enabled:false`，root 所有且不可由普通用户写入。唯一提权入口是 sudoers 对无参数 `/usr/local/sbin/ccslab-model-controller` 的精确授权；Gateway 以参数化 JSON 标准输入传递两个数值、旧值及 spec 摘要。helper 校验字段、整数范围、当前服务和配置，使用固定路径及固定 unit，不执行 shell。
+| 文件 | 字节数 | SHA-256 |
+| --- | ---: | --- |
+| CCSLab-Labcoding-Win-2.0.4-Setup-x64.exe | 76907520 | b84e16f9ba7002b5910b8ffae8ff348c7fa0255670c8dddd1a82970d419d9500 |
+| Labcoding-Server-Active-Sync-2.0.4-20261125.tar.gz | 25551 | e6de01b0183e744ca3c094ecb18659f8fc10828f5f73f8bfbe9a7d45c83f132f |
+| Labcoding-Server-OpenCode-Runtime-Hotfix-20261125.tar.gz | 14413 | f0260f2abff3a2b8c432332260226c4cf47c173d26c9121cf9ed734c87ef0511 |
 
-**注意：** systemd 的 `NoNewPrivileges=yes` 会阻止 Gateway 通过 setuid sudo 获得 root。因此启用该精确 sudoers 规则时，Gateway 必须将 `NoNewPrivileges` 改为 `no`。这仅解除该进程的 setuid 提权阻断，sudoers 仍只允许固定 helper；Gateway 进程被攻陷后可调用此 helper，所以应由运维评估这一权限边界。若不接受该安全取舍，不部署控制写入功能，保持只读；无需引入 Socket 服务。
+后两个包的服务器归档位置为`/home/server/.cache/labcoding-server-updates/`，解压目录分别为`active-sync-2.0.4-20261125`和`runtime-config-hotfix-20261125`。它们绑定各自部署前基线，不应在当前160K/2现场重复部署。Windows源码在热修复期间未额外修改，现有安装包继续对应最终Windows源码；服务端最终源码等于增量包加运行时热修复。
 
-sudoers 示例（以真实服务账户替换 `server`；`""` 表示不接受任何命令行参数）：
+## 主动同步与运行核验
 
-```sudoers
-server ALL=(root) NOPASSWD: /usr/local/sbin/ccslab-model-controller ""
+Windows 保存/重新同步成功后，复用现有生命周期重建已启动且空闲的内置引擎，等待真实/config读回再刷新模型页；同预算只读回，不重复建进程。未启动的引擎显示配置已就绪，不为状态展示启动常驻进程；活动任务/工具/审批继续受既有安全机制保护。刷新仅GET元数据及/config，不创建任务、不占槽、不发送模型请求。
+
+Gateway的opencode_runtime.py仅观察固定server用户和固定独立二进制的实例。无关sshd/systemd等进程的exe权限失败不再中止扫描；目标候选进程不可读时仍报告尚未核验。识别父子进程及serve --stdio的真实HTTP监听，PID和端口动态发现，不硬编码。核对配置来源、PID/启动身份、同网络命名空间与socket归属后，只访问该实例的127.0.0.1监听。v2.3.0使用HTTP Basic Authentication，用户名opencode，优先读取子进程OPENCODE_PASSWORD，仅在内存使用，不返回客户端或写入日志。
+
+只调用GET /api/info、/api/debug/location、/api/config和/api/model：枚举全部已加载位置，逐位置解析/api/config的List响应及每个document的info.providers.ccslab.models.lab-general.limit.context，按低到高优先级处理全部来源，不假定数组索引0；directory项仅为发现目录。再与/api/model实际构造值交叉核验，前后检查加载位置、进程身份和监听归属。多个实例或位置未全部核验时不以单个实例冒充总体成功。无代理、不跟随重定向，不启动/停止/重载实例，不产生推理或全局占槽调用。文件正确且无实例为ready，全部实际运行值一致才为synced；权限、认证、格式、退出重启或不一致均提供具体原因。保持原helper文件核验入口和降容退出条件不变。
+
+v2.3.0的真实同实例测试确认：JSON写入后立即读回可能仍为旧值，原生reload（POST /api/location/reload）可以加载新值；其他运行实例也可能经原生异步配置观察自行更新。显式同步会短时只读复核，始终以实际API值为准。reload命令重建所有已加载位置，会取消待审批和表单，运行会话在下一步边界换服务；接口没有原子“仅空闲时重载”参数。先GET空闲再POST存在新任务竞态，Gateway因此不自动调用它。交互式私有/stdio实例无法取得可信HTTP运行值时，明确提示正常退出重启；不得将文件成功视为运行同步。
+
+需要Gateway自动识别重新启动的独立实例时，沿用下文已验证的认证loopback serve + --server接入方式，在启动serve前明确配置：
+```bash
+export OPENCODE_CONFIG=/home/server/.config/opencode/opencode.json
+```
+在原项目目录启动，不公开端口或密码。Gateway也能识别正常交互式OpenCode的受认证HTTP子进程，自动枚举所有加载位置；无法完整读取时仍为尚未核验，不伪报成功。权限受限、认证不可取、未知版本、PID变化及配置来源不符均返回具体原因。正常重启或管理员在确认无任务/审批/表单且无并发操作时手动对同一实例执行原生reload后，刷新/重新同步会重新GET实际值（下方14096仅为人工启动示例端口，不是生产发现规则）：
+```bash
+/home/server/.opencode/bin/opencode --server http://127.0.0.1:14096 reload
+```
+此命令只能由管理员在上述安全条件满足时手动执行；私有交互实例优先正常退出重启，不自动取消审批。运行核验为只读，实际后台降容仍必须满足既有helper退出/直连维护保护。最终Gateway运行时热修复已由用户确认部署，归档保留原增量包和热修复包，不重复执行部署。
+
+Windows Labcoding 2.0.4使用同一Gateway管理模型；当前Ubuntu Labcoding为2.0.4+x11fix2，其仓库/home/server/coding-agent/Labcoding的ubuntu/desktop-port分支及b42f9ae基线不修改、不构建、不升级。既有Ubuntu2.0.5兼容性验证作为历史证据保留，不将两个客户端版本混同。公共账号、审批、权限、认证会话、额度结算和全局任务租约继续共享；本地项目、会话及执行记录保持独立。
+
+## 配置与兼容性
+
+总上下文合法值为32768、65536、131072、147456、163840、196608（32/64/128/144/160/192K，1K=1024）。128K只用于初始化或恢复默认草稿，不能覆盖服务器现存160K。槽位仍为1–10；OpenCode使用已核验的实际每槽容量。
+
+保留旧API路径、请求/响应语义及认证方式；新增状态字段为兼容扩展。旧Ubuntu管理页不提供新档位，使用Windows管理员页管理；旧版256K提交受六档白名单拒绝。其新引擎能读取128K/160K，原输出4096上限保留。旧会话预算过大时由Gateway拒绝并提示重连/重启及压缩。
+
+Gateway对所有账号使用运行模型的模板和分词器核验“实际输入tokens+输出预算≤实际每槽容量”；不按字符估算，不使用旧显示预算。实际槽位容量或分词服务未知时返回503；超容量返回兼容的context_length_exceeded/400且不发送推理、不扣费。额度统计仍按实际usage结算。
+
+## 安全降容操作
+
+1. 等待所有平台任务、工具执行、审批和实际模型请求结束。
+2. 正常退出服务器独立OpenCode，包括它的私有serve子进程。如果helper仍检测到旧Ubuntu Labcoding内置OpenCode，请正常退出该客户端；不修改安装或强杀进程。
+3. Windows管理员页刷新，读取真实总上下文、槽位及每槽值；若独立文件与当前每槽值不一致，先点“重新同步”补齐当前值，此操作不重启模型。
+4. 按实际每槽容量判断降容（例如160K/1→128K/1）；选择目标后点“保存服务器设置”，阅读维护说明后“确认应用”。不能仅依据总上下文判断增减容。
+5. Gateway关闭新任务入口，复核租约/版本/PID/实际请求。固定root helper核实server用户的opencode进程已退出，建立临时网络屏障，再次核验空闲，才改后端。
+6. helper重启固定模型服务，核验新PID、健康、环境、槽位和实际每槽n_ctx；以server身份只更新独立JSON的context，读回核验。原input、output、API Key、压缩和其他字段保留，0600与所有者保持，变更前保存同目录备份。
+7. 后端与文件成功后解除屏障和维护状态，Gateway发布实际值，Windows沿用已有机制重建空闲引擎/读回加载值，新任务在获取租约后重新读取预算；刷新GPU及采样时间。
+8. 正常重新启动独立OpenCode和需要重连的旧客户端。独立文件已写入不等于外部实例已加载；Gateway自动重新发现并可信读回后才标记运行时已同步。恢复原配置同样通过Windows保存；同目标重新同步不调用helper、不重复重启模型。
+
+未退出进程、未知进程权限、活动请求、文件缺失/权限/基线不一致、nft不可用等分别返回原因，配置不改或失败后恢复。进程扫描仅检查PID、UID、exe，不发送信号、不读取会话。
+
+## 固定安全边界
+
+helper仍是原固定无参数sudo入口，只接受old_context/old_slots/new_context/new_slots/policy五字段。客户端不能选择命令、服务、UID或路径；不新增sudoers规则。
+
+root配置 /etc/ccslab/model-control.json 新增可选字段：
+```json
+{"managed_opencode_config":"/home/server/.config/opencode/opencode.json"}
+```
+这是对已有JSON的单字段扩展，不能用上面片段覆盖完整文件。现有部署脚本保留原字段并添加它；helper只允许此固定路径。Gateway持久环境仍为CCSLAB_MANAGED_OPENCODE_CONFIG指向同一文件。
+
+纳管后的每次后端参数变更均启用临时inet表ccslab_context_maintenance：拒绝本机非root到本机TCP8000、以及外部到TCP8000的请求（含已有连接、IPv4/IPv6），保留root本机健康探针和其他端口。降容额外核实OpenCode已退出并管理文件恢复；增容允许较小预算的空闲实例保留，文件补同步语义不变。同目标同步不创建屏障、不重启模型。规则不改Cloudflare、既有防火墙表或持久网络配置。固定模型API仍为http://172.17.0.1:8000。
+
+/run/ccslab-model-context-maintenance 与既有pending阻止新Gateway任务。降容时helper负责后端和独立文件的同一事务；增容仍保留健康后端+文件部分完成的原重试机制。文件操作先降为server UID，再调用root安装的同版output_settings模块；root不以特权改写用户目录。
+
+任何降容应用失败均尝试恢复后端和独立context；两者均核验成功才解除屏障。恢复失败保留pending与屏障，明确报告恢复失败，禁止盲目删除标记、修改sudoers或假报成功。运维需依据/etc/ccslab/model-context.previous及pending中的independent_context_before恢复核验；模型事务未恢复前，代码部署脚本拒绝回退控制组件。
+
+## 历史增量部署：原160K/1基线，不重启模型
+
+本节保留初次受控维护部署的历史入口，不是当前160K/2现场的操作指令。本次归档不访问或修改Ubuntu客户端仓库，不执行下列历史命令。后续配套更新及最终热修复已使用仓库外的.cache目录，见上方交付记录。
+
+现有载荷目录：
+/home/server/coding-agent/Labcoding/.work/context-sync-20261125/release-final/
+
+```bash
+cd /home/server/coding-agent/Labcoding/.work/context-sync-20261125/release-final
+sha256sum -c SHA256SUMS
+python3 -I -B update.py --check
+sudo -v
+sudo /usr/bin/python3 -I -B update.py --deploy
 ```
 
-建议所有配置和 helper 路径由 `root:root` 所有、父目录不可被 Gateway 写入。sudoers 用 `visudo -cf` 校验。不要授予通用 `systemctl`、shell、解释器或可写脚本目录权限。
+部署脚本核对原16项备份和现场，管理员认证后占用全局槽位并心跳；备份root私有drop-in、Gateway/helper/策略/配置和新鲜SQLite快照。只安装必要模块、固定helper、root库中的output_settings、纳管环境及策略字段。仅重启Gateway并用部署维护标记保护验证窗口，保持模型PID与160K/1，核验账号/额度/有效会话行；不恢复旧数据库、不改变模型权重/量化/KV/GPU/API Key。
 
-## 初次部署（仅获批维护窗口执行）
+正式部署前源码/备份/哈希不匹配时停止，不用旧131072/5首次接入脚本替代增量部署。正常登录/注销产生既有认证会话写入，不手工改写账号额度。
 
-部署前备份原 unit/drop-in、Gateway drop-in、环境文件及策略；记录服务状态、PID、API 健康、模型 ID、5 槽和每槽上下文。确认当前模型、llama.cpp 构建及 GPU 条件。**本仓库没有可靠的完整负载显存峰值预算，不得把空闲显存当作预算。**首次接入只维持现有 `131072 / 5`，不同时更改模型或 GPU 参数。
-
-1. 将审查版 `server/model_control.py` 部署到 Gateway 应用树的 `server/model_control.py`，并安装同版至 root 所有的 `/usr/local/lib/ccslab-model-control/model_control.py`；安装 `server/model_host.py` 为 `/usr/local/sbin/ccslab-model-controller`，保持 Python shebang `#!/usr/bin/python3 -I`。为 root helper 目录设 `0755`、模块 `0644`、helper `0755`；确认路径链不可被 `server` 写入。Gateway 应用代码替换后需重启 Gateway 才会加载。
-2. 在 `/etc/ccslab` 安装 root 所有的 `model-control.json`（格式参见 `model-control.example.json`），设置初始值 `enabled:false`，填入既有模型 API URL、ID、GPU index 和现有 API key 文件的固定路径。不要把密钥写进 JSON、命令行或日志。保留现有 API key 文件和 Gateway 配置。
-3. 创建 root 所有的 `/etc/ccslab/model-context.env`，初始内容严格为：
-
-   ```text
-   LLAMA_ARG_CTX_SIZE=131072
-   LLAMA_ARG_N_PARALLEL=5
-   ```
-
-   模式 `0644`，只含以上两行及结尾换行。
-4. 修改 `ccslab-llm.service` drop-in：保留原 `EnvironmentFile=/etc/ccslab/llm.env` 及现有模型、网络、认证和其他参数；追加 `/etc/ccslab/model-context.env`，用完整 `ExecStart` 覆盖原启动行，但只移除显式 `-c 131072 -np 5`。检查最终 unit 仅有一组上下文来源且没有后续 `UnsetEnvironment` 或 CLI 覆盖。
-5. 创建 sudoers 文件，仅授予上述 helper 空参数调用，使用 `visudo -cf` 验证。Gateway drop-in 设置 `CCSLAB_MODEL_CONTROL_SPEC=/etc/ccslab/model-control.json` 和 `NoNewPrivileges=no`；保留其他服务设置。验证 sudo 规则只能运行 helper，不能附加参数、任意命令或 shell。
-6. `systemd-analyze verify` 后，在维护窗口 `daemon-reload` 并先重启模型服务。确认服务、模型 API、原模型 ID、`131072 / 5`、每槽 `n_ctx=26368`、进程参数/环境及客户端连接恢复。再重启 Gateway 使其加载配置，核验原 API、登录会话、账号/额度数据及客户端连接。上述两个重启都会造成短暂中断。
-7. 在管理员界面查看状态与预览，确认风险提示和目标值正确。首次接入期间不执行参数变更；只有另行获批后才启用 spec，并由管理员确认应用。
-
-生产现状的已知基线（2026-11-19 前次只读核验，部署前必须重新检查）：模型 `131072 / 5`，启动行含 `-c 131072 -np 5`，Gateway `NoNewPrivileges=yes`；模型控制 helper/spec/环境文件及 `CCSLAB_MODEL_CONTROL_SPEC` 尚未安装。若现状变化，以维护窗口重新读取的实际 unit、服务状态和 `/slots` 为准。
-
-## 应用失败与回滚
-
-helper 在改写前以原子写入保存原环境快照并落盘 pending 标记。新配置启动后，只有健康、模型、PID、启动环境/参数和实际槽数/每槽上下文全部核验通过才返回成功。启动失败或核验超时会恢复快照并重启同一固定模型服务；回滚核验失败时保留 pending、阻止新模型请求并返回失败，需运维介入，不能伪报成功。
-
-维护窗口中的整体验证失败回滚步骤：
-
-1. 保留 Gateway/模型日志、SQLite 模型审计和 `/etc/ccslab/model-change.pending`；不要在回滚不明时手工清除 pending。
-2. 将 `model-context.env` 恢复为已备份的 `131072 / 5`，恢复原模型 unit drop-in/`ExecStart`（含 `-c 131072 -np 5`），`daemon-reload` 后重启 `ccslab-llm.service`。确认 `/health`、模型 ID、`/slots` 五槽、每槽上下文及实际启动参数。
-3. 移除本次 Gateway 配置 spec 路径和精确 sudoers 文件，恢复 Gateway drop-in 原值（包括 `NoNewPrivileges=yes`），恢复原 Gateway 代码版本（若代码已部署），再 `daemon-reload` 并重启 Gateway。确认 `/health`、登录、既有 API/客户端连接、账号和额度数据。
-4. 仅在原模型服务和 Gateway 均验证恢复、事务状态经检查后，由运维处理 pending/备份文件。不要删除其他服务 drop-in、轮换凭据或改写账号数据库。
-
-## 生产只读复核（2026-11-19 16:24 CST）
-
-通过 SSH 只读检查：Gateway 与 `ccslab-llm.service` 均 active；模型 PID 4492，`/health` 正常，`/slots` 报告 5 槽且每槽 `n_ctx=26368`，进程启动参数仍为 `-c 131072 -np 5`。Gateway 为 `server:server`（UID/GID 1002），`NoNewPrivileges=yes`；没有 Gateway/model drop-in，未设置 `CCSLAB_MODEL_CONTROL_SPEC`。`/etc/ccslab` 为 `root:server 0750`，仅有原 `llm.env`（`root:server 0640`）；spec、受管环境、helper 及 pending 均不存在。
-
-`sudo -n -l` 对 `server` 返回拒绝，`/etc/sudoers.d` 仅有 README。已有模型备份 `ccslab-llm-128k.backup` 内容特征包含 `-c 131072 -np 1`，与当前 5 槽基线不符；`ccslab-llm.service.save` 存在但当前账号不可读，也没有 Gateway 的现成 unit 备份。维护窗口必须先新建并验证当前服务、环境文件及相关 drop-in 的备份，不能直接用旧模型备份回退。以上均为只读核验，无生产文件变更或服务重启。
-
-## 本地验证
-
-```powershell
-& ..\.work\verify-desktop-venv\Scripts\python.exe -B -m unittest -v server.test_model_control server.test_gateway
+代码回滚（需先结束模型事务，模型回到160K/1；后续合法切换产生的新PID会被保留）：
+```bash
+cd /home/server/coding-agent/Labcoding/.work/context-sync-20261125/release-final
+sha256sum -c SHA256SUMS
+sudo -v
+sudo /usr/bin/python3 -I -B update.py --rollback
 ```
 
-以上自动化用例在隔离临时目录中模拟进程遥测、sudo/systemd 和 HTTP 健康检查，不会重启真实服务，也不能替代维护窗口的真实权限、GPU 峰值和重启验收。
+回滚使用/var/backups/labcoding-context-sync-20261125-final，恢复原策略字段与代码，仅移除本轮新增且哈希仍匹配的文件，拒绝覆盖后续编辑；不重启模型、不回灌数据库。
 
-## 临时受限部署入口（首次接入准备）
+## 独立OpenCode v2.3.0的同实例核验
 
-本地 `server/model_control_deploy.py` 是一次性、固定无参数入口；远端安装位置为 `/usr/local/sbin/ccslab-model-control-deploy`。它只接受 `server` 用户经精确 sudoers 授权发起的无参数调用，脚本固定锁定两个 Gateway 源文件的 SHA-256，检查当前服务器、服务基线和运行态后才备份并部署。载荷由入口直接打开并校验哈希，随后固定到 `/run` 下 root 私有暂存目录并再次校验；root 侧验收只从 root 管理的 `/usr/local/lib/ccslab-model-control/model_control.py` 导入，不导入 `/home/server` 下可写的 Gateway 源码。首次接入保持 `131072 / 5`，不调用管理员 apply；成功或失败退出时均尝试删除临时 sudoers 授权和入口脚本，永久模型 helper 的独立授权仅在部署成功时保留。部署前必须从当前可信工作树重新生成并核验部署载荷，不可复用过期载荷。
-
-用户在确认维护窗口并人工取得 root 会话后，先将 `ccslab-model-control-deploy` 放到 `/home/server/.cache/ccslab-model-control-deploy/`，将本次审查的 `model_control.py`、`model_host.py` 放到其 `payload/` 子目录；入口安装为 `root:root 0755`，载荷目录 `server:server 0700`、文件 `server:server 0644`。然后人工执行：
-
-```sh
-sudo install -o root -g root -m 0755 /home/server/.cache/ccslab-model-control-deploy/ccslab-model-control-deploy /usr/local/sbin/ccslab-model-control-deploy
-sudo visudo -f /etc/sudoers.d/ccslab-model-control-deploy
+等待任务结束，空闲前台用Ctrl+C正常退出并返回shell。若使用独立后台服务，确认空闲后使用原生opencode service stop正常停止；不删除会话。恢复私有模式：
+```bash
+/home/server/.opencode/bin/opencode --standalone
 ```
 
-在 visudo 编辑器中只写入：
-
-```sudoers
-server ALL=(root) NOPASSWD: /usr/local/sbin/ccslab-model-control-deploy ""
+另一次--standalone api启动的是另一实例，不能证明先前交互实例已加载。需要同实例核验时，在原项目目录使用明确地址：
+```bash
+# 终端A，先确认14096空闲
+read -rsp 'OpenCode local password: ' OPENCODE_PASSWORD; printf '\n'
+export OPENCODE_PASSWORD
+export OPENCODE_SERVER_PASSWORD="$OPENCODE_PASSWORD"
+/home/server/.opencode/bin/opencode serve --hostname 127.0.0.1 --port 14096
 ```
-
-保存后执行 `sudo chown root:root /etc/sudoers.d/ccslab-model-control-deploy && sudo chmod 0440 /etc/sudoers.d/ccslab-model-control-deploy && sudo visudo -cf /etc/sudoers`，并核对入口、临时授权的属主和模式。之后由获授权的自动化客户端执行：
-
-```sh
-ssh server@192.168.1.107 'sudo -n -- /usr/local/sbin/ccslab-model-control-deploy'
+```bash
+# 终端B，同一项目目录、同一本机访问密码
+read -rsp 'Same OpenCode local password: ' OPENCODE_PASSWORD; printf '\n'
+export OPENCODE_PASSWORD
+/home/server/.opencode/bin/opencode --server http://127.0.0.1:14096 api GET /api/model | python3 -c 'import json,sys; m=next(x for x in json.load(sys.stdin)["data"] if x["providerID"]=="ccslab" and x["id"]=="lab-general"); print({"model":m["id"],"limit":m["limit"]})'
+/home/server/.opencode/bin/opencode --server http://127.0.0.1:14096
 ```
+128K应读到131072，160K应读到163840；若项目配置覆盖全局文件，先核查来源。不要公开完整配置中的Key。此访问密码不改变模型API Key，Gateway也不会把人工核验冒充自动运行值上报。
 
-正常流程会自行撤销临时授权。若入口中断或清理失败，人工撤销命令为 `sudo rm -f /etc/sudoers.d/ccslab-model-control-deploy /usr/local/sbin/ccslab-model-control-deploy && sudo visudo -cf /etc/sudoers`。不得用该临时入口替代或放宽永久 helper 规则。自动部署及真实服务重启仍必须按前文维护窗口、备份和验收条件执行。
+GPU只读Ubuntu指定GPU的nvidia-smi，展示编号/型号/used/total/free/使用率/模型进程显存及服务器采样时间。free、reserved与total-used-free差额分别理解；读取失败为未知。GPU失败不回滚已健康应用的配置。
+
+## 验证边界
+
+隔离HTTP/SQLite/模型遥测覆盖160K→128K→160K、同目标免重启、并发/租约、文件/启动/恢复/屏障失败及旧客户端容量保护；POSIX验证server身份写入及0600。独立QEMU VM的网络命名空间实测本机/远端/IPv6/已有连接的阻断和解除，不在生产试写规则。旧Ubuntu2.0.5冻结接口与其真实内置OpenCode继续隔离验证，安装文件保持不动。
+
+隔离证据仅证明软件行为，不能代替生产联调。上方列明的核心生产验收依据用户本次明确确认归档；双平台真实并发、第三任务超额保护及槽位释放仍待生产验收，满上下文压力测试未声明通过。后续生产变更仍须另行授权。

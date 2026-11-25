@@ -164,6 +164,7 @@ class Engine:
         self.job = None
         self.lock = threading.Lock()
         self.version = ""
+        self.loaded_limits = None
         self.sandbox = ""
 
     def open_project(self, path: str):
@@ -229,12 +230,24 @@ class Engine:
                 self.process_job.add(self.process.pid)
             self._wait_for_server()
             self._wait_for_mcp()
-            config = self._json("GET", "/config")
-            if config.get("default_agent") != "ccslab" or config.get("permission", {}).get("*") != "deny":
-                raise EngineError("OpenCode 权限策略校验失败。")
+            self.verify_loaded_limits()
         except BaseException:
             self.close()
             raise
+
+    def verify_loaded_limits(self):
+        """Read the running engine; never send a model prompt or acquire a lease."""
+        if self.process is None or self.process.poll() is not None:
+            raise EngineError("OpenCode 引擎尚未启动。")
+        self.loaded_limits = None
+        config = self._json("GET", "/config")
+        if config.get("default_agent") != "ccslab" or config.get("permission", {}).get("*") != "deny":
+            raise EngineError("OpenCode 权限策略校验失败。")
+        limits = config.get("provider", {}).get("ccslab", {}).get("models", {}).get("lab-general", {}).get("limit", {})
+        if limits != self._config()["provider"]["ccslab"]["models"]["lab-general"]["limit"]:
+            raise EngineError("OpenCode 上下文/输出配置未按目标加载。")
+        self.loaded_limits = dict(limits)
+        return dict(limits)
 
     def _config(self):
         request_timeout = (LONG_REQUEST_TIMEOUT_MS if self.limits[1] > SHORT_OUTPUT_LIMIT
@@ -579,6 +592,7 @@ class Engine:
                 pass
 
     def close(self):
+        self.loaded_limits = None
         job = self._get_job()
         if job is not None:
             self.stop(job.session_id)

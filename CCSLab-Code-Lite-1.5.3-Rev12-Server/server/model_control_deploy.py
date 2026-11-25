@@ -66,8 +66,8 @@ READ_ONLY_TTY_PROCESS_NAMES = {"top", "htop", "btop", "less", "more", "man", "jo
 TEMP_RULE_TEXT = 'server ALL=(root) NOPASSWD: /usr/local/sbin/ccslab-model-control-deploy ""\n'
 MODEL_RULE_TEXT = 'server ALL=(root) NOPASSWD: /usr/local/sbin/ccslab-model-controller ""\n'
 PAYLOAD_SHA256 = {
-    "model_control.py": "aed7d0c7a73f01a5cb173a510693942affa1d8cfc7490cecc996e4f7ccca23af",
-    "model_host.py": "c1310868a65c81b05490f6421ca861bacea5461efab951c95ae25bc0dd7cdf90",
+    "model_control.py": "b1b6cd99a61a750dd1291ba75b0abb8f026f3a2868ee2bc2410e0291695259ab",
+    "model_host.py": "cf29105f4bfb759067e027355e04da52b51b6e6b4898c93cc812acce96847879",
 }
 BACKUP_FILES = (
     MODEL_UNIT_FILE, GATEWAY_UNIT_FILE, LLM_ENV,

@@ -2048,11 +2048,11 @@ class App:
                                 return
                     heartbeat = Thread(target=keep_slot, daemon=True, name="labcoding-slot-heartbeat")
                     heartbeat.start()
-                    try:
-                        model = task.client.model()
-                    except AccountError as error:
-                        if error.status in {401, 403}:
-                            raise
+                    # After admission a fresh per-slot limit is required: a previous
+                    # task's snapshot may predate an administrator context change.
+                    model = task.client.model()
+                    if type(model.get("effective_context_limit")) is not int or not 1024 <= model["effective_context_limit"] <= 2_000_000:
+                        raise RuntimeError("无法核实模型实际每槽上下文，请刷新模型状态后重试。")
             if task.cancel.is_set():
                 return
             task.model = model
@@ -3679,6 +3679,78 @@ class App:
             self.task_stats = model
             self.refresh_task_sidebar()
 
+    def reload_idle_model_engine(self, on_done=None):
+        """Synchronize an existing idle engine, including actual /config readback.
+
+        No task admission or inference is involved. A missing/stopped engine is
+        left stopped; its next normal startup already uses model_limits().
+        """
+        engine = self.engine
+        limits = self.model_limits(self.model_info, self.output_limit)
+        owner, generation, path = self.state, self.account_generation, self.project
+        client = self.account_client if self.connection_mode == "account" else None
+        connection = self.api_base, self.token, self.ca_path
+
+        def state(status, detail=""):
+            self.model_engine_sync = {"status": status, "detail": detail, "limits": limits,
+                                      "generation": generation}
+
+        def complete():
+            if on_done:
+                on_done()
+
+        process = getattr(engine, "process", None)
+        if engine is None or process is None or process.poll() is not None:
+            if engine is not None:
+                engine.limits = limits
+                engine.loaded_limits = None
+            self.engine_limits = limits
+            state("ready", "配置已就绪，待引擎启动。")
+            complete()
+            return
+        if not path or self.tasks.active() or getattr(engine, "_get_job", lambda: None)() is not None or self.busy:
+            state("pending_reload", "引擎或任务仍在使用中，未强行重载；空闲后可重新同步。")
+            complete()
+            return
+        state("syncing", "正在同步并读取内置 OpenCode 实际配置。")
+
+        def work():
+            from engine import EngineError
+            if engine.limits == limits:
+                try:
+                    engine.verify_loaded_limits()
+                    return engine, None
+                except EngineError:
+                    pass
+            # Busy prevents new UI tasks; active task engines are checked above
+            # and are never touched. The same state/project preserves sessions.
+            engine.close()
+            proxy = client.engine_proxy_url() if client else None
+            return self.create_engine(path, limits, proxy_url=proxy, owner=owner, connection=connection)
+
+        def done(result):
+            if (self.closing or owner != self.state or generation != self.account_generation
+                    or path != self.project or self.engine is not engine):
+                self.retire_engine(result[0])
+                return
+            self.engine, sessions = result
+            self.engine_limits = limits
+            if sessions is not None:
+                self.update_sessions(sessions)
+            state("synced")
+            complete()
+
+        def failed(error):
+            if owner == self.state and generation == self.account_generation and self.engine is engine:
+                engine.loaded_limits = None
+                self.engine = None
+                self.retire_engine(engine)
+                state("error", "内置 OpenCode 配置加载或读回失败，请空闲后重新同步。")
+                complete()
+
+        self.worker("同步内置 OpenCode 配置", work, done, failed,
+                    discard=lambda result: self.retire_engine(result[0]))
+
     def refresh_context_output(self, state=None):
         if state is None:
             task = self.current_task()
@@ -3795,6 +3867,7 @@ class App:
                 return
             self.engine, sessions = result
             self.engine_limits = limits
+            self.model_engine_sync = {}
             self.update_sessions(sessions)
             if self.session and not self.history.get(self.session):
                 self.open_session(self.session)

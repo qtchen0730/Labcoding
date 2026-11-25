@@ -21,6 +21,10 @@ class SlotTests(unittest.TestCase):
             entered, release = asyncio.Event(), asyncio.Event()
             calls = []
             async def upstream(request):
+                if request.url.path == "/apply-template":
+                    return httpx.Response(200, json={"prompt": "fixture"})
+                if request.url.path == "/tokenize":
+                    return httpx.Response(200, json={"tokens": [1, 2, 3]})
                 calls.append(request)
                 if len(calls) == 1:
                     entered.set()
@@ -100,6 +104,10 @@ class SlotTests(unittest.TestCase):
     def test_http_two_users_statistics_legacy_requests_and_task_headers(self):
         seen = []
         def upstream(request):
+            if request.url.path == "/apply-template":
+                return httpx.Response(200, json={"prompt": "fixture"})
+            if request.url.path == "/tokenize":
+                return httpx.Response(200, json={"tokens": [1, 2, 3]})
             seen.append(request)
             return httpx.Response(200, json={"choices": [{"message": {"content": "fixture"}}]})
         with tempfile.TemporaryDirectory(dir=TEST_ROOT) as directory:

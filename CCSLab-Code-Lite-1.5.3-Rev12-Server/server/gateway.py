@@ -25,7 +25,7 @@ from .model_control import ModelControl, ModelControlError
 from .quotas import UsageObserver, require_available
 from .account_errors import QuotaError
 from .task_slots import TaskSlots
-from .output_settings import opencode_config_path, read_output_limit, write_output_limit
+from .output_settings import OpenCodeContext, opencode_config_path, read_output_limit, write_output_limit
 
 
 _MODEL_FIELDS = frozenset({
@@ -52,6 +52,7 @@ class Settings:
     gpu_index: int = 0
     admin_registration_code_file: Path | None = None
     opencode_config: Path | None = None
+    managed_opencode_config: Path | None = None
 
     @classmethod
     def from_environment(cls):
@@ -82,9 +83,14 @@ class Settings:
         if not 0 <= gpu <= 127:
             raise ValueError("CCSLAB_MODEL_GPU_INDEX 无效。")
         admin_code_file = os.environ.get("CCSLAB_ADMIN_REGISTRATION_CODE_FILE")
+        managed_config = os.environ.get("CCSLAB_MANAGED_OPENCODE_CONFIG")
+        if managed_config and not Path(managed_config).is_absolute():
+            raise ValueError("CCSLAB_MANAGED_OPENCODE_CONFIG 须为运维明确纳管的绝对 JSON 配置路径。")
         return cls(
             database, url, model_id, token, Path(control) if control else None, output_limit, unit, gpu,
             Path(admin_code_file) if admin_code_file else None,
+            opencode_config=Path(managed_config) if managed_config else None,
+            managed_opencode_config=Path(managed_config) if managed_config else None,
         )
 
 
@@ -263,7 +269,8 @@ def create_app(settings=None, *, model_control=None, upstream_transport=None, al
     model = model_control or ModelControl(accounts.database, settings.llama_url, settings.upstream_token,
                                          config_path=settings.control_spec, model_id=settings.model_id,
                                          runtime_unit=settings.runtime_unit, gpu_index=settings.gpu_index,
-                                         gateway_output_limit=settings.output_token_limit)
+                                         gateway_output_limit=settings.output_token_limit,
+                                         context_store=OpenCodeContext(settings.managed_opencode_config))
 
     slots = TaskSlots(model)
 
@@ -316,7 +323,7 @@ def create_app(settings=None, *, model_control=None, upstream_transport=None, al
 
     @app.get("/api/opencode/output-limit")
     def opencode_output_limit(_user=Depends(active_user)):
-        path = settings.opencode_config or opencode_config_path()
+        path = settings.managed_opencode_config or settings.opencode_config or opencode_config_path()
         try:
             value = read_output_limit(path)
         except (OSError, ValueError, KeyError, TypeError) as error:
@@ -330,7 +337,7 @@ def create_app(settings=None, *, model_control=None, upstream_transport=None, al
         value, = _only(await _json_input(request), "output_limit")
         if type(value) is not int or not 128 <= value <= 8192:
             raise HTTPException(400, "输出 Token 上限须为 128–8192 的整数。")
-        path = settings.opencode_config or opencode_config_path()
+        path = settings.managed_opencode_config or settings.opencode_config or opencode_config_path()
         try:
             await run_in_threadpool(write_output_limit, path, value)
         except (OSError, ValueError, KeyError, TypeError) as error:
@@ -485,9 +492,15 @@ def create_app(settings=None, *, model_control=None, upstream_transport=None, al
 
     @app.post("/api/admin/model/preview")
     async def model_preview(request: Request, admin=Depends(admin_user)):
-        context, slots = _only(await _json_input(request), "total_context", "slots")
+        payload = await _json_input(request)
+        version = payload.pop("expected_version", None)
+        if version is not None and (not isinstance(version, str) or not re.fullmatch(r"[a-f0-9]{64}", version)):
+            raise HTTPException(400, "配置版本无效。")
+        context, slots = _only(payload, "total_context", "slots")
         await run_in_threadpool(accounts.session, _token(request), admin=True)
-        return await run_in_threadpool(model.preview, str(admin["id"]), context, slots)
+        if version is None:
+            return await run_in_threadpool(model.preview, str(admin["id"]), context, slots)
+        return await run_in_threadpool(model.preview, str(admin["id"]), context, slots, expected_version=version)
 
     @app.post("/api/admin/model/apply")
     async def model_apply(request: Request, admin=Depends(admin_user)):
@@ -561,16 +574,22 @@ def create_app(settings=None, *, model_control=None, upstream_transport=None, al
         try:
             client = request.app.state.upstream
             reserve_tokens = None
-            if _user.get("quota", {}).get("mode") == "limited":
+            limited = _user.get("quota", {}).get("mode") == "limited"
+            observed_model = await run_in_threadpool(model.status)
+            context_limit = ((observed_model.get("context_sync") or {}).get("backend") or {}).get("effective_context_limit")
+            if type(context_limit) is not int or context_limit < 1024:
+                raise HTTPException(503, "无法核实服务器实际每槽上下文，请重新连接后重试。")
+            if limited:
                 require_available(_user["quota"])
-                # Use the running model's own template and tokenizer, including tools,
-                # history and system messages. Never turn a character estimate into a bill.
+            # Also protect unlimited / legacy clients after a decrease. Admission
+            # holds the global lease, so this actual capacity cannot change mid-call.
+            if context_limit:
                 for path, body in (("apply-template", payload), ("tokenize", None)):
                     if body is None:
                         body = {"content": prompt, "add_special": True, "parse_special": True}
                     counted = await _authorize_wait(client.post(path, json=body), check)
                     if counted.status_code != 200 or len(counted.content) > _MODEL_RESPONSE_LIMIT:
-                        raise HTTPException(503, "模型分词接口不可用，限额账号暂不能安全发起请求。")
+                        raise HTTPException(503, "模型分词接口不可用，暂不能安全核验请求上下文。")
                     try:
                         value = counted.json()
                     except (ValueError, RecursionError):
@@ -587,6 +606,15 @@ def create_app(settings=None, *, model_control=None, upstream_transport=None, al
                             raise HTTPException(503, "模型分词接口返回无效统计。")
                         reserve_tokens = len(tokens) + payload["max_tokens"]
                         request.state.quota_diagnostics["input_tokens"] = len(tokens)
+                        if reserve_tokens > context_limit:
+                            return JSONResponse({"detail": "请求超过服务器实际每槽上下文，请重新连接或重启客户端并压缩旧会话。",
+                                "error": {"code": "context_length_exceeded", "type": "invalid_request_error",
+                                          "message": "context length exceeded", "context_diagnostics": {
+                                              "stage": "Gateway", "context_limit": context_limit,
+                                              "input_tokens": len(tokens), "output_reserve": payload["max_tokens"],
+                                              "request_id": request_id}}}, status_code=400)
+            if not limited:
+                reserve_tokens = None  # preserve the existing unlimited-quota semantics
             reservation = await run_in_threadpool(accounts.quotas.reserve, token, request_id, reserve_tokens)
             call = client.build_request("POST", "v1/chat/completions", json=payload)
             call.headers["X-Request-ID"] = request_id

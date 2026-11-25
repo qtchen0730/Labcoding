@@ -23,6 +23,78 @@ else:
 
 BACKUP = Path("/etc/ccslab/model-context.previous")
 LOCK_FILE = Path("/etc/ccslab/model-change.lock")
+NFT = "/usr/sbin/nft"
+NFT_TABLE = "ccslab_context_maintenance"
+
+
+class MaintenanceError(ValueError):
+    def __init__(self, reason):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def opencode_processes(uid, proc=Path("/proc")):
+    """PID-only evidence; no command lines, keys, session data or process signals."""
+    try:
+        result = []
+        for entry in proc.iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                if entry.stat().st_uid == uid:
+                    executable = str((entry / "exe").readlink()).removesuffix(" (deleted)")
+                    if Path(executable).name.startswith("opencode"):
+                        result.append(int(entry.name))
+            except FileNotFoundError:  # exited / zombie, cannot submit a request
+                continue
+        return result
+    except OSError as error:
+        raise MaintenanceError("process_check_failed") from error
+
+
+class DirectRequestGuard:
+    """Only the host model's fixed TCP port; an independent ephemeral nft table."""
+    def __init__(self):
+        self.installed = self.marked = False
+
+    @staticmethod
+    def command(script):
+        try:
+            subprocess.run([NFT, "-f", "-"], input=script, encoding="ascii", check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+        except (OSError, subprocess.SubprocessError) as error:
+            raise MaintenanceError("direct_guard_failed") from error
+
+    def start(self):
+        if self.installed:
+            return
+        if not self.marked:
+            if control.MODEL_MAINTENANCE.exists():
+                raise MaintenanceError("direct_guard_failed")
+            self.marker = control.MODEL_MAINTENANCE
+            atomic_write(self.marker, b"ccslab fixed model maintenance\n", 0o600)
+            self.marked = True
+        # inet covers IPv4 and IPv6. Root-local probes remain possible; all
+        # unprivileged local and all remote traffic to the host port is rejected.
+        # "create" refuses an existing table; never edit somebody else's rules.
+        self.command(f"""create table inet {NFT_TABLE}
+add chain inet {NFT_TABLE} output {{ type filter hook output priority -150; policy accept; }}
+add rule inet {NFT_TABLE} output fib daddr type local meta skuid != 0 tcp dport 8000 reject with tcp reset
+add chain inet {NFT_TABLE} input {{ type filter hook input priority -150; policy accept; }}
+add rule inet {NFT_TABLE} input iifname != "lo" tcp dport 8000 reject with tcp reset
+""")
+        self.installed = True
+
+    def stop(self):
+        if self.installed:
+            try:
+                self.command(f"delete table inet {NFT_TABLE}\n")
+            except MaintenanceError as error:
+                raise MaintenanceError("direct_guard_release_failed") from error
+            self.installed = False
+        if self.marked:
+            self.marker.unlink()
+            self.marked = False
 
 
 class Interrupted(Exception):
@@ -77,6 +149,114 @@ class Host:
     def __init__(self, policy, token):
         self.policy = policy
         self.token = token
+        self.guard = None
+        self.managed_before = None
+        self.managed_target = None
+
+    def managed_config(self, context=None, allowed=None):
+        """Drop privileges before touching the server-owned JSON or its parents."""
+        import pwd
+        account = pwd.getpwnam("server")
+        path = self.policy.managed_opencode_config
+        if path is None:
+            raise MaintenanceError("maintenance_not_enrolled")
+        read_fd, write_fd = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            os.close(read_fd)
+            try:
+                if os.geteuid() == 0:
+                    os.setgroups([])
+                    os.setgid(account.pw_gid)
+                    os.setuid(account.pw_uid)
+                if os.geteuid() != account.pw_uid:
+                    raise PermissionError("unexpected managed uid")
+                os.umask(0o077)
+                if __package__:
+                    from .output_settings import OpenCodeContext
+                else:
+                    from output_settings import OpenCodeContext
+                store = OpenCodeContext(path)
+                _, limits = store._read()
+                info = path.stat()
+                if info.st_uid != account.pw_uid or info.st_mode & 0o777 != 0o600:
+                    raise PermissionError("managed config ownership/mode")
+                before = limits.get("context")
+                output = limits.get("output")
+                if type(before) is not int or before < 1024 or type(output) is not int or output <= 0:
+                    raise ValueError("invalid managed limits")
+                if context is not None:
+                    if before not in allowed:
+                        raise ValueError("independent context changed concurrently")
+                    store.sync(context)
+                    if store.status(context)["status"] != "pending_reload":
+                        raise ValueError("managed readback mismatch")
+                    before = context
+                result = {"ok": True, "context": before, "output": output}
+            except BaseException as error:
+                reason = ("managed_config_permission" if isinstance(error, PermissionError) else
+                          "managed_config_missing" if isinstance(error, FileNotFoundError) else
+                          "managed_config_io" if isinstance(error, OSError) else "managed_config_failed")
+                result = {"ok": False, "reason": reason}
+            try:
+                os.write(write_fd, json.dumps(result).encode("ascii"))
+            finally:
+                os.close(write_fd)
+                os._exit(0)
+        os.close(write_fd)
+        try:
+            with os.fdopen(read_fd, "rb") as stream:
+                result = json.loads(stream.read(4096))
+        except (OSError, ValueError) as error:
+            raise MaintenanceError("managed_config_failed") from error
+        finally:
+            _, status = os.waitpid(pid, 0)
+        if status != 0 or result.get("ok") is not True:
+            reason = result.get("reason")
+            raise MaintenanceError(reason if reason in control.REASONS else "managed_config_failed")
+        return result
+
+    def check_closed(self):
+        import pwd
+        if opencode_processes(pwd.getpwnam("server").pw_uid):
+            raise MaintenanceError("independent_running")
+
+    def prepare_guard(self):
+        # This guard implementation is deliberately fixed, never client-selected.
+        if control.normalized_llama_url(self.policy.llama_url) != "http://172.17.0.1:8000":
+            raise MaintenanceError("direct_guard_failed")
+        self.guard = DirectRequestGuard()
+
+    def prepare_decrease(self, target, current_context):
+        self.check_closed()
+        values = self.managed_config()
+        if values["context"] != current_context:
+            raise MaintenanceError("managed_config_mismatch")
+        if values["output"] >= target:
+            raise MaintenanceError("managed_config_failed")
+        self.managed_before, self.managed_target = values["context"], target
+        self.prepare_guard()
+
+    def begin_maintenance(self, runtime, require_closed):
+        self.guard.start()
+        if require_closed:
+            self.check_closed()
+        live = self.current()
+        if live.get("_active_slots") != 0:
+            raise MaintenanceError("model_busy")
+        control.validate_change(live, live["total_context"], live["slots"], require_idle=True)
+        if live["_pid"] != runtime["_pid"] or live["_config"] != runtime["_config"]:
+            raise MaintenanceError("policy_or_runtime_refused")
+
+    def sync_decrease(self):
+        self.managed_config(self.managed_target, {self.managed_before})
+        self.check_closed()
+
+    def restore_decrease(self):
+        self.managed_config(self.managed_before, {self.managed_before, self.managed_target})
+
+    def end_maintenance(self):
+        self.guard.stop()
 
     def current(self):
         p = self.policy
@@ -88,7 +268,10 @@ class Host:
 
     def remember(self, snapshot, payload):
         atomic_write(BACKUP, snapshot, 0o600)
-        atomic_write(control.ROLLBACK_PENDING, json.dumps(payload).encode("utf-8"))
+        journal = dict(payload)
+        if self.managed_before is not None:
+            journal["independent_context_before"] = self.managed_before
+        atomic_write(control.ROLLBACK_PENDING, json.dumps(journal).encode("utf-8"))
 
     def apply_settings(self, contents):
         atomic_write(control.CONTEXT_ENV, contents)
@@ -117,9 +300,13 @@ class Host:
 
 def run_change(host, policy, payload):
     """Return a sanitized outcome. Keep pending state unless apply or rollback is verified."""
+    decreasing = False
+    guarded = False
     try:
         runtime = host.current()
-        current, _ = control.validate_change(runtime, payload["new_context"], payload["new_slots"],
+        if runtime.get("_active_slots") != 0:
+            raise MaintenanceError("model_busy")
+        current, target = control.validate_change(runtime, payload["new_context"], payload["new_slots"],
                                              require_idle=True)
         snapshot = host.snapshot()
         if (payload["policy"] != policy.digest
@@ -130,32 +317,81 @@ def run_change(host, policy, payload):
             raise ValueError("operation does not match policy")
         if control.context_env(snapshot) != current:
             raise ValueError("working configuration differs from environment snapshot")
+        decreasing = target < runtime["_observed_slot_context"]
+        guarded = decreasing or policy.managed_opencode_config is not None
+        if decreasing:
+            host.prepare_decrease(target, runtime["_observed_slot_context"])
+        elif guarded:
+            host.prepare_guard()
         host.remember(snapshot, payload)
-    except (OSError, control.ModelControlError, KeyError, TypeError, ValueError, Interrupted):
-        return {"status": "refused", "reason": "policy_or_runtime_refused"}
+    except (OSError, control.ModelControlError, KeyError, TypeError, ValueError, Interrupted) as error:
+        return {"status": "refused", "reason": getattr(error, "reason", "policy_or_runtime_refused")}
+
+    if guarded:
+        try:
+            host.begin_maintenance(runtime, require_closed=decreasing)
+        except (OSError, control.ModelControlError, ValueError, Interrupted) as error:
+            reason = getattr(error, "reason", "policy_or_runtime_refused")
+            try:
+                host.end_maintenance()
+                host.clear_pending()
+                return {"status": "refused", "reason": reason}
+            except (OSError, ValueError, Interrupted):
+                return {"status": "rollback_failed", "reason": "direct_guard_release_failed"}
 
     failure = ""
     try:
         host.apply_settings(settings(payload["new_context"], payload["new_slots"]))
         host.restart()
         if host.wait_verified(payload["new_context"], payload["new_slots"], runtime["_pid"]):
+            if decreasing:
+                host.sync_decrease()
             host.clear_pending()
+            if guarded:
+                try:
+                    host.end_maintenance()
+                except (OSError, ValueError, Interrupted):
+                    host.remember(snapshot, payload)
+                    raise MaintenanceError("direct_guard_release_failed")
             return {"status": "applied", "reason": ""}
         failure = "health_or_dimensions_failed"
-    except (OSError, subprocess.SubprocessError, ValueError):
-        failure = "restart_failed"
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        failure = getattr(error, "reason", "restart_failed")
     except Interrupted:
         failure = "interrupted"
 
+    backend_restored = False
+    protected = not guarded
     try:
+        host.remember(snapshot, payload)
+        if guarded:
+            host.guard.start()
+            protected = True
         current_pid = host.current()["_pid"]
         host.apply_settings(snapshot)
         host.restart()
-        if host.wait_verified(current["total_context"], current["slots"], current_pid):
-            host.clear_pending()
-            return {"status": "rolled_back", "reason": failure}
+        backend_restored = host.wait_verified(current["total_context"], current["slots"], current_pid)
     except (OSError, subprocess.SubprocessError, ValueError, Interrupted):
         pass
+    file_restored = not decreasing
+    if decreasing and protected:
+        try:
+            host.restore_decrease()
+            file_restored = True
+        except (OSError, ValueError, Interrupted):
+            pass
+    if backend_restored and file_restored:
+        try:
+            host.clear_pending()
+            if guarded:
+                try:
+                    host.end_maintenance()
+                except (OSError, ValueError, Interrupted):
+                    host.remember(snapshot, payload)
+                    raise
+            return {"status": "rolled_back", "reason": failure}
+        except (OSError, ValueError, Interrupted):
+            pass
     return {"status": "rollback_failed", "reason": failure or "restore_failed"}
 
 
@@ -166,7 +402,7 @@ def execute_change(payload):
     with os.fdopen(descriptor, "wb") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         policy = control.Policy.read(control.MODEL_SPEC)
-        if control.ROLLBACK_PENDING.exists():
+        if control.ROLLBACK_PENDING.exists() or control.MODEL_MAINTENANCE.exists():
             return {"status": "refused", "reason": "previous_transaction_pending"}
         secret = api_key(policy.api_key_file)
         return run_change(Host(policy, secret), policy, payload)

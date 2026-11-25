@@ -52,6 +52,22 @@ def snapshot(profile=A, *, busy=0, used=27000, current_model=25000, total=32000,
 
 
 class TelemetryTest(unittest.TestCase):
+    def test_gpu_sample_has_actual_free_memory_and_failure_is_unknown(self):
+        with patch.object(m, "_fixed_command", side_effect=[
+                "0, GPU-abcd, NVIDIA GeForce RTX 5090, 29000, 32607, 3100",
+                "123, GPU-abcd, 28000\n123, GPU-ffff, 20"]):
+            gpu = m._read_gpu(0, 123)
+            self.assertEqual(gpu["free_mib"], 3100)
+            self.assertEqual(gpu["unaccounted_mib"], 507)
+            self.assertEqual(gpu["model_process_mib"], 28000)
+            self.assertEqual(gpu["name"], "NVIDIA GeForce RTX 5090")
+            self.assertAlmostEqual(gpu["utilization_percent"], 88.9)
+            self.assertGreater(gpu["sampled_at"], 0)
+        with patch.object(m, "_fixed_command", side_effect=OSError()):
+            self.assertIsNone(m._read_gpu(0, None))
+        with patch.object(m, "_fixed_command", return_value="0, GPU-abcd, GPU, 0, 0, 0"):
+            self.assertIsNone(m._read_gpu(0, None))
+
     def test_live_sources_no_inferred_context(self):
         replies = {
             "/health": {"status": "ok"},
@@ -134,6 +150,27 @@ class ControlTest(unittest.TestCase):
                 "SELECT result FROM model_configuration_audit ORDER BY id"
             ).fetchall(), [("requested",), ("applied",)])
 
+    def test_deployment_hold_blocks_admission_and_apply_without_consuming_confirmation(self):
+        ticket = self.preview()["confirmation"]
+        marker = self.control.db.parent / "deployment.hold"
+        with patch.object(m, "DEPLOYMENT_HOLD", marker):
+            marker.touch()
+            self.assertFalse(self.control.begin_inference())
+            self.assertTrue(self.control.status()["deployment_hold"])
+            self.assertFalse(self.control.status()["control_available"])
+            with self.assertRaisesRegex(m.ModelControlError, "服务器忙碌"):
+                self.control.apply("owner", ticket)
+            with self.assertRaisesRegex(m.ModelControlError, "服务器忙碌"):
+                self.preview()
+            marker.unlink()
+            self.assertTrue(self.control.begin_inference())
+            self.control.end_inference()
+            # The held operation did not consume the original confirmation.
+            with patch.object(self.control, "_invoke", return_value={"status": "refused"}) as helper:
+                with self.assertRaises(m.ModelControlError):
+                    self.control.apply("owner", ticket)
+                helper.assert_called_once()
+
     def test_expiry_and_slot_draining(self):
         token = self.preview()["confirmation"]
         with closing(sqlite3.connect(self.control.db)) as db, db:
@@ -157,6 +194,188 @@ class ControlTest(unittest.TestCase):
             self.assertEqual(db.execute(
                 "SELECT result, reason FROM model_configuration_audit ORDER BY id DESC LIMIT 1"
             ).fetchone(), ("rolled_back", "health_or_dimensions_failed"))
+
+    def enroll_opencode(self):
+        from .output_settings import OpenCodeContext
+        self.config = self.control.db.parent / "opencode.json"
+        self.document = {"model": "ccslab/lab-general", "other": {"keep": True}, "provider": {
+            "ccslab": {"options": {"apiKey": "fixture-secret"}, "models": {
+                "lab-general": {"limit": {"context": 24000, "input": 20000, "output": 4096}}}}}}
+        self.config.write_text(json.dumps(self.document), encoding="utf-8")
+        self.control.context_store = OpenCodeContext(self.config)
+
+    def test_actual_context_sync_preserves_output_and_other_fields(self):
+        self.enroll_opencode()
+        def invoke(_payload):
+            self.runtime.return_value = snapshot(B, used=21000)
+            return {"status": "applied"}
+        with patch.object(self.control, "_invoke", side_effect=invoke):
+            result = self.control.apply("owner", self.preview()["confirmation"])
+        expected = self.document
+        backups = list(self.config.parent.glob(".opencode-context-backup-*"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(json.loads(backups[0].read_text()), self.document)
+        expected["provider"]["ccslab"]["models"]["lab-general"]["limit"].update(context=32768)
+        self.assertEqual(json.loads(self.config.read_text(encoding="utf-8")), expected)
+        self.assertEqual(result["status"], "applied")
+        self.assertEqual(result["model"]["gpu"]["used_mib"], 21000)
+        sync = result["model"]["context_sync"]
+        self.assertEqual(sync["builtin"]["context_limit"], 32768)
+        self.assertEqual(sync["opencode"]["status"], "pending_reload")
+        self.assertIsNone(sync["opencode"]["effective_context_limit"])
+        # Status remains reconstructable after a later read, without a success cache.
+        self.assertEqual(self.control.status()["context_sync"]["opencode"]["configured_context_limit"], 32768)
+
+    def test_failed_file_sync_is_partial_and_same_target_retries_without_restart(self):
+        from . import output_settings
+        self.enroll_opencode()
+        original = self.config.read_bytes()
+        def invoke(_payload):
+            self.runtime.return_value = snapshot(B)
+            return {"status": "applied"}
+        with patch.object(self.control, "_invoke", side_effect=invoke), \
+                patch.object(output_settings, "_write_config", side_effect=PermissionError()):
+            result = self.control.apply("owner", self.preview()["confirmation"])
+        self.assertEqual(result["status"], "partially_applied")
+        self.assertFalse(result["fully_synchronized"])
+        self.assertEqual(result["configuration_errors"][0]["component"], "independent_opencode_file")
+        self.assertIn("权限", result["configuration_errors"][0]["reason"])
+        self.assertEqual(result["model"]["context_sync"]["opencode"]["status"], "error")
+        self.assertEqual(self.config.read_bytes(), original)
+        retry = self.preview()
+        self.assertFalse(retry["restart_required"])
+        with patch.object(self.control, "_invoke") as restart:
+            self.assertEqual(self.control.apply("owner", retry["confirmation"])["status"], "applied")
+            restart.assert_not_called()
+
+    def test_context_only_sync_keeps_absent_input_owner_mode_and_avoids_noop_writes(self):
+        self.enroll_opencode()
+        limits = self.document["provider"]["ccslab"]["models"]["lab-general"]["limit"]
+        limits.pop("input")
+        original = json.dumps(self.document).encode()
+        self.config.write_bytes(original)
+        self.config.chmod(0o600)
+        before = self.config.stat()
+        self.control.context_store.sync(32768)
+        after = self.config.stat()
+        saved = json.loads(self.config.read_bytes())
+        limits["context"] = 32768
+        self.assertEqual(saved, self.document)
+        if os.name == "posix":
+            self.assertEqual((after.st_uid, after.st_gid, after.st_mode & 0o777),
+                             (before.st_uid, before.st_gid, 0o600))
+        backup = list(self.config.parent.glob(".opencode-context-backup-*"))
+        self.assertEqual(len(backup), 1)
+        self.assertEqual(backup[0].read_bytes(), original)
+        with patch.object(Path, "replace", side_effect=AssertionError("unnecessary write")):
+            self.control.context_store.sync(32768)
+
+    def test_unenrolled_decrease_and_more_slots_are_refused_before_any_change(self):
+        from . import output_settings
+        self.enroll_opencode()
+        # Current actual capacity 32768. Both targets decrease per-slot capacity;
+        # the second leaves total context unchanged and increases slot count.
+        self.runtime.return_value = snapshot(B)
+        original = self.config.read_bytes()
+        for total, slots in ((32768, 2), (65536, 4)):
+            for file_failure in (PermissionError(), None):
+                with self.subTest(total=total, slots=slots, file_failure=type(file_failure).__name__), \
+                        patch.object(self.control, "_invoke") as helper, \
+                        patch.object(output_settings, "_write_config", side_effect=file_failure) as write:
+                    with self.assertRaisesRegex(m.ModelControlError, "降容已阻止"):
+                        self.control.preview("owner", total, slots)
+                    helper.assert_not_called()
+                    write.assert_not_called()
+                    self.assertEqual(self.config.read_bytes(), original)
+                    self.assertEqual(self.control.status()["total_context"], 65536)
+
+    def test_same_target_repair_rechecks_health_slots_and_capacity(self):
+        self.enroll_opencode()
+        self.runtime.return_value = snapshot(B)
+        for invalid in (dict(snapshot(B), status="unavailable"), dict(snapshot(B), slots=3),
+                        dict(snapshot(B), _observed_slot_context=1)):
+            token = self.preview()["confirmation"]
+            self.runtime.return_value = invalid
+            with patch.object(self.control, "_invoke") as helper:
+                with self.assertRaises(m.ModelControlError):
+                    self.control.apply("owner", token)
+                helper.assert_not_called()
+            self.runtime.return_value = snapshot(B)
+
+    def test_other_admin_same_target_version_and_new_instance_invalidate_old_repair(self):
+        self.enroll_opencode()
+        self.runtime.return_value = snapshot(B)
+        old_version = self.control.status()["configuration_version"]
+        first = self.control.preview("first", B.total_context, B.slots, expected_version=old_version)
+        second = self.control.preview("second", B.total_context, B.slots, expected_version=old_version)
+        with patch.object(self.control, "_invoke") as helper:
+            self.control.apply("second", second["confirmation"])
+            with self.assertRaisesRegex(m.ModelControlError, "版本"):
+                self.control.apply("first", first["confirmation"])
+            with self.assertRaisesRegex(m.ModelControlError, "版本"):
+                self.control.preview("first", B.total_context, B.slots, expected_version=old_version)
+            token = self.preview()["confirmation"]
+            self.runtime.return_value = dict(snapshot(B), _pid=5678)
+            with self.assertRaisesRegex(m.ModelControlError, "实例"):
+                self.control.apply("owner", token)
+            helper.assert_not_called()
+
+    def test_backend_rollback_or_unverified_success_never_changes_opencode(self):
+        self.enroll_opencode()
+        original = self.config.read_bytes()
+        for result in ({"status": "rolled_back"}, {"status": "applied"}):
+            with self.subTest(result=result), patch.object(self.control, "_invoke", return_value=result):
+                with self.assertRaises(m.ModelControlError):
+                    self.control.apply("owner", self.preview()["confirmation"])
+                self.assertEqual(self.config.read_bytes(), original)
+
+    def test_unmanaged_and_broken_config_are_truthful(self):
+        from .output_settings import OpenCodeContext
+        self.assertEqual(OpenCodeContext(None).status(32768)["status"], "unmanaged")
+        self.enroll_opencode()
+        for raw in ("{}", "invalid", '[]', '{"provider":null}'):
+            self.config.write_text(raw, encoding="utf-8")
+            self.assertEqual(self.control.status()["context_sync"]["opencode"]["status"], "error")
+            with self.assertRaises((ValueError, KeyError, TypeError)):
+                self.control.context_store.sync(32768)
+            self.assertEqual(self.config.read_text(encoding="utf-8"), raw)
+        self.config.unlink()
+        self.assertEqual(self.control.status()["context_sync"]["opencode"]["status"], "error")
+
+    def test_atomic_failure_and_overlapping_output_update_preserve_document(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Event
+        from . import output_settings
+        self.enroll_opencode()
+        original = self.config.read_bytes()
+        with patch.object(Path, "replace", side_effect=PermissionError()):
+            with self.assertRaises(PermissionError):
+                self.control.context_store.sync(32768)
+        self.assertEqual(self.config.read_bytes(), original)
+        self.assertFalse(list(self.config.parent.glob(".opencode-output-*")))
+        entered, release, output_started = Event(), Event(), Event()
+        write = output_settings._write_config
+        def delayed_write(path, config):
+            if config["provider"]["ccslab"]["models"]["lab-general"]["limit"]["output"] == 4096:
+                entered.set()
+                self.assertTrue(release.wait(5))
+            return write(path, config)
+        def output_update():
+            output_started.set()
+            return output_settings.write_output_limit(self.config, 8192)
+        with patch.object(output_settings, "_write_config", side_effect=delayed_write), ThreadPoolExecutor(2) as pool:
+            context = pool.submit(self.control.context_store.sync, 32768)
+            self.assertTrue(entered.wait(5))
+            output = pool.submit(output_update)
+            try:
+                self.assertTrue(output_started.wait(5))
+            finally:
+                release.set()
+            context.result(5)
+            self.assertEqual(output.result(5), 8192)
+        saved = json.loads(self.config.read_text(encoding="utf-8"))
+        self.assertEqual(saved["provider"]["ccslab"]["models"]["lab-general"]["limit"],
+                         {"context": 32768, "input": 20000, "output": 8192})
 
 
 class FixtureHost:
@@ -202,14 +421,22 @@ class HostRecoveryTest(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=TEST_ROOT) as directory:
             key_file = Path(directory) / "api-key"
             key_file.write_text("fixture-key", encoding="ascii")
+            key_file.chmod(0o600)
             self.assertEqual(host.api_key(key_file), "fixture-key")
 
             key_file.write_text("invalid key", encoding="ascii")
             with self.assertRaisesRegex(ValueError, "invalid API key"):
                 host.api_key(key_file)
+            key_file.write_text("fixture-key", encoding="ascii")
+            key_file.chmod(0o664)
+            with self.assertRaisesRegex(ValueError, "untrusted API key"):
+                host.api_key(key_file)
 
     def test_helper_request_accepts_only_fixed_integer_fields(self):
         self.assertEqual(host.parse_request(json.dumps(CHANGE).encode("ascii")), CHANGE)
+        self.assertEqual(m.CONTEXT_OPTIONS, (32768, 65536, 131072, 147456, 163840, 196608))
+        for context in m.CONTEXT_OPTIONS:
+            self.assertEqual(host.parse_request(json.dumps(dict(CHANGE, new_context=context)).encode("ascii"))["new_context"], context)
         for invalid in (dict(CHANGE, path="/etc/passwd"), dict(CHANGE, new_slots=True),
                         dict(CHANGE, new_slots=11)):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):

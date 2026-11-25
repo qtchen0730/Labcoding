@@ -25,7 +25,8 @@ class ControllerFixture:
         self.maintenance = False
 
     def status(self):
-        return {"status": "running", "total_context": 131072, "slots": 5, "effective_context_limit": 26368}
+        return {"status": "running", "total_context": 131072, "slots": 5, "effective_context_limit": 26368,
+                "context_sync": {"backend": {"effective_context_limit": 26368}}}
 
     def begin_inference(self):
         if self.maintenance:
@@ -66,7 +67,7 @@ def admin_login(code=ADMIN_CODE, username="admin-test"):
     return {"username": username, "password": ADMIN_PASSWORD, "role": "admin", "authorization_code": code}
 
 
-def setup(root, upstream, *, admin_code_file=None, bootstrap=True, opencode_config=None):
+def setup(root, upstream, *, admin_code_file=None, bootstrap=True, opencode_config=None, managed_opencode_config=None):
     db = root / "accounts.sqlite3"
     if admin_code_file is None:
         admin_code_file = root / "administrator.verifier"
@@ -78,7 +79,8 @@ def setup(root, upstream, *, admin_code_file=None, bootstrap=True, opencode_conf
     controller = ControllerFixture()
     app = create_app(
         Settings(db, "http://llama.fixture", "lab-general", UPSTREAM_KEY,
-                 admin_registration_code_file=admin_code_file, opencode_config=opencode_config),
+                 admin_registration_code_file=admin_code_file, opencode_config=opencode_config,
+                 managed_opencode_config=managed_opencode_config),
         model_control=controller,
         upstream_transport=httpx.MockTransport(upstream),
     )
@@ -86,11 +88,31 @@ def setup(root, upstream, *, admin_code_file=None, bootstrap=True, opencode_conf
 
 
 class AccountGatewayTests(unittest.TestCase):
+    def test_context_enrollment_is_explicit_and_reaches_controller(self):
+        with tempfile.TemporaryDirectory(dir=TEST_ROOT) as scratch:
+            root = Path(scratch)
+            key = root / "key"
+            key.write_text("fixture-key", encoding="ascii")
+            environment = {"CCSLAB_LLAMA_API_KEY_FILE": str(key), "CCSLAB_DATABASE": str(root / "accounts.db")}
+            with patch.dict(os.environ, environment, clear=True):
+                self.assertIsNone(Settings.from_environment().managed_opencode_config)
+                os.environ["CCSLAB_MANAGED_OPENCODE_CONFIG"] = str(root / "opencode.json")
+                settings = Settings.from_environment()
+                self.assertEqual(settings.opencode_config, settings.managed_opencode_config)
+                from . import gateway
+                with patch.object(gateway, "ModelControl", wraps=gateway.ModelControl) as factory:
+                    create_app(settings)
+                    self.assertEqual(factory.call_args.kwargs["context_store"].path, root / "opencode.json")
+                os.environ["CCSLAB_MANAGED_OPENCODE_CONFIG"] = "relative.json"
+                with self.assertRaises(ValueError):
+                    Settings.from_environment()
+
     def test_opencode_output_setting_read_write_retry_and_authorization(self):
         with tempfile.TemporaryDirectory(dir=TEST_ROOT) as scratch:
             root = Path(scratch)
             config_path = root / ".config" / "opencode" / "opencode.json"
-            _, _, gateway = setup(root, lambda _: None, opencode_config=config_path)
+            _, _, gateway = setup(root, lambda _: None, managed_opencode_config=config_path,
+                                  opencode_config=root / "must-not-write.json")
             with TestClient(gateway, base_url="https://gateway.fixture") as client:
                 admin = credentials(client.post("/api/login", json=admin_login()).json()["token"])
                 ordinary_result = client.post("/api/register", json={
@@ -210,6 +232,10 @@ class AccountGatewayTests(unittest.TestCase):
             requests = []
 
             def upstream(request):
+                if request.url.path == "/apply-template":
+                    return httpx.Response(200, json={"prompt": "fixture"})
+                if request.url.path == "/tokenize":
+                    return httpx.Response(200, json={"tokens": [1, 2, 3]})
                 requests.append(request)
                 return httpx.Response(
                     200,
@@ -445,6 +471,10 @@ class RevocationTests(unittest.IsolatedAsyncioTestCase):
             entered, closed = asyncio.Event(), asyncio.Event()
 
             async def upstream(_request):
+                if _request.url.path == "/apply-template":
+                    return httpx.Response(200, json={"prompt": "fixture"})
+                if _request.url.path == "/tokenize":
+                    return httpx.Response(200, json={"tokens": [1, 2, 3]})
                 return httpx.Response(200, headers={"Content-Type": "text/event-stream"},
                                       stream=PausedStream(entered, closed))
 
@@ -515,7 +545,8 @@ class ModelApplyIntegrationTests(unittest.TestCase):
         self.restarts, self.restart_modes = 0, []
 
         def telemetry(*_args, **_kwargs):
-            result = snapshot(self.profile)
+            result = snapshot(self.profile, used=27000 if self.profile == A else 21000,
+                              train=getattr(self, "train_context", 131072), busy=getattr(self, "active_requests", 0))
             result["_pid"] = self.pid
             if self.bad_dimensions:
                 result["_observed_slot_context"] = 1
@@ -535,7 +566,9 @@ class ModelApplyIntegrationTests(unittest.TestCase):
             if mode == "restart_failed":
                 raise subprocess.SubprocessError("isolated restart failure")
             values = m.context_env(m.CONTEXT_ENV.read_bytes())
-            self.profile = { (p.total_context, p.slots): p for p in (A, B) }[
+            from .test_model_control import Parameters
+            self.profile = { (p.total_context, p.slots): p for p in
+                             (A, B, Parameters(163840, 1), Parameters(131072, 1)) }[
                 values["total_context"], values["slots"]]
             self.pid += 1
             self.bad_dimensions = mode == "wrong_dimensions"
@@ -612,6 +645,264 @@ class ModelApplyIntegrationTests(unittest.TestCase):
                 self.assertEqual(db.execute(f"SELECT * FROM {table}").fetchall(), unchanged[table], table)
             self.assertEqual(db.execute("SELECT result FROM model_configuration_audit ORDER BY id").fetchall(),
                              [("requested",), ("applied",)])
+
+    def test_context_sync_api_partial_retry_status_gpu_and_auth(self):
+        from . import output_settings
+        config = self.root / "opencode.json"
+        config.write_text(json.dumps({"keep": "unchanged", "provider": {"ccslab": {"models": {
+            "lab-general": {"limit": {"context": 24000, "input": 22000, "output": 4096}}}}}}), encoding="utf-8")
+        self.control.context_store = output_settings.OpenCodeContext(config)
+        original = config.read_bytes()
+        self.assertEqual(self.client.post("/api/admin/model/preview", json={
+            "total_context": 65536, "slots": 2}).status_code, 401)
+        self.assertEqual(self.client.post("/api/admin/model/preview", headers=self.admin, json={
+            "total_context": 65536, "slots": 2, "path": str(config)}).status_code, 400)
+        token = self.preview()
+        with patch.object(output_settings, "_write_config", side_effect=PermissionError()):
+            reply = self.apply(token)
+        self.assertEqual(reply.status_code, 200, reply.text)
+        self.assertEqual(reply.json()["status"], "partially_applied")
+        self.assertEqual(config.read_bytes(), original)
+        self.assertEqual(self.restarts, 1)
+        retry = self.client.post("/api/admin/model/preview", headers=self.admin,
+                                 json={"total_context": 65536, "slots": 2}).json()
+        self.assertFalse(retry["restart_required"])
+        self.assertEqual(self.apply(retry["confirmation"]).json()["status"], "applied")
+        self.assertEqual(self.restarts, 1)
+        live = self.client.get("/api/model", headers=self.admin).json()
+        self.assertEqual(live["gpu"]["used_mib"], 21000)
+        sync = live["context_sync"]
+        self.assertEqual(sync["saved_configuration"], {"total_context": 65536, "slots": 2})
+        self.assertEqual(sync["backend"]["status"], "synced")
+        self.assertEqual(sync["builtin"]["context_limit"], 32768)
+        self.assertEqual(sync["opencode"]["configured_context_limit"], 32768)
+        self.assertIsNone(sync["opencode"]["effective_context_limit"])
+        saved = json.loads(config.read_text(encoding="utf-8"))
+        self.assertEqual(saved["keep"], "unchanged")
+        self.assertEqual(saved["provider"]["ccslab"]["models"]["lab-general"]["limit"],
+                         {"context": 32768, "input": 22000, "output": 4096})
+
+    def setup_decrease(self):
+        from .test_model_control import Parameters
+        from .output_settings import OpenCodeContext
+        self.A, self.B = Parameters(163840, 1), Parameters(131072, 1)
+        self.profile, self.train_context = self.A, 196608
+        self.control.base = "http://172.17.0.1:8000"
+        self.m.CONTEXT_ENV.write_bytes(self.host.settings(163840, 1))
+        self.config = self.root / "opencode.json"
+        self.config.write_text(json.dumps({"keep": True, "provider": {"ccslab": {"options": {"apiKey": "fixture"},
+            "models": {"lab-general": {"limit": {"context": 163840, "output": 8192}}}}}}), encoding="utf-8")
+        self.config.chmod(0o600)
+        self.control.context_store = OpenCodeContext(self.config)
+        self.enterContext(patch.object(self.m, "MANAGED_OPENCODE", self.config))
+        self.enterContext(patch.object(self.m, "MODEL_MAINTENANCE", self.root / "maintenance"))
+        policy = json.loads(self.m.MODEL_SPEC.read_text())
+        policy.update(llama_url=self.control.base, managed_opencode_config=str(self.config))
+        self.m.MODEL_SPEC.write_text(json.dumps(policy))
+        self.opencode_running = False
+        self.guard_failure = False
+        self.release_failures = 0
+        self.maintenance_events = []
+        owner = self
+
+        class Guard:
+            def start(self):
+                owner.m.MODEL_MAINTENANCE.touch()
+                owner.maintenance_events.append("fenced")
+                owner.assertFalse(owner.control.begin_inference())
+                if getattr(owner, "busy_after_fence", False): owner.active_requests = 1
+                if owner.guard_failure:
+                    raise owner.host.MaintenanceError("direct_guard_failed")
+            def stop(self):
+                if owner.release_failures:
+                    owner.release_failures -= 1
+                    raise owner.host.MaintenanceError("direct_guard_release_failed")
+                owner.maintenance_events.append("unfenced")
+                owner.m.MODEL_MAINTENANCE.unlink(missing_ok=True)
+
+        def closed(_host):
+            if self.opencode_running:
+                raise self.host.MaintenanceError("independent_running")
+        def managed(_host, context=None, allowed=None):
+            store = self.control.context_store
+            _, limits = store._read()
+            if context is not None:
+                self.assertTrue(self.m.MODEL_MAINTENANCE.exists(), "file update must remain fenced")
+                if limits["context"] not in allowed:
+                    raise self.host.MaintenanceError("managed_config_failed")
+                try:
+                    store.sync(context)
+                except (OSError, ValueError) as error:
+                    raise self.host.MaintenanceError("managed_config_failed") from error
+                self.maintenance_events.append(("file", context))
+            return {"context": context or limits["context"], "output": limits["output"]}
+        self.enterContext(patch.object(self.host, "DirectRequestGuard", Guard))
+        self.enterContext(patch.object(self.host.Host, "check_closed", closed))
+        self.enterContext(patch.object(self.host.Host, "managed_config", managed))
+
+    def test_160_to_128_to_160_and_same_target_sync_preserves_shared_data(self):
+        self.setup_decrease()
+        with closing(sqlite3.connect(self.control.db)) as db:
+            before = {n: db.execute("SELECT * FROM " + n).fetchall() for n in
+                      ("users", "sessions", "token_quotas", "token_requests")}
+        ticket = self.preview()
+        reply = self.apply(ticket)
+        self.assertEqual(reply.status_code, 200, reply.text)
+        self.assertEqual(reply.json()["model"]["effective_context_limit"], 131072)
+        self.assertEqual(self.restarts, 1)
+        self.assertEqual(self.maintenance_events, ["fenced", ("file", 131072), "unfenced"])
+        self.assertFalse(self.m.ROLLBACK_PENDING.exists())
+        self.assertFalse(self.m.MODEL_MAINTENANCE.exists())
+        for context in (131072, 163840, 163840):
+            expected_restarts = self.restarts + (context != self.profile.total_context)
+            preview = self.client.post("/api/admin/model/preview", headers=self.admin,
+                                      json={"total_context": context, "slots": 1}).json()
+            reply = self.apply(preview["confirmation"])
+            self.assertEqual(reply.status_code, 200, reply.text)
+            self.assertEqual(self.restarts, expected_restarts)
+            limits = json.loads(self.config.read_text())["provider"]["ccslab"]["models"]["lab-general"]["limit"]
+            self.assertEqual(limits, {"context": context, "output": 8192})
+        self.assertEqual(self.restarts, 2)
+        with closing(sqlite3.connect(self.control.db)) as db:
+            for name, rows in before.items():
+                self.assertEqual(db.execute("SELECT * FROM " + name).fetchall(), rows)
+
+    def test_increase_uses_fence_and_keeps_existing_partial_sync_retry(self):
+        from . import output_settings
+        self.setup_decrease()
+        self.profile = self.B
+        self.m.CONTEXT_ENV.write_bytes(self.host.settings(131072, 1))
+        self.control.context_store.sync(131072)
+        self.opencode_running = True  # the smaller running budget is safe on increase
+        preview = self.client.post("/api/admin/model/preview", headers=self.admin,
+                                  json={"total_context": 163840, "slots": 1}).json()
+        with patch.object(output_settings, "_write_config", side_effect=PermissionError()):
+            reply = self.apply(preview["confirmation"])
+        self.assertEqual(reply.status_code, 200, reply.text)
+        self.assertEqual(reply.json()["status"], "partially_applied")
+        self.assertEqual(self.restarts, 1)
+        self.assertEqual(self.maintenance_events, ["fenced", "unfenced"])
+        preview = self.client.post("/api/admin/model/preview", headers=self.admin,
+                                  json={"total_context": 163840, "slots": 1}).json()
+        self.assertEqual(self.apply(preview["confirmation"]).json()["status"], "applied")
+        self.assertEqual(self.restarts, 1)
+        self.assertFalse(self.m.MODEL_MAINTENANCE.exists())
+
+    def test_decrease_requires_normal_exit_and_idle_task_leases(self):
+        self.setup_decrease()
+        ticket = self.preview()
+        key = "c" * 32
+        self.assertTrue(self.client.post(f"/api/tasks/{key}/acquire", headers=self.admin).json()["acquired"])
+        self.assertEqual(self.apply(ticket).status_code, 409)
+        self.client.delete(f"/api/tasks/{key}", headers=self.admin)
+        self.opencode_running = True
+        reply = self.apply(ticket)
+        self.assertEqual(reply.status_code, 503)
+        self.assertIn("正常退出", reply.json()["detail"])
+        self.assertEqual(self.restarts, 0)
+        self.assertFalse(self.m.MODEL_MAINTENANCE.exists())
+        self.assertFalse(self.m.ROLLBACK_PENDING.exists())
+
+    def test_decrease_mismatched_file_can_be_repaired_without_restarting_model(self):
+        from .output_settings import OpenCodeContext
+        self.setup_decrease()
+        OpenCodeContext(self.config).sync(131072)
+        reply = self.apply(self.preview())
+        self.assertEqual(reply.status_code, 503)
+        self.assertIn("重新同步", reply.json()["detail"])
+        self.assertEqual(self.restarts, 0)
+        same = self.client.post("/api/admin/model/preview", headers=self.admin,
+                               json={"total_context": 163840, "slots": 1}).json()
+        self.assertEqual(self.apply(same["confirmation"]).status_code, 200)
+        self.assertEqual(self.restarts, 0)
+        self.assertEqual(self.apply(self.preview()).status_code, 200)
+        self.assertEqual(self.restarts, 1)
+
+    def test_decrease_guard_failure_never_changes_backend(self):
+        self.setup_decrease()
+        self.guard_failure = True
+        reply = self.apply(self.preview())
+        self.assertEqual(reply.status_code, 503)
+        self.assertIn("nftables", reply.json()["detail"])
+        self.assertEqual(self.restarts, 0)
+        self.assertFalse(self.m.MODEL_MAINTENANCE.exists())
+        self.assertFalse(self.m.ROLLBACK_PENDING.exists())
+
+    def test_decrease_file_failure_restores_and_verifies_160k(self):
+        from . import output_settings
+        self.setup_decrease()
+        original = self.config.read_bytes()
+        with patch.object(output_settings, "_write_config", side_effect=PermissionError()):
+            reply = self.apply(self.preview())
+        self.assertEqual(reply.status_code, 503)
+        self.assertIn("恢复", reply.json()["detail"])
+        self.assertEqual(self.profile.total_context, 163840)
+        self.assertEqual(self.restarts, 2)
+        self.assertEqual(self.config.read_bytes(), original)
+        self.assertFalse(self.m.ROLLBACK_PENDING.exists())
+        self.assertFalse(self.m.MODEL_MAINTENANCE.exists())
+
+    def test_decrease_backend_failure_and_restore_failure_keep_truthful_state(self):
+        self.setup_decrease()
+        self.restart_modes = ["wrong_dimensions", "restart_failed"]
+        reply = self.apply(self.preview())
+        self.assertEqual(reply.status_code, 503)
+        self.assertIn("恢复校验也未通过", reply.json()["detail"])
+        self.assertTrue(self.m.ROLLBACK_PENDING.exists())
+        self.assertTrue(self.m.MODEL_MAINTENANCE.exists())
+        self.assertFalse(self.control.begin_inference())
+
+    def test_decrease_rechecks_actual_requests_after_fencing(self):
+        self.setup_decrease()
+        self.busy_after_fence = True
+        reply = self.apply(self.preview())
+        self.assertEqual(reply.status_code, 503)
+        self.assertIn("实际请求", reply.json()["detail"])
+        self.assertEqual(self.restarts, 0)
+        self.assertFalse(self.m.ROLLBACK_PENDING.exists())
+        self.assertFalse(self.m.MODEL_MAINTENANCE.exists())
+
+    def test_decrease_startup_failure_restores_backend_and_file(self):
+        self.setup_decrease()
+        self.restart_modes = ["restart_failed", "ok"]
+        reply = self.apply(self.preview())
+        self.assertEqual(reply.status_code, 503)
+        self.assertIn("恢复并验证", reply.json()["detail"])
+        self.assertEqual(self.profile.total_context, 163840)
+        self.assertEqual(self.restarts, 2)
+        self.assertFalse(self.m.ROLLBACK_PENDING.exists())
+        self.assertFalse(self.m.MODEL_MAINTENANCE.exists())
+
+    def test_decrease_file_restore_failure_still_restores_backend_and_keeps_fence(self):
+        self.setup_decrease()
+        self.release_failures = 1
+        with patch.object(self.host.Host, "restore_decrease", side_effect=self.host.MaintenanceError("managed_config_permission")):
+            reply = self.apply(self.preview())
+        self.assertEqual(reply.status_code, 503)
+        self.assertEqual(self.profile.total_context, 163840)
+        self.assertEqual(self.restarts, 2)
+        self.assertTrue(self.m.ROLLBACK_PENDING.exists())
+        self.assertTrue(self.m.MODEL_MAINTENANCE.exists())
+        self.assertFalse(self.control.begin_inference())
+
+    def test_decrease_guard_release_failure_rolls_back_before_reopening(self):
+        self.setup_decrease()
+        self.release_failures = 1
+        reply = self.apply(self.preview())
+        self.assertEqual(reply.status_code, 503)
+        self.assertEqual(self.profile.total_context, 163840)
+        self.assertEqual(self.restarts, 2)
+        self.assertFalse(self.m.ROLLBACK_PENDING.exists())
+        self.assertFalse(self.m.MODEL_MAINTENANCE.exists())
+
+    def test_context_sync_does_not_bypass_task_lease(self):
+        ticket = self.preview()
+        key = "f" * 32
+        self.assertTrue(self.client.post(f"/api/tasks/{key}/acquire", headers=self.admin).json()["acquired"])
+        self.assertEqual(self.apply(ticket).status_code, 409)
+        self.assertEqual(self.restarts, 0)
+        self.client.delete(f"/api/tasks/{key}", headers=self.admin)
+        self.assertEqual(self.apply(ticket).status_code, 200)
 
     def test_failed_dimensions_restore_original_file(self):
         # Each test instance starts from A; rollback must verify a new PID too.

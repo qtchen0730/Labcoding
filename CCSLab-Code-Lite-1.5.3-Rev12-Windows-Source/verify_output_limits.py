@@ -167,7 +167,8 @@ class OutputLimitTests(unittest.TestCase):
             project = root / "project"
             project.mkdir()
             (project / "sample.py").write_text("value = 1\n", encoding="utf-8")
-            for budget, expected_timeout in ((4096, 120000), (8192, 300000)):
+            for context, budget, expected_timeout in ((26368, 4096, 120000), (65536, 8192, 300000)):
+                meta["effective_context_limit"] = context
                 preferences = {}
                 set_output_limit(preferences, budget)
                 preference_file = root / "preferences.json"
@@ -186,8 +187,12 @@ class OutputLimitTests(unittest.TestCase):
                     self.assertEqual(provider["options"]["timeout"], expected_timeout)
                     self.assertEqual(provider["options"]["chunkTimeout"], 60000)
                     self.assertEqual(provider["models"]["lab-general"]["limit"]["output"], budget)
+                    self.assertEqual(provider["models"]["lab-general"]["limit"]["context"], context)
+                    self.assertEqual(provider["models"]["lab-general"]["limit"]["input"], context - 2048)
+                    self.assertEqual(engine.loaded_limits["context"], context)
                 finally:
                     engine.close()
+                self.assertIsNone(engine.loaded_limits)
 
     @unittest.skipUnless(os.environ.get("CCSLAB_LONG_STREAM_TESTS") == "1",
                          "set CCSLAB_LONG_STREAM_TESTS=1 to run real 60/120/150/300 second streams")

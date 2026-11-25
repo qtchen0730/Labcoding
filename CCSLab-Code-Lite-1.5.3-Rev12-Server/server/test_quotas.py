@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 import httpx
@@ -63,6 +64,26 @@ class GatewayQuotaTests(unittest.TestCase):
     def quota(self):
         return self.client.get("/api/me",headers=self.user).json()["user"]["quota"]
 
+    def test_legacy_unlimited_request_exceeding_actual_capacity_is_rejected_without_charge(self):
+        self.prompt_count = 26300
+        result = self.client.post("/v1/chat/completions", headers=self.user, json=self.payload)
+        self.assertEqual(result.status_code, 400, result.text)
+        error = result.json()["error"]
+        self.assertEqual(error["code"], "context_length_exceeded")
+        self.assertEqual(error["context_diagnostics"]["context_limit"], 26368)
+        self.assertEqual([r.url.path for r in self.calls], ["/apply-template", "/tokenize"])
+        self.assertEqual(self.quota()["used_tokens"], 0)
+        self.assertEqual(self.model.in_flight, 0)
+
+    def test_unknown_actual_slot_capacity_cannot_reuse_display_or_old_budget(self):
+        values = self.model.status()
+        values["context_sync"]["backend"]["effective_context_limit"] = None
+        with patch.object(self.model, "status", return_value=values):
+            result = self.client.post("/v1/chat/completions", headers=self.user, json=self.payload)
+        self.assertEqual(result.status_code, 503)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.model.in_flight, 0)
+
     def test_admin_only_updates_and_validation(self):
         body={"mode":"limited","limit_tokens":1000}
         self.assertEqual(self.client.post(self.path,headers=self.user,json=body).status_code,403)
@@ -118,7 +139,7 @@ class GatewayQuotaTests(unittest.TestCase):
         self.grant(None)
         self.calls.clear()
         self.assertEqual(self.client.post("/v1/chat/completions",headers=self.user,json=self.payload).status_code,200)
-        self.assertEqual(len(self.calls),1)
+        self.assertEqual([r.url.path for r in self.calls], ["/apply-template", "/tokenize", "/v1/chat/completions"])
 
     def test_full_hold_and_partial_stream_use_pending_error_not_exhaustion(self):
         self.grant(200)

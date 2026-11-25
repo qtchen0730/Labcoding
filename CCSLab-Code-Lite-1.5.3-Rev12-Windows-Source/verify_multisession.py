@@ -331,6 +331,22 @@ class MultiSessionTkTests(unittest.TestCase):
         self.scratch.cleanup()
         self.assertFalse(self.tk_errors)
 
+    def test_context_refresh_after_admission_and_failure_cannot_reuse_old_snapshot(self):
+        with patch.object(self.client, "model", return_value={
+                "effective_context_limit": 65536, "output_token_limit": 4096}):
+            task = self.start()
+            self.running(task)
+            self.assertEqual(task.model["effective_context_limit"], 65536)
+            self.assertEqual(task.output_limit, 4096)
+            self.complete(task)
+        for failure in (AccountError("fixture unavailable", 503), {"effective_context_limit": None}):
+            with patch.object(self.client, "model", **(
+                    {"side_effect": failure} if isinstance(failure, Exception) else {"return_value": failure})):
+                task = self.start()
+                self.wait(lambda: task.status == "failed")
+                self.assertNotIn(task.task_id, self.runtimes)
+                self.assertNotIn(task.task_id, self.client.slots)
+
     def test_interleaved_streams_same_project_and_two_rotating_icons(self):
         a = self.start()
         ra = self.running(a)
@@ -1479,6 +1495,115 @@ class MultiSessionTkTests(unittest.TestCase):
             self.assertIn((str(self.projects[0]), a), self.gui.tree_rows.values())
             self.wait(lambda: not self.gui.busy and 'native target history' in self.gui.chat.get('1.0', 'end'))
             self.assertIn(a, self.gui.history)
+
+    def test_admin_save_and_resync_verify_native_idle_engine_without_model_task(self):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from threading import Thread
+        from engine import Engine
+        from verify_admin_cards import ModelConfigFixture
+
+        requests = []
+        class NoInference(BaseHTTPRequestHandler):
+            def log_message(self, *_args): pass
+            def do_GET(self):
+                requests.append(('GET', self.path))
+                self.send_response(200); self.end_headers(); self.wfile.write(b'{"data":[]}')
+            def do_POST(self):
+                requests.append(('POST', self.path))
+                self.send_response(503); self.end_headers()
+        server = ThreadingHTTPServer(('127.0.0.1', 0), NoInference)
+        Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.gui.engine.close()
+        self.gui.api_base = f'http://127.0.0.1:{server.server_port}/v1'
+        self.gui.output_limit = 8192
+        actual = Engine(self.gui.state, self.gui.api_base, 'fixture', limits=(163840, 8192))
+        self.addCleanup(lambda: self.gui.engine.close() if self.gui.engine else None)
+        actual.open_project(self.gui.project)
+        self.gui.engine = actual
+        sid = actual.new_session()
+        self.gui.session = sid
+        self.gui.history[sid] = {'events': [{'type':'delta','text':'existing history'}]}
+        before_history = deepcopy(self.gui.history)
+        old_pid = actual.process.pid
+        self.gui.create_engine = App.create_engine.__get__(self.gui, App)
+        fixture = ModelConfigFixture()
+        fixture.engine_proxy_url = lambda: None
+        fixture.model.update(total_context=163840,slots=1,effective_context_limit=163840,output_token_limit=8192)
+        self.gui.account_client = fixture
+        self.gui.show_page('admin')
+        page = self.gui.page_controller
+        page.tabs.select(page.model_tab)
+        self.wait(lambda: page.has_model and not self.gui.busy)
+        page.total.set('131072'); page.slots.set('1')
+        page.preview_button.invoke()
+        self.wait(lambda: bool(page.review_ticket) and not self.gui.busy)
+        page.apply_preview()
+        self.wait(lambda: not self.gui.busy and page.model_fields['builtin_loaded'].get()=='131,072 Token',seconds=30)
+        engine = self.gui.engine
+        self.assertNotEqual(engine.process.pid,old_pid)
+        self.assertEqual(engine.loaded_limits,{'context':131072,'input':129024,'output':8192})
+        self.assertEqual(page.model_fields['builtin_state'].get(),'已同步')
+        self.assertIn(sid,[s['id'] for s in engine.sessions()])
+        self.assertEqual(self.gui.history,before_history)
+        self.assertEqual(self.gui.session,sid)
+        self.assertFalse(self.gui.tasks.active())
+        self.assertFalse(self.client.slots)
+        pid = engine.process.pid
+        engine.loaded_limits = None
+        before_requests = len(fixture.requests)
+        page.refresh_model()
+        self.wait(lambda: not self.gui.busy and page.model_fields['builtin_loaded'].get()=='131,072 Token')
+        self.assertEqual(self.gui.engine.process.pid,pid)
+        self.assertTrue(all(method=='GET' for method,path,body in fixture.requests[before_requests:]))
+        engine.loaded_limits = None  # Resync must read the runtime, not trust this cache.
+        page.resync_button.invoke()
+        self.wait(lambda: bool(page.review_ticket) and not self.gui.busy)
+        page.apply_preview()
+        self.wait(lambda: not self.gui.busy and page.model_fields['builtin_loaded'].get()=='131,072 Token',seconds=30)
+        self.assertEqual(self.gui.engine.process.pid,pid)
+        self.assertEqual(self.gui.engine.loaded_limits['context'],131072)
+        self.assertFalse(any(method=='POST' for method,path in requests), requests)
+        self.assertFalse(any('tasks' in path or 'completion' in path for method,path,*_ in fixture.requests))
+
+    def test_active_model_sync_leaves_unstarted_and_busy_engines_untouched(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        self.gui.update_model({'effective_context_limit':131072,'output_token_limit':8192})
+        self.gui.engine = None
+        with patch.object(self.gui,'create_engine') as create:
+            done = Mock()
+            self.gui.reload_idle_model_engine(done)
+            done.assert_called_once()
+            create.assert_not_called()
+            self.assertEqual(self.gui.model_engine_sync['status'],'ready')
+        running = SimpleNamespace(process=SimpleNamespace(poll=lambda:None), limits=(163840,4096),
+                                  loaded_limits={'context':163840}, close=Mock(), _get_job=lambda:None)
+        self.gui.engine = running
+        with patch.object(self.gui.tasks,'active',return_value=[object()]):
+            self.gui.reload_idle_model_engine()
+        self.assertEqual(self.gui.model_engine_sync['status'],'pending_reload')
+        running.close.assert_not_called()
+        self.assertEqual(running.limits,(163840,4096))
+        self.gui.engine = None
+
+    def test_active_model_sync_readback_failure_is_not_reported_as_synced(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        from engine import EngineError
+        limits = self.gui.model_limits(self.gui.model_info,self.gui.output_limit)
+        running = SimpleNamespace(process=SimpleNamespace(poll=lambda:None), limits=limits,
+            loaded_limits={'context':limits[0]}, close=Mock(), _get_job=lambda:None,
+            verify_loaded_limits=Mock(side_effect=EngineError('fixture readback mismatch')))
+        self.gui.engine = running
+        done = Event()
+        with patch.object(self.gui,'create_engine',side_effect=EngineError('fixture startup failed')):
+            self.gui.reload_idle_model_engine(done.set)
+            self.wait(lambda: done.is_set() and not self.gui.busy)
+        self.assertEqual(self.gui.model_engine_sync['status'],'error')
+        self.assertIsNone(running.loaded_limits)
+        self.gui.engine = None
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
