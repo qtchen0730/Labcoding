@@ -67,6 +67,43 @@ def build_admin_page(app, parent):
     return page
 
 
+class ModelCard(tk.Canvas):
+    """Rounded model-page container, themed by the existing widget registry."""
+    def __init__(self, app, parent):
+        super().__init__(parent, width=1, height=1, borderwidth=0, highlightthickness=0)
+        self.app = app
+        self.padding = 18
+        self.body = app.frame(self)
+        self.outline = self.create_polygon(0, 0, 1, 0, 1, 1, smooth=True, splinesteps=24, width=1)
+        self.content = self.create_window(self.padding, self.padding, anchor="nw", window=self.body)
+        app.skin(self, "panel", None)
+        self.bind("<Configure>", self.resize)
+        self.body.bind("<Configure>", self.resize)
+
+    def configure(self, cnf=None, **options):
+        result = super().configure(cnf, **options)
+        if hasattr(self, "outline"):
+            colors = self.app.colors
+            # Lift the existing low-contrast border slightly; never use a fixed palette.
+            border = "#" + "".join(f"{round(int(colors['border'][i:i+2], 16) * .84 + int(colors['muted'][i:i+2], 16) * .16):02x}"
+                                    for i in (1, 3, 5))
+            self.itemconfigure(self.outline, fill=colors["panel"], outline=border)
+        return result
+
+    def resize(self, _event=None):
+        width = max(1, self.winfo_width())
+        body_width = max(1, width - self.padding * 2)
+        if int(float(self.itemcget(self.content, "width"))) != body_width:
+            self.itemconfigure(self.content, width=body_width)
+        height = self.body.winfo_reqheight() + self.padding * 2
+        if int(self.cget("height")) != height:
+            self.configure(height=height)
+        right, bottom, radius = max(2, width - 1), max(2, height - 1), 12
+        self.coords(self.outline, radius, 1, right-radius, 1, right, 1, right, radius,
+                    right, bottom-radius, right, bottom, right-radius, bottom,
+                    radius, bottom, 1, bottom, 1, bottom-radius, 1, radius, 1, 1)
+
+
 class AdminPage:
     def __init__(self, app, parent):
         self.app, self.parent = app, parent
@@ -275,6 +312,7 @@ class AdminPage:
         self.model_viewport.bind("<Configure>", lambda event: self.model_viewport.itemconfigure(content, width=event.width))
         frame.bind("<Configure>", lambda _event: self.model_viewport.configure(scrollregion=self.model_viewport.bbox("all")))
         self.model_fields, self.model_field_labels = {}, {}
+        self.model_cards = {}
         app.label(frame, "模型基本信息", muted=True, size=9).pack(fill="x", pady=(0, 5))
         heading = app.frame(frame)
         heading.pack(fill="x", pady=(0, 8))
@@ -307,6 +345,9 @@ class AdminPage:
         self.model_flow(metrics, cards, 150, column_options=(6, 3, 2, 1))
 
         service = self.model_section(frame, '模型服务控制')
+        service_groups = app.frame(service)
+        service_groups.pack(fill='x')
+        groups = []
         for title, fields, columns in (
             ('模型与部署', (('service_model', '当前模型名称'), ('service_backend', '推理后端'), ('service_gpu', '部署 GPU')), (3, 2, 1)),
             ('服务运行状态', (('service_state', '模型服务运行状态'), ('service_api', 'API 可用状态'), ('service_pid', '模型进程 PID')), (3, 2, 1)),
@@ -314,11 +355,13 @@ class AdminPage:
                 ('service_budget', '启动显存需求（历史样本 + 余量）'), ('service_released', '上次停止的GPU已用显存变化（实测）')), (2, 1)),
             ('时间记录', (('service_started', '最近一次启动时间'), ('service_checked', '最近一次状态核验时间')), (2, 1)),
         ):
-            app.label(service, title, muted=True, size=9).pack(fill='x', pady=(5, 4))
-            group = app.frame(service)
-            group.pack(fill='x', pady=(0, 4))
-            self.model_flow(group, [self.model_field(group, key, name, bg='panel') for key, name in fields],
-                            265, column_options=columns)
+            shelf = self.model_shelf(service_groups, title)
+            group = app.frame(shelf, 'field')
+            group.pack(fill='x')
+            self.model_flow(group, [self.model_field(group, key, name) for key, name in fields],
+                            145 if len(fields) == 3 else 200, column_options=columns)
+            groups.append(shelf)
+        self.model_flow(service_groups, groups, 440, column_options=(2, 1))
         service_actions = app.frame(service)
         service_actions.pack(fill='x', pady=(8, 8))
         self.service_buttons = {}
@@ -410,7 +453,10 @@ class AdminPage:
             ("gpu_difference", "显存统计差额 · total − used − free"), ("gpu_sampled", "最近采样时间 · 服务器"))]
         self.model_flow(gpu_details, cells, 280)
 
-        times = self.model_section(frame, "配置时间及高级详情")
+        app.frame(sync, "border", height=1).pack(fill="x", pady=(10, 14))
+        times = app.frame(sync)
+        times.pack(fill="x")
+        app.label(times, "配置时间及高级详情", muted=True, size=10, bold=True).pack(fill="x", pady=(0, 8))
         time_fields = app.frame(times)
         time_fields.pack(fill="x")
         self.model_flow(time_fields, [self.model_field(time_fields, key, name, bg="panel") for key, name in (
@@ -469,10 +515,11 @@ class AdminPage:
         label.bind("<Configure>", wrap)
 
     def model_section(self, parent, title):
-        section = self.app.frame(parent)
-        section.pack(fill="x", pady=(16, 0))
-        self.app.label(section, title, size=12, bold=True).pack(fill="x", pady=(0, 10))
-        return section
+        card = ModelCard(self.app, parent)
+        card.pack(fill="x", padx=2, pady=(6, 10))
+        self.model_cards[title] = card
+        self.app.label(card.body, title, size=12, bold=True).pack(fill="x", pady=(0, 14))
+        return card.body
 
     def model_shelf(self, parent, title):
         shelf = self.app.frame(parent, "field")

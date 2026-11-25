@@ -14,6 +14,8 @@ from app import App
 from account_client import AccountError
 from verify_admin_cards import ModelConfigFixture, wait, descendants
 from verify_support import TEST_ROOT
+from themes import THEMES
+from versioning import read_version_info
 
 
 class LifecycleFixture(ModelConfigFixture):
@@ -80,7 +82,7 @@ def create(phase, data):
         process=SimpleNamespace(poll=lambda:None), verify_loaded_limits=lambda:dict(context=81920,input=79872,output=8192))
     gui.theme.set('Midnight'); gui.show_page('admin')
     page = gui.page_controller; page.tabs.select(page.model_tab)
-    root.title('Labcoding 2.0.5 · '+('运行中' if phase == 'running' else '已停止')+' · 隔离模型服务预览')
+    root.title('Labcoding '+read_version_info()['version']+' · '+('运行中' if phase == 'running' else '已停止')+' · 隔离卡片布局预览')
     root.state('zoomed')
     return root,gui,page,fixture
 
@@ -105,6 +107,7 @@ def verify(root, gui, page, fixture):
             for widget in (*page.model_field_labels.values(),*page.service_buttons.values()):
                 x=widget.winfo_rootx()-page.model_viewport.winfo_rootx()
                 assert x>=0 and x+widget.winfo_width()<=page.model_viewport.winfo_width(),(theme,width,widget)
+            verify_cards(root,gui,page)
     with patch('admin_view.messagebox.askyesno',return_value=False):
         before=len(fixture.requests);page.service_buttons['stop'].invoke();wait(root,lambda:not gui.busy)
         assert not any(p.endswith('/apply') for _,p,_ in fixture.requests[before:])
@@ -119,6 +122,7 @@ def verify(root, gui, page, fixture):
     assert all(v.get()=='未加载' for v in page.model_metrics[:3])
     assert str(page.resync_button.cget('state'))=='disabled' and str(page.preview_button.cget('state'))=='disabled'
     assert str(page.service_buttons['start'].cget('state'))=='normal'
+    verify_cards(root,gui,page)
     before=len(fixture.requests);page.refresh_model_button.invoke();wait(root,lambda:not gui.busy)
     assert all(method=='GET' for method,path,body in fixture.requests[before:])
     with patch('admin_view.messagebox.askyesno',return_value=True),patch.object(gui,'reload_idle_model_engine',side_effect=lambda on_done:on_done()):
@@ -131,6 +135,37 @@ def verify(root, gui, page, fixture):
         wait(root,lambda:not gui.busy and '最近操作失败' in page.service_note.get())
     assert page.model_fields['service_state'].get()=='运行中'
     print('PASS native lifecycle controls/confirmation/read-only refresh/draft preservation/offline fields; Dark+Midnight; 1440+800 layout',flush=True)
+    # Every existing palette must update the card surface and its visible outline.
+    for label,_colors in THEMES.values():
+        gui.theme.set(label);gui.apply_theme();root.update()
+        verify_cards(root,gui,page)
+    print('PASS five rounded section cards; themed borders; responsive subgroups; all seven palettes; scrollable full page',flush=True)
+
+
+def verify_cards(root,gui,page):
+    expected=('核心运行指标','模型服务控制','模型参数设置','上下文配置与同步状态','服务器 GPU 资源')
+    assert tuple(page.model_cards)==expected
+    prior_bottom=0
+    for title,card in page.model_cards.items():
+        assert card.itemcget(card.outline,'smooth')=='true'
+        assert float(card.itemcget(card.outline,'width'))==1
+        assert root.winfo_rgb(card.itemcget(card.outline,'fill'))==root.winfo_rgb(gui.colors['panel'])
+        assert root.winfo_rgb(card.itemcget(card.outline,'outline'))!=root.winfo_rgb(gui.colors['panel'])
+        assert card.body.winfo_width()==card.winfo_width()-card.padding*2
+        assert card.winfo_height()>=card.body.winfo_height()+card.padding*2
+        assert card.winfo_y()>=prior_bottom+6
+        prior_bottom=card.winfo_y()+card.winfo_height()
+    service=page.model_cards['模型服务控制'].body
+    groups=next(child for child in service.winfo_children() if len(child.grid_slaves())==4)
+    expected_columns=2 if groups.winfo_width()>=880 else 1
+    assert len({int(shelf.grid_info()['column']) for shelf in groups.grid_slaves()})==expected_columns
+    # Time/advanced details remain inside synchronization instead of adding a sixth primary card.
+    advanced=page.advanced_toggle
+    while advanced.master is not page.model_viewport:
+        if advanced is page.model_cards['上下文配置与同步状态']:break
+        advanced=advanced.master
+    else:raise AssertionError('advanced details left the synchronization card')
+    assert page.model_viewport.bbox('all')[3]>page.model_viewport.winfo_height()
 
 
 if __name__=='__main__':

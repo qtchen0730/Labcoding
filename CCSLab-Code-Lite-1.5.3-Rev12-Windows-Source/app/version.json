@@ -1,6 +1,6 @@
 {
-  "version": "2.0.5",
-  "release_sequence": 8,
+  "version": "2.0.6",
+  "release_sequence": 9,
   "channel": "stable",
   "repository": "qtchen0730/Labcoding"
 }
